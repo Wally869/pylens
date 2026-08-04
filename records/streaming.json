@@ -1,0 +1,263 @@
+{
+  "dependencies": [
+    {
+      "from": false,
+      "module": {
+        "package": "re"
+      },
+      "scope": "module",
+      "status": "resolved"
+    }
+  ],
+  "functions": [
+    {
+      "name": "tokenize",
+      "kind": "function",
+      "params": [
+        {
+          "name": "text",
+          "shape": "any",
+          "has_default": false
+        }
+      ],
+      "is_generator": true,
+      "returns": [
+        "none"
+      ],
+      "raises": {
+        "explicit": [],
+        "implicit": []
+      },
+      "mutations": [],
+      "global_writes": [],
+      "io": [],
+      "unresolved_effects": [
+        {
+          "reason": "call_import",
+          "callee": "re.finditer",
+          "may_affect": [
+            {
+              "root": "param",
+              "name": "text"
+            }
+          ]
+        }
+      ],
+      "purity": "unknown",
+      "uses": [
+        {
+          "binding": "re",
+          "module": {
+            "package": "re"
+          }
+        }
+      ],
+      "cases": [
+        {
+          "input": [
+            "ab"
+          ],
+          "outcome": "returned",
+          "return": [
+            "ab"
+          ],
+          "mutations": []
+        },
+        {
+          "input": [
+            [
+              1,
+              2,
+              3
+            ]
+          ],
+          "outcome": "raised",
+          "raises": "TypeError",
+          "mutations": []
+        },
+        {
+          "input": [
+            null
+          ],
+          "outcome": "raised",
+          "raises": "TypeError",
+          "mutations": []
+        },
+        {
+          "input": [
+            1.5
+          ],
+          "outcome": "raised",
+          "raises": "TypeError",
+          "mutations": []
+        }
+      ]
+    },
+    {
+      "name": "histogram",
+      "kind": "function",
+      "params": [
+        {
+          "name": "text",
+          "shape": "any",
+          "has_default": false
+        }
+      ],
+      "is_generator": false,
+      "returns": [
+        "opaque"
+      ],
+      "raises": {
+        "explicit": [],
+        "implicit": []
+      },
+      "mutations": [],
+      "global_writes": [],
+      "io": [],
+      "unresolved_effects": [
+        {
+          "reason": "call_unknown_callee",
+          "callee": "tokenize",
+          "may_affect": [
+            {
+              "root": "param",
+              "name": "text"
+            }
+          ]
+        }
+      ],
+      "purity": "unknown",
+      "cases": [
+        {
+          "input": [
+            "ab"
+          ],
+          "outcome": "returned",
+          "return": {
+            "__t__": "dict",
+            "items": [
+              [
+                "ab",
+                1
+              ]
+            ]
+          },
+          "mutations": []
+        },
+        {
+          "input": [
+            [
+              1,
+              2,
+              3
+            ]
+          ],
+          "outcome": "raised",
+          "raises": "TypeError",
+          "mutations": []
+        },
+        {
+          "input": [
+            null
+          ],
+          "outcome": "raised",
+          "raises": "TypeError",
+          "mutations": []
+        },
+        {
+          "input": [
+            1.5
+          ],
+          "outcome": "raised",
+          "raises": "TypeError",
+          "mutations": []
+        }
+      ]
+    },
+    {
+      "name": "report",
+      "kind": "function",
+      "params": [
+        {
+          "name": "rows",
+          "shape": "sequence",
+          "has_default": false
+        },
+        {
+          "name": "sink",
+          "shape": "any",
+          "has_default": false
+        }
+      ],
+      "is_generator": false,
+      "returns": [
+        "opaque"
+      ],
+      "raises": {
+        "explicit": [],
+        "implicit": []
+      },
+      "mutations": [],
+      "global_writes": [],
+      "io": [
+        "stdout"
+      ],
+      "unresolved_effects": [],
+      "purity": "impure",
+      "cases": [
+        {
+          "input": [
+            [],
+            "ab"
+          ],
+          "outcome": "returned",
+          "return": 0,
+          "mutations": [],
+          "stdout": "wrote 0 rows\n"
+        },
+        {
+          "input": [
+            [
+              1
+            ],
+            [
+              1,
+              2,
+              3
+            ]
+          ],
+          "outcome": "raised",
+          "raises": "AttributeError",
+          "mutations": []
+        },
+        {
+          "input": [
+            [
+              3,
+              1,
+              2
+            ],
+            null
+          ],
+          "outcome": "raised",
+          "raises": "AttributeError",
+          "mutations": []
+        },
+        {
+          "input": [
+            [
+              5,
+              5,
+              2,
+              8
+            ],
+            1.5
+          ],
+          "outcome": "raised",
+          "raises": "AttributeError",
+          "mutations": []
+        }
+      ]
+    }
+  ]
+}

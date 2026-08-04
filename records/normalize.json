@@ -1,0 +1,269 @@
+{
+  "dependencies": [],
+  "functions": [
+    {
+      "name": "normalize_rows",
+      "kind": "function",
+      "params": [
+        {
+          "name": "matrix",
+          "shape": "sequence",
+          "has_default": false
+        }
+      ],
+      "is_generator": false,
+      "returns": [
+        "opaque"
+      ],
+      "raises": {
+        "explicit": [],
+        "implicit": []
+      },
+      "mutations": [],
+      "global_writes": [],
+      "io": [],
+      "unresolved_effects": [],
+      "purity": "pure",
+      "cases": [
+        {
+          "input": [
+            []
+          ],
+          "outcome": "returned",
+          "return": [],
+          "mutations": [],
+          "return_aliases_arg": 0
+        },
+        {
+          "input": [
+            [
+              1
+            ]
+          ],
+          "outcome": "raised",
+          "raises": "TypeError",
+          "mutations": []
+        },
+        {
+          "input": [
+            [
+              3,
+              1,
+              2
+            ]
+          ],
+          "outcome": "raised",
+          "raises": "TypeError",
+          "mutations": []
+        },
+        {
+          "input": [
+            [
+              5,
+              5,
+              2,
+              8
+            ]
+          ],
+          "outcome": "raised",
+          "raises": "TypeError",
+          "mutations": []
+        }
+      ]
+    },
+    {
+      "name": "classify",
+      "kind": "function",
+      "params": [
+        {
+          "name": "score",
+          "shape": "int",
+          "has_default": false
+        },
+        {
+          "name": "threshold",
+          "shape": "any",
+          "has_default": true
+        }
+      ],
+      "is_generator": false,
+      "returns": [
+        "str",
+        "int",
+        "none"
+      ],
+      "raises": {
+        "explicit": [
+          "ValueError"
+        ],
+        "implicit": []
+      },
+      "mutations": [],
+      "global_writes": [],
+      "io": [],
+      "unresolved_effects": [],
+      "purity": "pure",
+      "cases": [
+        {
+          "input": [
+            0,
+            "ab"
+          ],
+          "outcome": "raised",
+          "raises": "TypeError",
+          "mutations": []
+        },
+        {
+          "input": [
+            1,
+            [
+              1,
+              2,
+              3
+            ]
+          ],
+          "outcome": "raised",
+          "raises": "TypeError",
+          "mutations": []
+        },
+        {
+          "input": [
+            -3,
+            null
+          ],
+          "outcome": "raised",
+          "raises": "TypeError",
+          "mutations": []
+        },
+        {
+          "input": [
+            7,
+            1.5
+          ],
+          "outcome": "returned",
+          "return": "pass",
+          "mutations": []
+        }
+      ]
+    },
+    {
+      "name": "clamp_all",
+      "kind": "function",
+      "params": [
+        {
+          "name": "values",
+          "shape": "sequence",
+          "has_default": false
+        },
+        {
+          "name": "lo",
+          "shape": "any",
+          "has_default": false
+        },
+        {
+          "name": "hi",
+          "shape": "any",
+          "has_default": false
+        }
+      ],
+      "is_generator": false,
+      "returns": [
+        "int"
+      ],
+      "raises": {
+        "explicit": [],
+        "implicit": []
+      },
+      "mutations": [
+        {
+          "target": {
+            "root": "param",
+            "name": "values"
+          },
+          "via": "subscript_set"
+        }
+      ],
+      "global_writes": [],
+      "io": [],
+      "unresolved_effects": [],
+      "purity": "impure",
+      "cases": [
+        {
+          "input": [
+            [],
+            "ab",
+            "ab"
+          ],
+          "outcome": "returned",
+          "return": 0,
+          "mutations": []
+        },
+        {
+          "input": [
+            [
+              1
+            ],
+            [
+              1,
+              2,
+              3
+            ],
+            [
+              1,
+              2,
+              3
+            ]
+          ],
+          "outcome": "raised",
+          "raises": "TypeError",
+          "mutations": []
+        },
+        {
+          "input": [
+            [
+              3,
+              1,
+              2
+            ],
+            null,
+            null
+          ],
+          "outcome": "raised",
+          "raises": "TypeError",
+          "mutations": []
+        },
+        {
+          "input": [
+            [
+              5,
+              5,
+              2,
+              8
+            ],
+            1.5,
+            1.5
+          ],
+          "outcome": "returned",
+          "return": 4,
+          "mutations": [
+            {
+              "target": "values",
+              "before": [
+                5,
+                5,
+                2,
+                8
+              ],
+              "after": [
+                1.5,
+                1.5,
+                1.5,
+                1.5
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

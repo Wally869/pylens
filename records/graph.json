@@ -1,0 +1,173 @@
+{
+  "dependencies": [],
+  "functions": [
+    {
+      "name": "walk",
+      "kind": "function",
+      "params": [
+        {
+          "name": "adj",
+          "shape": "mapping",
+          "has_default": false
+        },
+        {
+          "name": "start",
+          "shape": "any",
+          "has_default": false
+        }
+      ],
+      "is_generator": false,
+      "returns": [
+        "opaque"
+      ],
+      "raises": {
+        "explicit": [],
+        "implicit": []
+      },
+      "mutations": [],
+      "global_writes": [
+        "_VISITS"
+      ],
+      "io": [],
+      "unresolved_effects": [],
+      "purity": "impure",
+      "cases": [
+        {
+          "input": [
+            {},
+            "ab"
+          ],
+          "outcome": "returned",
+          "return": [
+            "ab"
+          ],
+          "mutations": []
+        },
+        {
+          "input": [
+            {},
+            [
+              1,
+              2,
+              3
+            ]
+          ],
+          "outcome": "raised",
+          "raises": "TypeError",
+          "mutations": []
+        },
+        {
+          "input": [
+            {
+              "a": 1
+            },
+            null
+          ],
+          "outcome": "returned",
+          "return": [
+            null
+          ],
+          "mutations": []
+        },
+        {
+          "input": [
+            {
+              "a": 1,
+              "b": 2
+            },
+            1.5
+          ],
+          "outcome": "returned",
+          "return": [
+            1.5
+          ],
+          "mutations": []
+        }
+      ]
+    },
+    {
+      "name": "merge_into",
+      "kind": "function",
+      "params": [
+        {
+          "name": "dst",
+          "shape": "any",
+          "has_default": false
+        },
+        {
+          "name": "src",
+          "shape": "mapping",
+          "has_default": false
+        }
+      ],
+      "is_generator": false,
+      "returns": [
+        "opaque"
+      ],
+      "raises": {
+        "explicit": [],
+        "implicit": []
+      },
+      "mutations": [
+        {
+          "target": {
+            "root": "param",
+            "name": "dst"
+          },
+          "via": "subscript_set"
+        }
+      ],
+      "global_writes": [],
+      "io": [],
+      "unresolved_effects": [],
+      "purity": "impure",
+      "cases": [
+        {
+          "input": [
+            "ab",
+            {}
+          ],
+          "outcome": "returned",
+          "return": "ab",
+          "mutations": []
+        },
+        {
+          "input": [
+            1.5,
+            {}
+          ],
+          "outcome": "returned",
+          "return": 1.5,
+          "mutations": []
+        },
+        {
+          "input": [
+            null,
+            {
+              "a": 1
+            }
+          ],
+          "outcome": "raised",
+          "raises": "TypeError",
+          "mutations": []
+        },
+        {
+          "input": [
+            [
+              1,
+              2,
+              3
+            ],
+            {
+              "a": 1,
+              "b": 2
+            }
+          ],
+          "outcome": "raised",
+          "raises": "TypeError",
+          "mutations": []
+        }
+      ]
+    }
+  ]
+}

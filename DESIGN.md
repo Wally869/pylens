@@ -1,0 +1,220 @@
+# pylens — Design
+
+## Purpose
+
+**pylens** statically analyzes Python functions and methods (in Rust) to extract their
+**effects** — what they return, which arguments they mutate in place, which exceptions
+they raise, their I/O, whether they are generators — as a normalized **effect signature**.
+
+pylens then runs the function in a jail on generated inputs and **records the effects it
+actually has** (the `record` flow). The signature plus these observed cases are the
+**behavioral record** of a function.
+
+The motivating consumer is RL-training an LLM against reference functions — but pylens stops
+at producing records. Turning records into a reward (comparing a candidate to a reference,
+scoring) is **out of scope**: it's the training loop's decision, not this tool's. Effect
+extraction is the engine; jailed execution backstops it with real observed behavior.
+
+## Guiding principles
+
+- **The downstream signal is adversarial.** Anything the analysis cannot see becomes a hole a
+  consumer's reward could be hacked through. The analyzer must be *honest about its blind spots*
+  rather than silently assume purity — see `unresolved_effects`.
+- **Static effect *shape* is necessary but not sufficient.** Two functions can share an
+  effect shape yet return different values. Dynamic value-level checking (phases 3–6)
+  backstops the static signal.
+- **Over-approximate (may-sets), so the analyzer is checkable.** See the soundness
+  invariant below.
+
+## Locked decisions
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Analysis method | **Static AST**, no execution in the core | Fast, deterministic, the reason to use Rust |
+| Parser | **ruff** (`ruff_python_parser` + `ruff_python_ast`), behind a `parse/` boundary | Best grammar fidelity for arbitrary Python; boundary keeps it swappable |
+| Approximation | **may-sets** (over-approximate) | Enables the soundness invariant `observed ⊆ static` |
+| Signature shape | **path-aware behavior set** | Returns/raises vary by path; union over all exits, not one flat type |
+| Annotations | **untrusted** | Recorded separately; inferred-vs-declared mismatches are flagged, not trusted |
+| Honesty | **`unresolved_effects`** | Unknown calls / dynamic constructs recorded explicitly, never assumed pure |
+| Scope | Extractor emits signatures (JSON); **test-gen folded into the project** | Generation validates the analyzer and produces the observed cases in each record |
+| Execution locus (phase 3+) | **nsjail on a Linux kernel**, always | See "Execution layer" below |
+| Sandbox policy | **Mandatory** — every Python execution is jailed; **no unsandboxed launcher exists** | All gold *and* candidate code is untrusted at dataset-build time |
+| First milestone | **Analyzer foundation first** (phases 1–2) | Lock the spec/contract before building dynamic layers on it |
+
+## Effect taxonomy (caller's point of view)
+
+1. **Return** — `None` vs value; coarse inferred kind. Rebinding a parameter name is *not*
+   an effect.
+2. **Argument mutation** — `p[i]=…`, `p.attr=…`, `del p[i]`, mutating methods
+   (`append`/`sort`/`update`/…), augmented assignment on an element/attr.
+3. **Global / module-state mutation** — `global x; x=…`, writes to module-level names.
+4. **Nonlocal / closure mutation.**
+5. **`self`-attribute mutation** — special case of (2) where the arg is `self` (methods).
+6. **World I/O** — stdout/print, files, network, env; plus nondeterminism (`random`, `time`).
+7. **Exceptions raised** — *explicit* (`raise`) vs *implicit* (operator-induced:
+   `ZeroDivisionError`/`KeyError`/`IndexError`/`TypeError`).
+8. **Generator / async** — `yield`, `await`.
+
+## Effect signature schema (draft)
+
+A single function is a **set of behaviors**, not one flat signature. Returns and raises are
+unioned over all exits; mutations are may-sets.
+
+```jsonc
+{
+  "name": "normalize",
+  "kind": "method",                  // function | method
+  "owner": "Normalizer",             // class (methods only) — needed to build a receiver
+  "declared_return": "list",         // from annotation — UNTRUSTED
+  "is_generator": false,
+  "returns": ["sequence"],           // union over all return exits (incl. "none"); else "opaque"
+  "raises": {
+    "explicit": ["ValueError"],      // from `raise` statements — high confidence
+    "implicit": []                   // operator-induced — over-approx / deferred to dynamic
+  },
+  "mutations": [
+    { "target": {"param": "self"},   "via": "attr_set",   "name": "cache" },
+    { "target": {"param": "items"},  "via": "method",     "name": "append" }
+  ],
+  "global_writes": ["COUNTER"],
+  "io": ["stdout"],
+  "unresolved_effects": [
+    { "reason": "call_import", "callee": "np.sort", "may_affect": [{"param": "items"}] }
+  ],
+  "uses": [ { "binding": "np", "module": { "package": "numpy" } } ],
+  "purity": "unknown"                // any unresolved effect ⇒ unknown, never "pure"
+}
+```
+
+Calls through an imported name (`np.sort(items)`) are opaque foreign effects: recorded as a
+`call_import` unresolved effect and linked back to the import via `uses`, so a function that
+shells out to a library is never mistaken for pure. The companion **import catalog** (every
+style, package/path-split, with module/function `scope`) is emitted alongside, and the `record`
+flow probes each for resolution; see the README/USER_GUIDE for the `dependencies` shape.
+
+Mutation **targets** (roots): `param(name)` · `self_attr(name)` · `global(name)` ·
+`nonlocal(name)` · `unknown`. Mutation **kinds** (`via`): `subscript_set` · `subscript_del`
+· `attr_set` · `attr_del` · `method(name)` · `aug_subscript` · `aug_attr`.
+
+## Soundness invariant
+
+With may-sets, the static set should be a *superset* of whatever any execution does:
+
+> **observed_effects ⊆ static_may_set**
+
+Every observed effect not predicted statically is a **soundness bug** — a reward-hacking
+hole — and must be driven to zero. The reverse (predicted-but-never-observed) is imprecision:
+measured, tolerated, kept low. Dynamic testing **falsifies** soundness (finds holes); it does
+not prove it.
+
+## Architecture / modules
+
+- `parse/` — ruff wrapper. **All `ruff_*` imports are isolated here**; parses source into
+  function/method defs. Swapping parsers means rewriting `parse/` + `analyze/`, not consumers.
+- `model/` — `EffectSignature` types + serde JSON. Pure, parser-independent.
+- `analyze/` — AST visitor over a `FunctionDef`; local **alias map** so `q = p; q.append()`
+  resolves to root `p`.
+- `generate/` — usage-shape-directed input generation: an even spread over the cartesian
+  product of per-parameter candidates (so argument *combinations* are exercised).
+- `record/` — joins static signatures with jailed execution into per-function records:
+  dependency probing, module-load + constructor probing (so an unloadable module or
+  unbuildable receiver is reported once as `uncallable`, not as N identical per-case failures),
+  and case construction. No comparison, no score — that's the consumer's.
+- `exec/` — dynamic effect observer. A `Sandbox` trait with launcher-pluggable backends
+  (`nsjail` native / `wsl`-wrapped); **no unsandboxed launcher**. Owns the JSON-over-stdio
+  worker protocol, the structured `HarnessError`, and `CallResult` parsing.
+- `python/worker.py` — the in-jail CPython harness (serialize-before / serialize-after for
+  mutation diffs; stdout and stderr captured separately; load/ctor probe via a null `fn`).
+
+## Execution layer (sandbox model — decided)
+
+The dynamic layer must execute gold/candidate functions, observe real effects (return,
+argument mutations, raised exceptions), serve as the RL oracle, and validate the analyzer.
+
+**Threat model.** This runs at **dataset-build time**, not in the training loop — so the
+execution host is "wherever we build the dataset" (today: Windows; later: Linux). **All
+input code is untrusted** — gold *and* candidate alike. Therefore every execution is jailed
+and there is **no unsandboxed launcher**, not even for dev or tests.
+
+**The sandbox is nsjail on a Linux kernel — full stop.** It wraps each `worker.py`
+invocation in namespaces + a seccomp-bpf filter + rlimits (mem/CPU/time/pids caps, no
+network, read-only FS). The seccomp filter is a **denylist** of the unambiguously dangerous
+syscalls (ptrace, mount, module load, kexec, setns/unshare, bpf, …) layered on top of dropped
+capabilities + `NO_NEW_PRIVS` — chosen over a strict CPython allowlist, which is fragile
+across interpreter versions and silently breaks the worker. Tightening to an allowlist is a
+tracked future hardening. The launch host only differs in *how a Linux kernel is reached*:
+
+| Host | Launcher | Command shape |
+|---|---|---|
+| Linux | `nsjail` (native) | `nsjail <policy> -- python worker.py` |
+| Windows | `wsl` → `nsjail` | `wsl -d <distro> -- nsjail <policy> -- python worker.py` |
+
+Same nsjail policy, same `worker.py`, same JSON-over-stdio protocol, same `CallResult`
+parsing. The only per-host variation is the command prefix.
+
+**Why no Docker.** WSL2 is itself a real Linux kernel *and* a lightweight Hyper-V utility VM,
+so on Windows the untrusted code already sits behind two boundaries —
+`untrusted python → nsjail → WSL2 VM → Windows host` — without a container. Docker would add
+only a third layer plus a daemon dependency; its sole remaining value is *reproducible
+provisioning* of nsjail+python (nsjail is a from-source build, not a stock package). That is
+a **future** convenience launcher for hermetic CI parity, not a requirement, and is kept
+behind the same trait so it can slot in later.
+
+**`Sandbox` trait.** One interface, launcher-pluggable, in priority order:
+
+1. **`nsjail`** — native on Linux, `wsl --`-wrapped on Windows. *The* execution path.
+2. *(future)* **`docker`** — only if hermetic provisioning / CI parity is wanted.
+
+There is deliberately **no** `unsandboxed` launcher. The current plain-`python`-subprocess
+`Worker` is replaced by the nsjail launcher; the `record` flow and the tests run under nsjail
+(via WSL2 on Windows), so a developer must provision a WSL distro with nsjail + Python
+(one-time setup script) before `record`/`cargo test` will run.
+
+**Execution mechanics (unchanged by the host split):**
+
+- **Real CPython** for exact oracle fidelity; **persistent workers** amortize interpreter
+  startup → IPC-bound per call.
+- **Mutation observability:** serialize args to tagged JSON **before** the call and **after**,
+  then diff the two snapshots (no `deepcopy` — the pre-snapshot is an independent value); tagged
+  JSON covers non-JSON-native types (set/tuple/dict/objects).
+- **Aliasing:** the harness reports **identity relations** (`return is arg[i]`, arg–arg
+  aliasing) — deepcopy + JSON alone destroys identity, which our static model tracks.
+- **Methods:** instantiate the receiver from `__init__` and capture **`self` pre/post** state,
+  not just positional args.
+- **Mutation derivation** uses **structural equality** (float tolerance, set/dict ordering)
+  to diff before/after, rather than raw JSON field diff.
+- **Captured stdout/stderr:** the function's own output is captured (recorded as an effect, and
+  kept out of the JSON protocol channel).
+
+**Rejected alternatives** (research: `docs/research/python-execution.md`): CPython-WASI
+(~1.2 s cold start, stdlib gaps), RustPython (fidelity), Monty (immature, v0.0.18); Docker as
+a *required* layer (redundant with the WSL2 VM; daemon dependency).
+
+The Rust analyzer is unaffected — it emits a JSON effect-signature spec the execution layer
+consumes.
+
+## Phase plan
+
+1. **Parse + behavior-set signature** (returns/raises/mutations/io/unresolved, may-sets) →
+   JSON; snapshot-tested on a hand-written corpus. *(Foundation — current milestone.)*
+2. **Generation hints** — usage-based param shapes. *(Done.)*
+3. **Execution: jailed effect observer + `record`** — per function/method, run generated
+   inputs in the jail and emit static signature + observed cases (returns, raises, argument &
+   `self` mutations, aliasing, stdout/stderr). Includes the import catalog, jailed dependency
+   resolution, the per-function `uses` edge, and the module-load/constructor `uncallable` hoist.
+   *(Done.)*
+4. **Self-validation harness** — `observed ⊆ static` over the corpus → soundness-defect count.
+   *Keystone: proves the analyzer. The records already carry both sides; this adds the check.*
+5. **Guided generation** — guard-directed inputs + minimization to reach deep paths.
+
+**Out of scope:** comparing a candidate to a reference and scoring it (an RL *reward*). pylens
+produces records; how a consumer turns records into a training signal is theirs to decide.
+
+## Open questions
+
+- **Implicit exceptions** — over-approximate (`any op may raise`) vs defer to the dynamic layer.
+- **Interprocedural effects** — resolve calls to local helpers vs treat as `unresolved`.
+- **Return aliasing** — a function returning an argument it also mutated.
+- **Mutation readback** — exact mechanism in the chosen executor.
+- **Equality semantics** for return/exception comparison — float tolerance, set/dict ordering,
+  NaN, exception type-only vs message.

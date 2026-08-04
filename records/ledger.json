@@ -1,0 +1,273 @@
+{
+  "dependencies": [
+    {
+      "from": false,
+      "module": {
+        "package": "hashlib"
+      },
+      "scope": "module",
+      "status": "resolved"
+    },
+    {
+      "from": true,
+      "module": {
+        "package": "datetime"
+      },
+      "names": [
+        {
+          "name": "datetime"
+        }
+      ],
+      "scope": "module",
+      "status": "resolved"
+    }
+  ],
+  "functions": [
+    {
+      "name": "add",
+      "kind": "method",
+      "owner": "Ledger",
+      "params": [
+        {
+          "name": "label",
+          "shape": "any",
+          "has_default": false
+        },
+        {
+          "name": "amount",
+          "shape": "int",
+          "has_default": false
+        }
+      ],
+      "is_generator": false,
+      "returns": [
+        "opaque"
+      ],
+      "raises": {
+        "explicit": [
+          "ValueError"
+        ],
+        "implicit": []
+      },
+      "mutations": [
+        {
+          "target": {
+            "root": "self_attr",
+            "name": "total"
+          },
+          "via": "aug_attr",
+          "name": "total"
+        },
+        {
+          "target": {
+            "root": "param",
+            "name": "self"
+          },
+          "via": "method",
+          "name": "append"
+        }
+      ],
+      "global_writes": [],
+      "io": [],
+      "unresolved_effects": [],
+      "purity": "impure",
+      "cases": [
+        {
+          "input": [
+            "ab",
+            0
+          ],
+          "ctor_args": [],
+          "outcome": "returned",
+          "return": 0,
+          "mutations": [
+            {
+              "target": "self",
+              "before": {
+                "__t__": "dict",
+                "items": [
+                  [
+                    "entries",
+                    []
+                  ],
+                  [
+                    "total",
+                    0
+                  ]
+                ]
+              },
+              "after": {
+                "__t__": "dict",
+                "items": [
+                  [
+                    "entries",
+                    [
+                      {
+                        "__t__": "tuple",
+                        "items": [
+                          "ab",
+                          0
+                        ]
+                      }
+                    ]
+                  ],
+                  [
+                    "total",
+                    0
+                  ]
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "input": [
+            "ab",
+            1
+          ],
+          "ctor_args": [],
+          "outcome": "returned",
+          "return": 1,
+          "mutations": [
+            {
+              "target": "self",
+              "before": {
+                "__t__": "dict",
+                "items": [
+                  [
+                    "entries",
+                    []
+                  ],
+                  [
+                    "total",
+                    0
+                  ]
+                ]
+              },
+              "after": {
+                "__t__": "dict",
+                "items": [
+                  [
+                    "entries",
+                    [
+                      {
+                        "__t__": "tuple",
+                        "items": [
+                          "ab",
+                          1
+                        ]
+                      }
+                    ]
+                  ],
+                  [
+                    "total",
+                    1
+                  ]
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "input": [
+            "ab",
+            -3
+          ],
+          "ctor_args": [],
+          "outcome": "raised",
+          "raises": "ValueError",
+          "mutations": []
+        },
+        {
+          "input": [
+            "ab",
+            7
+          ],
+          "ctor_args": [],
+          "outcome": "returned",
+          "return": 7,
+          "mutations": [
+            {
+              "target": "self",
+              "before": {
+                "__t__": "dict",
+                "items": [
+                  [
+                    "entries",
+                    []
+                  ],
+                  [
+                    "total",
+                    0
+                  ]
+                ]
+              },
+              "after": {
+                "__t__": "dict",
+                "items": [
+                  [
+                    "entries",
+                    [
+                      {
+                        "__t__": "tuple",
+                        "items": [
+                          "ab",
+                          7
+                        ]
+                      }
+                    ]
+                  ],
+                  [
+                    "total",
+                    7
+                  ]
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "digest",
+      "kind": "method",
+      "owner": "Ledger",
+      "params": [],
+      "is_generator": false,
+      "returns": [
+        "opaque"
+      ],
+      "raises": {
+        "explicit": [],
+        "implicit": []
+      },
+      "mutations": [],
+      "global_writes": [],
+      "io": [],
+      "unresolved_effects": [
+        {
+          "reason": "call_import",
+          "callee": "hashlib.sha256"
+        }
+      ],
+      "purity": "unknown",
+      "uses": [
+        {
+          "binding": "hashlib",
+          "module": {
+            "package": "hashlib"
+          }
+        }
+      ],
+      "cases": [
+        {
+          "input": [],
+          "ctor_args": [],
+          "outcome": "returned",
+          "return": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "mutations": []
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,279 @@
+{
+  "dependencies": [
+    {
+      "from": false,
+      "module": {
+        "package": "json"
+      },
+      "scope": "module",
+      "status": "resolved"
+    },
+    {
+      "from": false,
+      "module": {
+        "package": "matplotlib"
+      },
+      "scope": "function",
+      "status": "unresolved",
+      "error": {
+        "stage": "setup",
+        "kind": "ModuleNotFoundError",
+        "message": "No module named 'matplotlib'",
+        "module": "matplotlib"
+      }
+    },
+    {
+      "from": false,
+      "module": {
+        "package": "yaml"
+      },
+      "scope": "function",
+      "status": "resolved"
+    }
+  ],
+  "functions": [
+    {
+      "name": "to_json",
+      "kind": "function",
+      "params": [
+        {
+          "name": "obj",
+          "shape": "any",
+          "has_default": false
+        }
+      ],
+      "is_generator": false,
+      "returns": [
+        "opaque"
+      ],
+      "raises": {
+        "explicit": [],
+        "implicit": []
+      },
+      "mutations": [],
+      "global_writes": [],
+      "io": [],
+      "unresolved_effects": [
+        {
+          "reason": "call_import",
+          "callee": "json.dumps",
+          "may_affect": [
+            {
+              "root": "param",
+              "name": "obj"
+            }
+          ]
+        }
+      ],
+      "purity": "unknown",
+      "uses": [
+        {
+          "binding": "json",
+          "module": {
+            "package": "json"
+          }
+        }
+      ],
+      "cases": [
+        {
+          "input": [
+            "ab"
+          ],
+          "outcome": "returned",
+          "return": "\"ab\"",
+          "mutations": []
+        },
+        {
+          "input": [
+            [
+              1,
+              2,
+              3
+            ]
+          ],
+          "outcome": "returned",
+          "return": "[1, 2, 3]",
+          "mutations": []
+        },
+        {
+          "input": [
+            null
+          ],
+          "outcome": "returned",
+          "return": "null",
+          "mutations": []
+        },
+        {
+          "input": [
+            1.5
+          ],
+          "outcome": "returned",
+          "return": "1.5",
+          "mutations": []
+        }
+      ]
+    },
+    {
+      "name": "render",
+      "kind": "function",
+      "params": [
+        {
+          "name": "points",
+          "shape": "any",
+          "has_default": false
+        }
+      ],
+      "is_generator": false,
+      "returns": [
+        "opaque"
+      ],
+      "raises": {
+        "explicit": [],
+        "implicit": []
+      },
+      "mutations": [],
+      "global_writes": [],
+      "io": [],
+      "unresolved_effects": [
+        {
+          "reason": "call_import",
+          "callee": "matplotlib.plot",
+          "may_affect": [
+            {
+              "root": "param",
+              "name": "points"
+            }
+          ]
+        }
+      ],
+      "purity": "unknown",
+      "uses": [
+        {
+          "binding": "matplotlib",
+          "module": {
+            "package": "matplotlib"
+          }
+        }
+      ],
+      "cases": [
+        {
+          "input": [
+            "ab"
+          ],
+          "outcome": "raised",
+          "raises": "ModuleNotFoundError",
+          "mutations": []
+        },
+        {
+          "input": [
+            [
+              1,
+              2,
+              3
+            ]
+          ],
+          "outcome": "raised",
+          "raises": "ModuleNotFoundError",
+          "mutations": []
+        },
+        {
+          "input": [
+            null
+          ],
+          "outcome": "raised",
+          "raises": "ModuleNotFoundError",
+          "mutations": []
+        },
+        {
+          "input": [
+            1.5
+          ],
+          "outcome": "raised",
+          "raises": "ModuleNotFoundError",
+          "mutations": []
+        }
+      ]
+    },
+    {
+      "name": "load_config",
+      "kind": "function",
+      "params": [
+        {
+          "name": "text",
+          "shape": "any",
+          "has_default": false
+        }
+      ],
+      "is_generator": false,
+      "returns": [
+        "opaque"
+      ],
+      "raises": {
+        "explicit": [],
+        "implicit": []
+      },
+      "mutations": [],
+      "global_writes": [],
+      "io": [],
+      "unresolved_effects": [
+        {
+          "reason": "call_import",
+          "callee": "yaml.safe_load",
+          "may_affect": [
+            {
+              "root": "param",
+              "name": "text"
+            }
+          ]
+        }
+      ],
+      "purity": "unknown",
+      "uses": [
+        {
+          "binding": "yaml",
+          "module": {
+            "package": "yaml"
+          }
+        }
+      ],
+      "cases": [
+        {
+          "input": [
+            "ab"
+          ],
+          "outcome": "returned",
+          "return": "ab",
+          "mutations": []
+        },
+        {
+          "input": [
+            [
+              1,
+              2,
+              3
+            ]
+          ],
+          "outcome": "raised",
+          "raises": "AttributeError",
+          "mutations": []
+        },
+        {
+          "input": [
+            null
+          ],
+          "outcome": "raised",
+          "raises": "AttributeError",
+          "mutations": []
+        },
+        {
+          "input": [
+            1.5
+          ],
+          "outcome": "raised",
+          "raises": "AttributeError",
+          "mutations": []
+        }
+      ]
+    }
+  ]
+}

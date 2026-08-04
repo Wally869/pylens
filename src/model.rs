@@ -1,0 +1,308 @@
+//! Effect-signature data model. Parser-independent and serde-serializable.
+//!
+//! Uses **may-set** (over-approximation) semantics: the static sets should be a superset of
+//! whatever any execution actually does, so the soundness invariant `observed ⊆ static`
+//! holds. See DESIGN.md.
+
+use serde::{Deserialize, Serialize};
+
+/// Whether the analyzed definition is a free function or a method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefKind {
+    Function,
+    Method,
+}
+
+/// A coarse, inferred description of a returned value. Inferred from the body — never
+/// trusted from annotations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReturnKind {
+    /// `return`, `return None`, or fall-through off the end.
+    None,
+    Bool,
+    Int,
+    Float,
+    Str,
+    Bytes,
+    /// list/tuple literal or constructor.
+    Sequence,
+    /// dict literal or constructor.
+    Mapping,
+    Set,
+    /// A value whose type could not be statically inferred (e.g. a returned attribute, local,
+    /// or unknown call). NOT the same as `none` — there *is* a value, its kind is just opaque.
+    Opaque,
+}
+
+/// The root object a mutation targets.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "root", rename_all = "snake_case")]
+pub enum MutationTarget {
+    Param { name: String },
+    SelfAttr { name: String },
+    Global { name: String },
+    Nonlocal { name: String },
+    /// Aliased to something we could not root.
+    Unknown,
+}
+
+/// How a mutation is performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationKind {
+    SubscriptSet,
+    SubscriptDel,
+    AttrSet,
+    AttrDel,
+    /// A (possibly) mutating method call; `Mutation::name` carries which method.
+    Method,
+    AugSubscript,
+    AugAttr,
+}
+
+/// A single may-mutation: some root, mutated some way.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Mutation {
+    pub target: MutationTarget,
+    pub via: MutationKind,
+    /// Method or attribute name where relevant (e.g. "append", "cache").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Exceptions the function may raise.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Raises {
+    /// From `raise` statements — high confidence.
+    pub explicit: Vec<String>,
+    /// Operator-induced (ZeroDivisionError / KeyError / IndexError / TypeError / ...) —
+    /// over-approximated or deferred to the dynamic layer.
+    pub implicit: Vec<String>,
+}
+
+/// An effect we could not resolve statically. The honest record of a blind spot — the
+/// anti-reward-hacking surface. Never silently dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnresolvedEffect {
+    /// e.g. "call_unknown_callee", "dynamic_setattr", "param_escapes_to_callee".
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callee: Option<String>,
+    /// Roots this unresolved effect may touch (e.g. params passed into an unknown call).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub may_affect: Vec<MutationTarget>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Purity {
+    Pure,
+    Impure,
+    /// Has unresolved effects — purity cannot be determined.
+    Unknown,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// A name pulled in by `from module import name [as alias]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportedName {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+}
+
+/// A dotted module reference, split into its top-level **package** and the remaining **path**.
+/// `xml.etree.ElementTree` → package `xml`, path `etree.ElementTree`. A bare module (`os`) has
+/// an empty path. A pure relative `from . import x` has an empty package (see `Import::level`).
+/// The package is the unit that answers "is this library installed"; the path navigates within
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleRef {
+    pub package: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+}
+
+impl ModuleRef {
+    /// Split a dotted module string at its first component.
+    pub fn parse(dotted: &str) -> Self {
+        match dotted.split_once('.') {
+            Some((package, path)) => ModuleRef {
+                package: package.to_string(),
+                path: path.to_string(),
+            },
+            None => ModuleRef {
+                package: dotted.to_string(),
+                path: String::new(),
+            },
+        }
+    }
+
+    /// Reconstruct the dotted module string (for probing/display; not serialized).
+    pub fn dotted(&self) -> String {
+        if self.path.is_empty() {
+            self.package.clone()
+        } else {
+            format!("{}.{}", self.package, self.path)
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.package.is_empty() && self.path.is_empty()
+    }
+}
+
+/// Where an import statement lives — which decides *when* it executes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportScope {
+    /// Runs at module load: top level, a class body, or top-level control flow. A failure here
+    /// stops the whole module from loading.
+    Module,
+    /// Runs only when a function is called (an import inside a function body). A failure here
+    /// surfaces per-call, not at load.
+    Function,
+}
+
+/// A single import. `import a, b` is split into one entry per bound module.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Import {
+    /// `false` for `import x`, `true` for `from x import ...`.
+    pub from: bool,
+    /// The module imported from, split into package + path.
+    pub module: ModuleRef,
+    /// Leading-dot count for relative imports (0 = absolute).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub level: u32,
+    /// For `import x as y`: the alias `y`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    /// For `from m import a, b as c`: the imported names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<ImportedName>,
+    /// `from m import *`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub star: bool,
+    /// Whether this import runs at module load or only when a function runs.
+    pub scope: ImportScope,
+}
+
+impl Import {
+    /// The names this import introduces into the enclosing namespace. Empty for
+    /// `from m import *` (a wildcard — any free name might come from it; see `star`).
+    pub fn bindings(&self) -> Vec<String> {
+        if self.star {
+            Vec::new()
+        } else if self.from {
+            self.names
+                .iter()
+                .map(|n| n.alias.clone().unwrap_or_else(|| n.name.clone()))
+                .collect()
+        } else if let Some(alias) = &self.alias {
+            vec![alias.clone()]
+        } else {
+            // `import a.b.c` binds the top-level package name `a`.
+            vec![self.module.package.clone()]
+        }
+    }
+}
+
+/// A reference from a function to an import it uses: the bound name as referenced in the body,
+/// plus the module that name resolves to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportUse {
+    pub binding: String,
+    pub module: ModuleRef,
+}
+
+/// A usage-inferred shape for a parameter, used to direct input generation. Inferred from how
+/// the parameter is used in the body (not from annotations).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParamShape {
+    Int,
+    Float,
+    Str,
+    Bool,
+    /// list/tuple-like: indexed, iterated, `len()`-ed, or list-mutated.
+    Sequence,
+    /// dict-like: `.keys`/`.get`/`.items`/`.update`.
+    Mapping,
+    Set,
+    /// No discriminating usage observed.
+    Any,
+}
+
+/// A parameter and its inferred shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParamInfo {
+    pub name: String,
+    pub shape: ParamShape,
+    pub has_default: bool,
+}
+
+/// The full effect signature of one function/method.
+///
+/// A *set of behaviors*, not one flat signature: `returns` and `raises` are unioned over all
+/// exits; `mutations` is a may-set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectSignature {
+    pub name: String,
+    pub kind: DefKind,
+    /// For methods, the class the method is defined in; `None` for free functions. Needed to
+    /// construct a receiver when executing the method.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Parameters with usage-inferred shapes (drives input generation).
+    pub params: Vec<ParamInfo>,
+    /// From annotation — UNTRUSTED. Kept only for declared-vs-inferred mismatch detection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_return: Option<String>,
+    pub is_generator: bool,
+    /// Union of return kinds over all return exits (including `None` / fall-through).
+    pub returns: Vec<ReturnKind>,
+    pub raises: Raises,
+    pub mutations: Vec<Mutation>,
+    pub global_writes: Vec<String>,
+    pub io: Vec<String>,
+    pub unresolved_effects: Vec<UnresolvedEffect>,
+    pub purity: Purity,
+    /// Imports this function references (the per-function ← dependency edge).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uses: Vec<ImportUse>,
+    /// A `from m import *` is in scope and this function calls a name we could not otherwise
+    /// resolve — so that name *may* come from the star import.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub may_use_star: bool,
+}
+
+impl EffectSignature {
+    /// An empty signature for `name`/`kind` with no detected effects yet.
+    pub fn new(name: impl Into<String>, kind: DefKind) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            owner: None,
+            params: Vec::new(),
+            declared_return: None,
+            is_generator: false,
+            returns: Vec::new(),
+            raises: Raises::default(),
+            mutations: Vec::new(),
+            global_writes: Vec::new(),
+            io: Vec::new(),
+            unresolved_effects: Vec::new(),
+            purity: Purity::Unknown,
+            uses: Vec::new(),
+            may_use_star: false,
+        }
+    }
+}
