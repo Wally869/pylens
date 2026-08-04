@@ -69,8 +69,8 @@ unioned over all exits; mutations are may-sets.
   "is_generator": false,
   "returns": ["sequence"],           // union over all return exits (incl. "none"); else "opaque"
   "raises": {
-    "explicit": ["ValueError"],      // from `raise` statements — high confidence
-    "implicit": []                   // operator-induced — over-approx / deferred to dynamic
+    "explicit": ["ValueError"],      // from `raise` / `assert` statements — high confidence
+    "implicit": ["TypeError"]        // operator-induced — statically-inferred may-set
   },
   "mutations": [
     { "target": {"param": "self"},   "via": "attr_set",   "name": "cache" },
@@ -82,6 +82,7 @@ unioned over all exits; mutations are may-sets.
     { "reason": "call_import", "callee": "np.sort", "may_affect": [{"param": "items"}] }
   ],
   "uses": [ { "binding": "np", "module": { "package": "numpy" } } ],
+  "decorators": [],                  // dotted decorator names; unrecognized ⇒ purity downgrade
   "purity": "unknown"                // any unresolved effect ⇒ unknown, never "pure"
 }
 ```
@@ -111,20 +112,46 @@ not prove it.
 
 - `parse/` — ruff wrapper. **All `ruff_*` imports are isolated here**; parses source into
   function/method defs. Swapping parsers means rewriting `parse/` + `analyze/`, not consumers.
-- `model/` — `EffectSignature` types + serde JSON. Pure, parser-independent.
-- `analyze/` — AST visitor over a `FunctionDef`; local **alias map** so `q = p; q.append()`
-  resolves to root `p`.
+- `model/` — `EffectSignature` types + serde JSON, including the recursive `Shape` type
+  (`Int`/`Float`/`Bool`/`Str`/`Bytes`/`None`/`Seq`/`Map`/`Set`/`Any`, serializing scalars as a
+  tag string and containers as a tagged object) and `ParamKind`
+  (`Positional`/`VarPositional`/`VarKeyword`/`KeywordOnly`). Pure, parser-independent.
+- `analyze/` — an ordered **pass pipeline** over a shared `ModuleAnalysis` context, driven by a
+  single AST walk with per-concern **collectors** (aliases, mutations, exceptions, shapes,
+  returns):
+  - **Imports** — builds the import binding table.
+  - **Declarations** — builds a function/method **symbol table** (name, params, receiver kind,
+    decorators); collected now, groundwork for a future interprocedural pass.
+  - **Shapes** — fixpoint-infers a name→`Shape` environment per function (recursive, nested
+    container shapes) before Effects runs, so Effects reads settled shapes instead of voting
+    mid-walk.
+  - **Effects** — the per-function AST walk, delegating to collectors; also collects
+    explicit/implicit raises and unknown decorators.
+  - **Purity** — derived classification from collected facts (runs last); any unresolved effect
+    or unrecognized decorator ⇒ `unknown`, never `pure`.
 - `generate/` — usage-shape-directed input generation: an even spread over the cartesian
-  product of per-parameter candidates (so argument *combinations* are exercised).
+  product of per-parameter candidates (so argument *combinations* are exercised), recursive and
+  breadth-capped for nested shapes; `*args`/`**kwargs` are excluded from positional generation,
+  keyword-only params are generated and passed by name.
 - `record/` — joins static signatures with jailed execution into per-function records:
   dependency probing, module-load + constructor probing (so an unloadable module or
   unbuildable receiver is reported once as `uncallable`, not as N identical per-case failures),
-  and case construction. No comparison, no score — that's the consumer's.
+  and case construction. Distinguishes a **resource kill** (`outcome: "error"`,
+  `error.stage: "resource"` — OOM/recursion-limit/timeout, an artifact of the sandbox) from a
+  **semantic raise** (`outcome: "raised"` — part of the function's own behavior). No comparison,
+  no score — that's the consumer's.
 - `exec/` — dynamic effect observer. A `Sandbox` trait with launcher-pluggable backends
   (`nsjail` native / `wsl`-wrapped); **no unsandboxed launcher**. Owns the JSON-over-stdio
-  worker protocol, the structured `HarnessError`, and `CallResult` parsing.
+  worker protocol (including `kwargs`), the structured `HarnessError` (with `is_resource()`),
+  and `CallResult` parsing.
 - `python/worker.py` — the in-jail CPython harness (serialize-before / serialize-after for
   mutation diffs; stdout and stderr captured separately; load/ctor probe via a null `fn`).
+- `validate/` — the `observed ⊆ static` self-validation harness: given a `FunctionRecord`
+  (signature + cases), checks that every observed mutation/raise/return/I/O is covered by the
+  static may-set. A gap is `Hard` (signature claimed completeness) or `Soft` (signature already
+  flagged `unresolved_effects`). Pure, no jail, no I/O — driven by `pylens validate`.
+- `report/` — output formatting: versioned JSON (top-level `schema_version`) and a thin
+  terminal `--format summary` for `analyze`/`record`/`validate`.
 
 ## Execution layer (sandbox model — decided)
 
@@ -205,6 +232,8 @@ consumes.
    *(Done.)*
 4. **Self-validation harness** — `observed ⊆ static` over the corpus → soundness-defect count.
    *Keystone: proves the analyzer. The records already carry both sides; this adds the check.*
+   *(Done — `pylens validate` and `src/validate.rs`; the example corpus validates with zero
+   hard defects.)*
 5. **Guided generation** — guard-directed inputs + minimization to reach deep paths.
 
 **Out of scope:** comparing a candidate to a reference and scoring it (an RL *reward*). pylens
@@ -212,7 +241,6 @@ produces records; how a consumer turns records into a training signal is theirs 
 
 ## Open questions
 
-- **Implicit exceptions** — over-approximate (`any op may raise`) vs defer to the dynamic layer.
 - **Interprocedural effects** — resolve calls to local helpers vs treat as `unresolved`.
 - **Return aliasing** — a function returning an argument it also mutated.
 - **Mutation readback** — exact mechanism in the chosen executor.

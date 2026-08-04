@@ -1,17 +1,22 @@
 # pylens
 
-Static **effect analysis** of Python functions, plus jailed execution to **record what a
-function actually does** on generated inputs.
+A standalone, general-purpose tool for **behavioral analysis of Python code**: static effect
+and shape analysis, plus jailed execution to **record what a function actually does** on
+generated inputs.
 
 Given a Python function, pylens extracts its **effect signature** — what it returns, which
-arguments and `self`-attributes it mutates, what it raises, whether it's a generator, its I/O,
-and the calls it can't see through. It then runs the function in a sandbox on generated inputs
-and records the **observed effects** per input. The static analyzer is Rust (via the
-[ruff](https://github.com/astral-sh/ruff) parser); execution is real CPython inside
+arguments and `self`-attributes it mutates, what it raises (explicit and statically-inferred
+implicit exceptions), whether it's a generator, its I/O, its decorators, and the calls it can't
+see through — plus recursive, nested **parameter shapes** (`int`, `str`, `Seq(Float)`,
+`Map(Str, Seq(Int))`, …). It then runs the function in a sandbox on generated inputs and records
+the **observed effects** per input, and can check that everything observed was statically
+predicted. The static analyzer is Rust (via the [ruff](https://github.com/astral-sh/ruff)
+parser, single AST walk, pass pipeline); execution is real CPython inside
 [nsjail](https://github.com/google/nsjail).
 
 ```
-parse (ruff) ─▶ static effect signature ─▶ infer param shapes ─▶ generate inputs ─▶ run in jail ─▶ record observed effects
+parse (ruff) ─▶ pass pipeline (imports/declarations/shapes/effects/purity) ─▶ static effect
+signature ─▶ generate inputs ─▶ run in jail ─▶ record observed effects ─▶ validate observed ⊆ static
 ```
 
 ## Requirements
@@ -96,23 +101,37 @@ A case from `Inventory.add(name, qty)` — a successful call that mutates the re
 
 | Command | Description |
 |---|---|
-| `pylens analyze <file.py>` | `{ imports, functions }`: catalogued imports + the static effect signature of every function/method, as JSON. Reads stdin if no file is given. No jail. |
-| `pylens record <file.py> [--inputs <N>]` | `{ dependencies, functions }`: imports probed for resolution **plus** observed cases per function/method (generated inputs run in the jail), as JSON. `--inputs` caps generated vectors (default 4). |
+| `pylens analyze <file.py> [--format json\|summary]` | `{ imports, functions }`: catalogued imports + the static effect signature of every function/method. Reads stdin if no file is given. No jail. |
+| `pylens record <file.py> [--inputs <N>] [--format json\|summary]` | `{ dependencies, functions }`: imports probed for resolution **plus** observed cases per function/method (generated inputs run in the jail). `--inputs` caps generated vectors (default 4). |
+| `pylens validate <file.py> [--inputs <N>] [--format json\|summary]` | Runs `record`, then checks `observed ⊆ static` per function: any observed effect the static signature didn't predict is a soundness defect. Exits non-zero on any **hard** defect (a function claiming no unresolved effects that still misses one). |
+
+`--format` defaults to `json` (every output is versioned with a top-level `schema_version`);
+`--format summary` renders a thin terminal summary instead.
 
 ## What it detects (static)
 
-Per function/method, as may-sets (over-approximating) unioned over all exits:
+Per function/method, as may-sets (over-approximating) unioned over all exits, produced by a
+pass pipeline (**Imports → Declarations → Shapes → Effects → Purity**) over a single AST walk:
 
 - **Return** kinds (`int`, `str`, `sequence`, `none`, …) inferred from the body
 - **Argument mutations** — `p[i]=…`, `p.attr=…`, `del`, mutating methods (`append`/`sort`/…),
-  with a local alias map (`q = p; q.append(1)` ⇒ `p`)
-- **`self`-attribute writes** (methods)
-- **Raised exceptions** (explicit `raise`)
-- **Generators**, global writes, basic I/O
+  augmented assignment, with a local alias map (`q = p; q.append(1)` ⇒ `p`)
+- **`self`-attribute writes** (methods), including `@classmethod` receivers
+- **Recursive parameter shapes** — `int`/`float`/`bool`/`str`/`bytes`/`none`, and nested
+  containers (`Seq`/`Map`/`Set`) inferred to a fixpoint (e.g. `matrix: Seq(Seq(Float))`);
+  `*args`/`**kwargs` are marked as variadic and never generated positionally, keyword-only
+  params are generated and passed by name
+- **Raised exceptions** — explicit (`raise`, `assert` ⇒ `AssertionError`) and statically-inferred
+  **implicit** may-sets (`ZeroDivisionError`, `IndexError`/`KeyError` on subscript,
+  `ValueError` from `int()`/`float()`, `TypeError` on ordered-compare/arithmetic over
+  `Any`-typed operands)
+- **Generators**, global writes, basic I/O, unknown decorators (recorded and downgrade purity —
+  a decorator can replace the function entirely)
 - **`uses`** — the imports each function references (`{ binding, module }`), linking functions
   to dependencies
 - **`unresolved_effects`** — calls through imports (`call_import`, e.g. `np.sort(arr)`) and
-  unknown/dynamic calls, recorded honestly: such a function is `unknown`, never assumed pure
+  unknown/dynamic calls (including comprehensions, lambdas, and unknown method calls on a
+  param/local), recorded honestly: such a function is `unknown`, never assumed pure
 
 ## What it records (dynamic)
 
@@ -122,18 +141,34 @@ the exception type when raised. A function that can't run at all (a module-scope
 won't load, or a constructor that can't be built) is marked `uncallable` once, with a structured
 reason, rather than producing identical failing cases.
 
+Resource exhaustion is distinguished from a function's own semantics: a **resource kill**
+(out-of-memory, recursion limit, timeout — an artifact of the sandbox) is always
+`outcome: "error"` with `error.stage: "resource"`, never `outcome: "raised"`. `raised` means the
+function itself raised — part of its behavior.
+
+## `pylens validate` — the soundness check
+
+`pylens validate <file.py>` runs `record`, then checks every observed case against the static
+signature: every observed mutation/raise/return/I/O must be covered by the static may-set
+(`observed ⊆ static`). A gap where the signature claimed no unresolved effects is a **hard**
+defect (a true soundness bug); a gap where the signature already flagged
+`unresolved_effects` is a **soft** defect (an acknowledged blind spot). The example corpus in
+[examples/](examples/) currently validates with zero hard defects.
+
 ## Status
 
-The static analyzer, the import/dependency report, and the `record` flow work today (see
-[examples/](examples/) and `cargo test`). Execution is **always nsjail-jailed** — native on
-Linux, via WSL2 on Windows — with no unsandboxed path; `record_file` drives a persistent
-fork-server worker pool ([`src/exec.rs`](src/exec.rs)) that amortizes interpreter startup across
-the whole file while keeping per-call isolation. Imports are now linked to the functions that
-use them (`uses`), and calls through an import (`mod.fn(param)`) are flagged as `call_import`
-effects so such functions are never mistaken for pure. Not yet done: pylens still doesn't model
-*what* a library call does (whether it mutates its argument, what it returns); relative-import
-resolution needs a package-aware, multi-file entry point; interprocedural/cross-file analysis;
-and a `observed ⊆ static` soundness check over the records. See [DESIGN.md](DESIGN.md).
+The static analyzer, the import/dependency report, the `record` flow, and the `observed ⊆
+static` self-validation harness (`pylens validate`) all work today (see [examples/](examples/)
+and `cargo test`). Execution is **always nsjail-jailed** — native on Linux, via WSL2 on Windows —
+with no unsandboxed path; `record_file` drives a persistent fork-server worker pool
+([`src/exec.rs`](src/exec.rs)) that amortizes interpreter startup across the whole file while
+keeping per-call isolation. Imports are linked to the functions that use them (`uses`), and calls
+through an import (`mod.fn(param)`) are flagged as `call_import` effects so such functions are
+never mistaken for pure. All JSON output carries a top-level `schema_version`. Not yet done:
+pylens still doesn't model *what* a library call does (whether it mutates its argument, what it
+returns); relative-import resolution needs a package-aware, multi-file entry point;
+interprocedural/cross-file analysis (the Declarations symbol table lays the groundwork). See
+[DESIGN.md](DESIGN.md).
 
 ## Docs
 

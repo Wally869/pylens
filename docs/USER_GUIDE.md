@@ -5,7 +5,7 @@
 - [3. `analyze` — effect signatures](#3-analyze--effect-signatures)
 - [4. The effect signature schema](#4-the-effect-signature-schema)
 - [5. `record` — signatures + observed cases](#5-record--signatures--observed-cases)
-- [6. How a record is built](#6-how-a-record-is-built)
+- [6. How a record is built](#6-how-a-record-is-built) (includes `pylens validate`)
 - [7. Using pylens from Rust](#7-using-pylens-from-rust)
 - [8. Limitations & gotchas](#8-limitations--gotchas)
 - [9. Troubleshooting](#9-troubleshooting)
@@ -98,31 +98,39 @@ pylens analyze normalize.py
 ```
 
 ```jsonc
-[
-  {
-    "name": "normalize",
-    "kind": "function",
-    "params": [
-      { "name": "items", "shape": "sequence", "has_default": false },
-      { "name": "scale", "shape": "any",      "has_default": true  }
-    ],
-    "is_generator": false,
-    "returns": ["opaque"],
-    "raises": { "explicit": ["ValueError"], "implicit": [] },
-    "mutations": [
-      { "target": { "root": "param", "name": "items" }, "via": "subscript_set" }
-    ],
-    "global_writes": [],
-    "io": [],
-    "unresolved_effects": [],
-    "purity": "impure"
-  }
-]
+{
+  "schema_version": "1.0",
+  "imports": [],
+  "functions": [
+    {
+      "name": "normalize",
+      "kind": "function",
+      "params": [
+        { "name": "items", "shape": { "seq": "float" }, "has_default": false },
+        { "name": "scale", "shape": "any",               "has_default": true  }
+      ],
+      "is_generator": false,
+      "returns": ["opaque"],
+      "raises": {
+        "explicit": ["ValueError"],
+        "implicit": ["IndexError", "ZeroDivisionError", "TypeError"]
+      },
+      "mutations": [
+        { "target": { "root": "param", "name": "items" }, "via": "subscript_set" }
+      ],
+      "global_writes": [],
+      "io": [],
+      "unresolved_effects": [],
+      "purity": "impure"
+    }
+  ]
+}
 ```
 
-Read it as: *takes a sequence `items` and an optional `scale`; mutates `items` by item
-assignment; may raise `ValueError`; returns a value of opaque kind (a returned argument, so
-its type isn't statically known).* A function that references imports also carries a `uses`
+Read it as: *takes a sequence of floats `items` and an optional `scale`; mutates `items` by item
+assignment; may raise `ValueError` explicitly, plus `IndexError`/`ZeroDivisionError`/`TypeError`
+as statically-inferred implicit may-sets; returns a value of opaque kind (a returned argument,
+so its type isn't statically known).* A function that references imports also carries a `uses`
 list (and the calls through them show up in `unresolved_effects`) — see [§5](#5-record--signatures--observed-cases).
 
 ---
@@ -141,23 +149,31 @@ function is a *set of behaviors*, not one flat type.
 | `declared_return` | the return annotation, if any — **untrusted**, kept only to flag declared-vs-inferred mismatches |
 | `is_generator` | the body contains `yield` / `yield from` |
 | `returns` | union of inferred return kinds over all `return` statements (plus `none` for a bare/absent return or fall-through) |
-| `raises.explicit` | exception types from `raise` statements |
-| `raises.implicit` | operator-induced exceptions (`ZeroDivisionError`, `KeyError`, …) — over-approximated or left to the dynamic layer |
+| `raises.explicit` | exception types from `raise` statements and `assert` (⇒ `AssertionError`) — high confidence |
+| `raises.implicit` | statically-inferred operator-induced may-set: `ZeroDivisionError` (`/`, `//`, `%`), `IndexError`/`KeyError` (subscript read), `ValueError` (`int()`/`float()`), `TypeError` (ordered-compare/arithmetic over `Any`-typed operands) |
 | `mutations` | may-set of in-place mutations (see below) |
 | `global_writes` | module-level names written under a `global` declaration |
 | `io` | observed I/O channels (`stdout`, `stdin`, `filesystem`) |
 | `unresolved_effects` | calls/constructs that couldn't be resolved (see below) |
-| `purity` | `pure`, `impure`, or `unknown` (the latter when any effect is unresolved) |
+| `purity` | `pure`, `impure`, or `unknown` (the latter when any effect is unresolved, or an unrecognized decorator is applied) |
 | `uses` | imports this function references — each `{ binding, module: { package, path } }` — the per-function → dependency edge |
 | `may_use_star` | a `from m import *` is in scope and this function calls a name we couldn't otherwise resolve, so it *may* come from the star |
+| `decorators` | dotted decorator names applied to the def, in source order. A decorator outside the recognized-transparent set (e.g. `@staticmethod`, `@classmethod`) can replace the function entirely, so it downgrades `purity` to `unknown` |
 
 **Return kinds:** `none`, `bool`, `int`, `float`, `str`, `bytes`, `sequence`, `mapping`,
 `set`, `opaque` (a value whose kind couldn't be inferred — e.g. a returned attribute, local,
 or unknown call; **not** the same as `none`).
 
-**Parameter shapes** (drive input generation): `int`, `float`, `str`, `bool`, `sequence`,
-`mapping`, `set`, `any` — inferred from usage (subscripting, iteration, `len`, arithmetic,
-and type-specific methods like `.split`/`.keys`/`.append`), never from annotations.
+**Parameter shapes** (drive input generation) are a recursive `Shape`, inferred to a fixpoint
+from usage (subscripting, iteration, `len`, arithmetic, and type-specific methods like
+`.split`/`.keys`/`.append`), never from annotations. Scalars (`int`, `float`, `bool`, `str`,
+`bytes`, `none`, `any`) serialize as a lowercase string; containers serialize as a tagged
+object carrying their element shape(s): `{"seq": <elem>}`, `{"set": <elem>}`,
+`{"map": {"key": <k>, "value": <v>}}` — so nested usage (`matrix[i][j]`) infers a nested shape
+like `{"seq": {"seq": "float"}}`. `any` means no discriminating usage was observed. Each
+parameter also carries a `kind`: `positional` (default, omitted from JSON), `keyword_only`
+(after a bare `*`), `var_positional` (`*args`), or `var_keyword` (`**kwargs`) — variadic
+parameters are never generated as a single positional value.
 
 **Mutations.** Each entry is a `target` × a `via` kind:
 
@@ -281,6 +297,21 @@ marked `uncallable` and no cases are generated. Then, for each loadable function
 `record` does no comparison and computes no score. It produces the behavioral record of one
 function; turning records into a training signal is the consumer's job, not pylens's.
 
+Cases also distinguish a **resource kill** from a **semantic raise**: `outcome: "raised"` means
+the function itself raised (part of its behavior — `raises` carries the type); a **resource
+kill** (out-of-memory, recursion limit, timeout — an artifact of the sandbox, not the function)
+is always `outcome: "error"` with `error.stage == "resource"`, never `"raised"`.
+
+```sh
+pylens validate <file.py> [--inputs <N>]
+```
+
+Runs `record`, then checks every case against its static signature: every observed
+mutation/raise/return/I/O must be covered by the static may-set (`observed ⊆ static`, see
+DESIGN.md). A gap is a `hard` defect when the signature claimed no unresolved effects (a true
+soundness bug), or `soft` when the signature already flagged `unresolved_effects` (an
+acknowledged blind spot). Exits non-zero if any hard defect is found — usable as a CI gate.
+
 ---
 
 ## 7. Using pylens from Rust
@@ -302,14 +333,14 @@ println!("{} cases", m.functions[0].cases.len());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Key items: `pylens::model` (the `EffectSignature` / `Import` / `ModuleRef` / `ImportUse` types),
-`pylens::analyze_source`, `pylens::imports_of`,
+Key items: `pylens::model` (the `EffectSignature` / `Import` / `ModuleRef` / `ImportUse` / `Shape`
+types), `pylens::analyze_source`, `pylens::imports_of`,
 `pylens::record::{record_file, ModuleRecord, Dependency, DepStatus, FunctionRecord, Uncallable,
-Case}`, and the execution layer
-`pylens::exec::{Sandbox, Nsjail, NsjailPool, HarnessError, probe}` — `Sandbox` is the trait,
-`Nsjail` runs one jailed process per call, `NsjailPool` is the persistent fork-server pool that
-`record_file` drives, and `probe()` checks whether the sandbox is provisioned (all execution
-requires it — there is no unsandboxed launcher).
+Case}`, `pylens::validate::{validate_function, validate_signature, Defect, Severity, Dimension}`,
+and the execution layer `pylens::exec::{Sandbox, Nsjail, NsjailPool, HarnessError, probe}` —
+`Sandbox` is the trait, `Nsjail` runs one jailed process per call, `NsjailPool` is the persistent
+fork-server pool that `record_file` drives, and `probe()` checks whether the sandbox is
+provisioned (all execution requires it — there is no unsandboxed launcher).
 
 ---
 
@@ -329,8 +360,9 @@ requires it — there is no unsandboxed launcher).
   guarded path, and a parameter with no discriminating usage (`any` shape) gets a spread of
   types, so some generated inputs are ill-typed and the case records that honestly (a
   `TypeError`, etc.). Raise `--inputs` for more coverage.
-- **No `observed ⊆ static` check yet.** The records don't (yet) assert that the dynamically
-  observed effects are a subset of the statically predicted may-sets.
+- **`pylens validate` measures soundness, it doesn't guarantee it.** It checks the observed
+  cases from a given `--inputs` run against the static signature; a soundness gap only shows up
+  if generation happens to exercise the path that would expose it.
 - **Execution requires a provisioned sandbox.** All runs are nsjail-jailed (native Linux / WSL2
   on Windows); there is no unsandboxed fallback. If nsjail or WSL isn't set up, `record` errors
   and the jailed tests skip — run `scripts/provision-sandbox.sh` first. The jail has no network,

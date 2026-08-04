@@ -4,8 +4,9 @@ Non-trivial Python chosen to exercise the analyzer and the record flow. Run eith
 any file:
 
 ```sh
-pylens analyze examples/<file>.py            # static signatures
-pylens record  examples/<file>.py --inputs 4 # signatures + observed cases (jailed)
+pylens analyze  examples/<file>.py            # static signatures
+pylens record   examples/<file>.py --inputs 4 # signatures + observed cases (jailed)
+pylens validate examples/<file>.py --inputs 4 # observed ⊆ static soundness check (jailed)
 ```
 
 | File | Exercises |
