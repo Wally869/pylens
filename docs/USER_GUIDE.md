@@ -7,8 +7,10 @@
 - [5. `record` — signatures + observed cases](#5-record--signatures--observed-cases)
 - [6. How a record is built](#6-how-a-record-is-built) (includes `pylens validate`)
 - [7. Using pylens from Rust](#7-using-pylens-from-rust)
-- [8. Limitations & gotchas](#8-limitations--gotchas)
-- [9. Troubleshooting](#9-troubleshooting)
+- [8. Multi-file / project mode](#8-multi-file--project-mode)
+- [9. `.pyi` stubs and HTML reports](#9-pyi-stubs-and-html-reports)
+- [10. Limitations & gotchas](#10-limitations--gotchas)
+- [11. Troubleshooting](#11-troubleshooting)
 
 ---
 
@@ -150,11 +152,12 @@ function is a *set of behaviors*, not one flat type.
 | `is_generator` | the body contains `yield` / `yield from` |
 | `returns` | union of inferred return kinds over all `return` statements (plus `none` for a bare/absent return or fall-through) |
 | `raises.explicit` | exception types from `raise` statements and `assert` (⇒ `AssertionError`) — high confidence |
-| `raises.implicit` | statically-inferred operator-induced may-set: `ZeroDivisionError` (`/`, `//`, `%`), `IndexError`/`KeyError` (subscript read), `ValueError` (`int()`/`float()`), `TypeError` (ordered-compare/arithmetic over `Any`-typed operands) |
-| `mutations` | may-set of in-place mutations (see below) |
+| `raises.implicit` | statically-inferred operator-induced may-set: `ZeroDivisionError` (`/`, `//`, `%`), `IndexError`/`KeyError` (subscript read), `ValueError` (`int()`/`float()`), `TypeError` (ordered-compare/arithmetic over `Any`-typed operands, **or** a subscript whose key/index roots to an `Any`-typed param); also folds in a resolved local callee's own explicit + implicit raises (see [interprocedural propagation](#3-analyze--effect-signatures) below) |
+| `mutations` | may-set of in-place mutations (see below); also includes mutations propagated in from a resolved local callee |
 | `global_writes` | module-level names written under a `global` declaration |
 | `io` | observed I/O channels (`stdout`, `stdin`, `filesystem`) |
 | `unresolved_effects` | calls/constructs that couldn't be resolved (see below) |
+| `type_mismatches` | a contradiction between the untrusted `declared_return` annotation and the inferred `returns` may-set — only flagged when the two are fully disjoint (e.g. declared `-> str` but every inferred exit is `int`); a partial overlap (e.g. declared `-> list` with an implicit `None` fall-through) is never flagged |
 | `purity` | `pure`, `impure`, or `unknown` (the latter when any effect is unresolved, or an unrecognized decorator is applied) |
 | `uses` | imports this function references — each `{ binding, module: { package, path } }` — the per-function → dependency edge |
 | `may_use_star` | a `from m import *` is in scope and this function calls a name we couldn't otherwise resolve, so it *may* come from the star |
@@ -194,9 +197,18 @@ instead of assuming purity:
 
 Reasons include `call_import` (a call through an imported name — `np.array(rows)`,
 `json.dumps(obj)` — which is opaque, so the function is `unknown`, never `pure`),
-`call_unknown_callee` (an unknown free function received a parameter and may mutate it), and
-`dynamic_setattr` / `dynamic_exec` / `dynamic_eval`. This is the honest record of where static
-analysis can't see; the `record` command's execution covers these dynamically.
+`call_unknown_callee` (a call to something that isn't a locally-defined function/method and
+isn't an import either — e.g. a value received as a parameter), and `dynamic_setattr` /
+`dynamic_exec` / `dynamic_eval`. This is the honest record of where static analysis can't see;
+the `record` command's execution covers these dynamically.
+
+**Calls to functions/methods defined in the same file are not `unresolved_effects`.** The
+analyzer resolves them and propagates the callee's own effects onto the caller instead (a
+fixpoint over the intra-file call graph, so multi-hop chains and recursion settle too): a
+function that calls a mutating local helper is correctly `impure`, not falsely `unknown`. Only
+calls through imports or to genuinely unresolvable callees stay in `unresolved_effects`. This
+propagation is **intra-file only** — a call into another file (even one that resolves
+`project_local` in [project mode](#8-multi-file--project-mode)) is not yet followed.
 
 ---
 
@@ -340,26 +352,117 @@ Case}`, `pylens::validate::{validate_function, validate_signature, Defect, Sever
 and the execution layer `pylens::exec::{Sandbox, Nsjail, NsjailPool, HarnessError, probe}` —
 `Sandbox` is the trait, `Nsjail` runs one jailed process per call, `NsjailPool` is the persistent
 fork-server pool that `record_file` drives, and `probe()` checks whether the sandbox is
-provisioned (all execution requires it — there is no unsandboxed launcher).
+provisioned (all execution requires it — there is no unsandboxed launcher). `pylens::project`
+exposes the directory-mode entry points (`analyze_project`, `record_project`, `validate_project`,
+`collect_py_files`) and `pylens::project::resolve` the import-resolution types (`ModuleIndex`,
+`resolve_import`, `Resolution`); `pylens::stub::render_stub` renders `.pyi` output;
+`pylens::html::render` renders the HTML report.
 
 ---
 
-## 8. Limitations & gotchas
+## 8. Multi-file / project mode
+
+```sh
+pylens analyze  <dir> [--format json|summary|pyi|html]
+pylens record   <dir> [--inputs <N>] [--format json|summary|html]
+pylens validate <dir> [--inputs <N>] [--format json|summary|html]
+```
+
+Passing a **directory** instead of a file recurses over its `*.py` files (skipping `.git`,
+`__pycache__`, `.venv`/`venv`/`env`, `node_modules`, `build`, `dist`, `target`, and other
+dotfile/cache dirs) and produces an aggregated **project report** instead of a single-file one:
+
+```jsonc
+{
+  "schema_version": "1.0",
+  "root": "examples",
+  "files": [
+    { "path": "inventory.py", "imports": [...], "functions": [...] },
+    { "path": "broken.py", "error": "parse error: ..." }
+  ],
+  "summary": {
+    "files": 2, "ok": 1, "errors": 1,
+    "functions": 5,
+    "purity": { "pure": 2, "impure": 2, "unknown": 1 }
+    // validate mode also adds: "hard_defects", "soft_defects", "functions_checked"
+  }
+}
+```
+
+A file that fails to read, parse, or record becomes `{ path, error }` in `files` instead of
+aborting the whole run. `record`/`validate` in project mode run over one shared jailed worker
+pool for the whole run (still sequential across files); `analyze` (no jail, CPU-bound) is
+parallelized across a small worker-thread pool.
+
+**Project-local import resolution.** In project mode, every import and dependency entry gains a
+`resolution` field, computed purely statically (no jail) against the other files in the project:
+
+- `project_local` — the import points at another file in this project; a `project_target` field
+  gives its path (relative to the project root, forward-slash separated).
+- `external` — a non-relative import that isn't any project file (stdlib/third-party).
+- `unresolved_relative` — a relative import (`from . import x`, `from ..pkg import y`) that
+  doesn't land on a project file (climbs past the root, or the target isn't indexed).
+
+This supersedes the single-file behavior for relative imports: outside project mode a relative
+import is always `not_probed` (§5); in project mode it's resolved against the tree and reported
+`project_local` or `unresolved_relative` as appropriate. `__init__.py` files are indexed under
+their *containing package* (importing `pkg.sub` runs `pkg/sub/__init__.py`), and relative-import
+level climbs package directories accordingly.
+
+Interprocedural effect propagation (§4) does **not** yet follow `project_local` imports across
+files — it stays intra-file even in project mode.
+
+---
+
+## 9. `.pyi` stubs and HTML reports
+
+```sh
+pylens analyze <file.py|dir> --format pyi
+```
+
+Renders inferred `.pyi` type-hint stubs instead of JSON — one `def` per function/method (methods
+grouped under `class <Owner>:`), targeting Python 3.10+ syntax: builtin generics (`list[...]`,
+`dict[...]`) rather than `typing.List`/`typing.Dict`, and `|` unions rather than `typing.Union`.
+Generators render as `-> Iterator[Any]`. A function whose declared return annotation contradicts
+the inferred `returns` set (a `type_mismatches` entry) gets a trailing `# note: declared ...,
+inferred ...` comment — the emitted type annotation always reflects the *inferred* may-set, never
+the untrusted declaration. Over a directory, each file's stub is preceded by a `# <relative
+path>` comment line. `--format pyi` is **`analyze`-only** (`record`/`validate` reject it).
+
+```sh
+pylens record examples/inventory.py --format html > report.html
+```
+
+`--format html` renders a self-contained `<!doctype html>` document (inline `<style>` only, no
+external stylesheets/scripts/fonts) for `analyze`, `record`, or `validate`, over a single file or
+a whole project — open it straight from disk. It renders the same data as the JSON output; all
+text from analyzed Python source (names, decorators, exception types, error messages) is
+HTML-escaped before being written.
+
+---
+
+## 10. Limitations & gotchas
 
 - **Library calls are flagged but not modelled.** A qualified call through an imported name
   (`os.remove(path)`, `np.sort(arr)`) is recorded as a `call_import` unresolved effect and
   makes the function `unknown` — but pylens doesn't know *what* the call does (whether it
   mutates its argument, what it returns). The dynamic layer observes the actual outcome.
-- **Relative imports aren't resolved.** `from . import sibling` is catalogued and marked
-  `not_probed`; resolving it needs a package-aware, multi-file entry point that binds the
-  package directory into the jail — not yet built.
+- **Relative imports resolve only in project mode.** Outside a directory run, `from . import
+  sibling` is catalogued and marked `not_probed` (§3, §5) — a single file has no package context.
+  In project mode (§8) it's resolved against the other files in the tree.
+- **Interprocedural effect propagation is intra-file only.** Even in project mode, a call through
+  a `project_local`-resolved import into another file isn't followed — only calls to
+  functions/methods defined in the *same* file get their effects propagated onto the caller (§4).
 - **Static returns are coarse.** A returned local variable or a returned argument is reported
   as `opaque`; precise return-type tracking is intentionally out of scope (the dynamic layer
   checks actual values).
-- **Generation is shape-directed, not constraint-solving.** It won't always reach a deeply
-  guarded path, and a parameter with no discriminating usage (`any` shape) gets a spread of
-  types, so some generated inputs are ill-typed and the case records that honestly (a
-  `TypeError`, etc.). Raise `--inputs` for more coverage.
+- **Generation is guard-guided, not constraint-solving.** It seeds candidates from parameter
+  guards (`if`/`assert`/`while`/ternary literals and boundaries) on top of the usual shape-based
+  spread, so it's more likely to reach a guarded branch, but it's still heuristic, not a solver —
+  it won't reliably reach a deeply nested or cross-parameter guard. A parameter with no
+  discriminating usage (`any` shape) still gets a spread of types, so some generated inputs are
+  ill-typed and the case records that honestly (a `TypeError`, etc.). Raise `--inputs` for more
+  coverage.
 - **`pylens validate` measures soundness, it doesn't guarantee it.** It checks the observed
   cases from a given `--inputs` run against the static signature; a soundness gap only shows up
   if generation happens to exercise the path that would expose it.
@@ -373,7 +476,7 @@ provisioned (all execution requires it — there is no unsandboxed launcher).
 
 ---
 
-## 9. Troubleshooting
+## 11. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|

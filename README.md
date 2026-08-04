@@ -6,17 +6,22 @@ generated inputs.
 
 Given a Python function, pylens extracts its **effect signature** — what it returns, which
 arguments and `self`-attributes it mutates, what it raises (explicit and statically-inferred
-implicit exceptions), whether it's a generator, its I/O, its decorators, and the calls it can't
-see through — plus recursive, nested **parameter shapes** (`int`, `str`, `Seq(Float)`,
-`Map(Str, Seq(Int))`, …). It then runs the function in a sandbox on generated inputs and records
-the **observed effects** per input, and can check that everything observed was statically
-predicted. The static analyzer is Rust (via the [ruff](https://github.com/astral-sh/ruff)
+implicit exceptions), whether it's a generator, its I/O, its decorators, calls to locally-defined
+functions/methods it resolves (interprocedural propagation), and the calls it still can't see
+through — plus recursive, nested **parameter shapes** (`int`, `str`, `Seq(Float)`,
+`Map(Str, Seq(Int))`, …) and declared-vs-inferred return type mismatches. It then runs the
+function in a sandbox on generated inputs (guided by literals/boundaries pulled from the
+function's own guards) and records the **observed effects** per input, and can check that
+everything observed was statically predicted. It also runs over a whole directory, resolving
+project-local imports against the other files, and can emit `.pyi` type stubs or a self-contained
+HTML report. The static analyzer is Rust (via the [ruff](https://github.com/astral-sh/ruff)
 parser, single AST walk, pass pipeline); execution is real CPython inside
 [nsjail](https://github.com/google/nsjail).
 
 ```
-parse (ruff) ─▶ pass pipeline (imports/declarations/shapes/effects/purity) ─▶ static effect
-signature ─▶ generate inputs ─▶ run in jail ─▶ record observed effects ─▶ validate observed ⊆ static
+parse (ruff) ─▶ pass pipeline (imports/declarations/shapes/effects/interprocedural/type
+check/purity) ─▶ static effect signature ─▶ guard-guided input generation ─▶ run in jail ─▶
+record observed effects ─▶ validate observed ⊆ static
 ```
 
 ## Requirements
@@ -101,17 +106,26 @@ A case from `Inventory.add(name, qty)` — a successful call that mutates the re
 
 | Command | Description |
 |---|---|
-| `pylens analyze <file.py> [--format json\|summary]` | `{ imports, functions }`: catalogued imports + the static effect signature of every function/method. Reads stdin if no file is given. No jail. |
-| `pylens record <file.py> [--inputs <N>] [--format json\|summary]` | `{ dependencies, functions }`: imports probed for resolution **plus** observed cases per function/method (generated inputs run in the jail). `--inputs` caps generated vectors (default 4). |
-| `pylens validate <file.py> [--inputs <N>] [--format json\|summary]` | Runs `record`, then checks `observed ⊆ static` per function: any observed effect the static signature didn't predict is a soundness defect. Exits non-zero on any **hard** defect (a function claiming no unresolved effects that still misses one). |
+| `pylens analyze <file.py\|dir> [--format json\|summary\|pyi\|html]` | `{ imports, functions }`: catalogued imports + the static effect signature of every function/method. Reads stdin if no file is given. No jail. |
+| `pylens record <file.py\|dir> [--inputs <N>] [--format json\|summary\|html]` | `{ dependencies, functions }`: imports probed for resolution **plus** observed cases per function/method (generated inputs run in the jail). `--inputs` caps generated vectors (default 4). |
+| `pylens validate <file.py\|dir> [--inputs <N>] [--format json\|summary\|html]` | Runs `record`, then checks `observed ⊆ static` per function: any observed effect the static signature didn't predict is a soundness defect. Exits non-zero on any **hard** defect (a function claiming no unresolved effects that still misses one). |
+
+A directory argument recurses over its `*.py` files and produces an aggregated **project
+report** — `{ schema_version, root, files: [...], summary }`, one entry per file (or `{path,
+error}` if that file failed to parse/record/read) plus aggregate purity/defect counts — instead
+of a single-file report. Project mode also resolves each file's imports (absolute and relative)
+against the other project files; see "Multi-file / project mode" below.
 
 `--format` defaults to `json` (every output is versioned with a top-level `schema_version`);
-`--format summary` renders a thin terminal summary instead.
+`--format summary` renders a thin terminal summary; `--format pyi` (`analyze` only) renders
+inferred `.pyi` type-hint stubs instead of the JSON signature; `--format html` renders a
+self-contained HTML report (all three commands, single-file or project).
 
 ## What it detects (static)
 
 Per function/method, as may-sets (over-approximating) unioned over all exits, produced by a
-pass pipeline (**Imports → Declarations → Shapes → Effects → Purity**) over a single AST walk:
+pass pipeline (**Imports → Declarations → Shapes → Effects → Interprocedural → TypeCheck →
+Purity**) over a single AST walk:
 
 - **Return** kinds (`int`, `str`, `sequence`, `none`, …) inferred from the body
 - **Argument mutations** — `p[i]=…`, `p.attr=…`, `del`, mutating methods (`append`/`sort`/…),
@@ -124,7 +138,13 @@ pass pipeline (**Imports → Declarations → Shapes → Effects → Purity**) o
 - **Raised exceptions** — explicit (`raise`, `assert` ⇒ `AssertionError`) and statically-inferred
   **implicit** may-sets (`ZeroDivisionError`, `IndexError`/`KeyError` on subscript,
   `ValueError` from `int()`/`float()`, `TypeError` on ordered-compare/arithmetic over
-  `Any`-typed operands)
+  `Any`-typed operands, and on a subscript whose key roots to an `Any`-typed param)
+- **Declared-vs-inferred return type mismatches** (`type_mismatches`) — flagged when a function's
+  (untrusted) return annotation is fully disjoint from its inferred `returns` may-set
+- **Interprocedural effect propagation (intra-file)** — a call to a function/method defined in
+  the same file inherits that callee's mutations/raises/I/O/unresolved effects, to a fixpoint
+  (recursion included), so a caller of a mutating local helper is correctly `impure` rather than
+  falsely `unknown`; calls through imports or otherwise unresolved callees are still opaque
 - **Generators**, global writes, basic I/O, unknown decorators (recorded and downgrade purity —
   a decorator can replace the function entirely)
 - **`uses`** — the imports each function references (`{ binding, module }`), linking functions
@@ -141,10 +161,45 @@ the exception type when raised. A function that can't run at all (a module-scope
 won't load, or a constructor that can't be built) is marked `uncallable` once, with a structured
 reason, rather than producing identical failing cases.
 
+Input generation is **guard-directed**: besides the usual shape-derived spread, it pulls literal
+and boundary values straight out of the function's own `if`/`assert`/`while`/ternary guards on
+each parameter (`if qty > 10:` seeds `9`, `10`, `11`), so generated inputs are more likely to
+reach a guarded branch instead of missing it by chance.
+
 Resource exhaustion is distinguished from a function's own semantics: a **resource kill**
 (out-of-memory, recursion limit, timeout — an artifact of the sandbox) is always
 `outcome: "error"` with `error.stage: "resource"`, never `outcome: "raised"`. `raised` means the
 function itself raised — part of its behavior.
+
+## Multi-file / project mode
+
+Passing a **directory** instead of a file to `analyze`/`record`/`validate` recurses over its
+`*.py` files (skipping VCS/venv/build noise dirs) and aggregates every file's report into one
+project report: `{ schema_version, root, files: [...], summary }`. A file that fails to read,
+parse, or record becomes `{ path, error }` in `files` instead of aborting the whole run, and
+`summary` carries file/function/purity counts (plus hard/soft defect totals for `validate`).
+Single-file behavior is unchanged.
+
+In project mode, every import (absolute and relative) is additionally resolved against the
+other files in the project: each import/dependency entry gains a `resolution` field —
+`project_local` (with a `project_target` path into the project), `external` (stdlib/third-party,
+not a project file), or `unresolved_relative` (a relative import that doesn't land on a project
+file). This is purely static (no jail), so it applies to `analyze` too. Previously, relative
+imports were reported `not_probed` outside of a project context; in project mode they now
+resolve when the target is another file in the tree.
+
+## `.pyi` stubs and HTML reports
+
+`pylens analyze --format pyi` renders inferred `.pyi` type-hint stubs (Python 3.10+ syntax:
+`list[...]`/`dict[...]` builtin generics, `|` unions, `Iterator[Any]` for generators) instead of
+JSON — one stub per function/method, grouped under `class <Owner>:` blocks for methods, with an
+inline comment when a declared return annotation contradicts the inferred type. It works over a
+single file or a whole directory (one `# <relative path>` block per file). `--format pyi` is
+`analyze`-only.
+
+`--format html` renders a self-contained, theme-aware `<!doctype html>` report (no external
+assets) for `analyze`, `record`, or `validate`, single-file or project — the same underlying data
+as the JSON output, laid out for human reading.
 
 ## `pylens validate` — the soundness check
 
@@ -157,18 +212,21 @@ defect (a true soundness bug); a gap where the signature already flagged
 
 ## Status
 
-The static analyzer, the import/dependency report, the `record` flow, and the `observed ⊆
-static` self-validation harness (`pylens validate`) all work today (see [examples/](examples/)
-and `cargo test`). Execution is **always nsjail-jailed** — native on Linux, via WSL2 on Windows —
-with no unsandboxed path; `record_file` drives a persistent fork-server worker pool
-([`src/exec.rs`](src/exec.rs)) that amortizes interpreter startup across the whole file while
-keeping per-call isolation. Imports are linked to the functions that use them (`uses`), and calls
-through an import (`mod.fn(param)`) are flagged as `call_import` effects so such functions are
-never mistaken for pure. All JSON output carries a top-level `schema_version`. Not yet done:
-pylens still doesn't model *what* a library call does (whether it mutates its argument, what it
-returns); relative-import resolution needs a package-aware, multi-file entry point;
-interprocedural/cross-file analysis (the Declarations symbol table lays the groundwork). See
-[DESIGN.md](DESIGN.md).
+The static analyzer, the import/dependency report, the `record` flow, guard-guided input
+generation, intra-file interprocedural effect propagation, declared-vs-inferred return type
+checking, multi-file/project mode with project-local import resolution, `.pyi`/HTML output, and
+the `observed ⊆ static` self-validation harness (`pylens validate`) all work today (see
+[examples/](examples/) and `cargo test`). Execution is **always nsjail-jailed** — native on
+Linux, via WSL2 on Windows — with no unsandboxed path; `record_file` drives a persistent
+fork-server worker pool ([`src/exec.rs`](src/exec.rs)) that amortizes interpreter startup across
+the whole file while keeping per-call isolation. Imports are linked to the functions that use
+them (`uses`), and calls through an import (`mod.fn(param)`) are flagged as `call_import` effects
+so such functions are never mistaken for pure; calls to functions/methods defined in the *same*
+file are resolved and their effects propagated onto the caller instead. All JSON output carries a
+top-level `schema_version`. Not yet done: pylens still doesn't model *what* a library call does
+(whether it mutates its argument, what it returns); interprocedural effect propagation is
+intra-file only — cross-file propagation (following a `project_local` import to its target
+file's signatures) is future work. See [DESIGN.md](DESIGN.md).
 
 ## Docs
 

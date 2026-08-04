@@ -1,12 +1,17 @@
 # Example corpus
 
-Non-trivial Python chosen to exercise the analyzer and the record flow. Run either command on
-any file:
+Non-trivial Python chosen to exercise the analyzer and the record flow. Run any command on
+a single file, or on the whole `examples/` directory to exercise project mode (aggregated report,
+project-local import resolution):
 
 ```sh
 pylens analyze  examples/<file>.py            # static signatures
 pylens record   examples/<file>.py --inputs 4 # signatures + observed cases (jailed)
 pylens validate examples/<file>.py --inputs 4 # observed ⊆ static soundness check (jailed)
+
+pylens analyze  examples --format summary     # same, over every *.py file under examples/
+pylens analyze  examples/<file>.py --format pyi   # inferred .pyi stub instead of JSON
+pylens record   examples/<file>.py --format html > report.html  # self-contained HTML report
 ```
 
 | File | Exercises |

@@ -83,6 +83,7 @@ unioned over all exits; mutations are may-sets.
   ],
   "uses": [ { "binding": "np", "module": { "package": "numpy" } } ],
   "decorators": [],                  // dotted decorator names; unrecognized ⇒ purity downgrade
+  "type_mismatches": [],             // declared_return contradicts the inferred `returns` set
   "purity": "unknown"                // any unresolved effect ⇒ unknown, never "pure"
 }
 ```
@@ -116,23 +117,47 @@ not prove it.
   (`Int`/`Float`/`Bool`/`Str`/`Bytes`/`None`/`Seq`/`Map`/`Set`/`Any`, serializing scalars as a
   tag string and containers as a tagged object) and `ParamKind`
   (`Positional`/`VarPositional`/`VarKeyword`/`KeywordOnly`). Pure, parser-independent.
-- `analyze/` — an ordered **pass pipeline** over a shared `ModuleAnalysis` context, driven by a
+- `analyze/` — an ordered **pass pipeline** (**Imports → Declarations → Shapes → Effects →
+  Interprocedural → TypeCheck → Purity**) over a shared `ModuleAnalysis` context, driven by a
   single AST walk with per-concern **collectors** (aliases, mutations, exceptions, shapes,
-  returns):
+  returns, guards):
   - **Imports** — builds the import binding table.
   - **Declarations** — builds a function/method **symbol table** (name, params, receiver kind,
-    decorators); collected now, groundwork for a future interprocedural pass.
+    decorators); collected now, consumed by Interprocedural to resolve local call sites.
   - **Shapes** — fixpoint-infers a name→`Shape` environment per function (recursive, nested
     container shapes) before Effects runs, so Effects reads settled shapes instead of voting
     mid-walk.
   - **Effects** — the per-function AST walk, delegating to collectors; also collects
-    explicit/implicit raises and unknown decorators.
-  - **Purity** — derived classification from collected facts (runs last); any unresolved effect
-    or unrecognized decorator ⇒ `unknown`, never `pure`.
+    explicit/implicit raises (including the guard-derived collector, `collect/guards.rs`, which
+    pulls literal/boundary samples off `if`/`assert`/`while`/ternary tests for generation to use)
+    and unknown decorators. Also records structured intra-module **call sites** (callee index,
+    positional-argument roots, whether the call was `self.`/`cls.`-qualified) for Interprocedural
+    to consume.
+  - **Interprocedural** (`passes/interprocedural.rs`) — resolves calls to functions/methods
+    defined in this *same file* (via the call sites Effects recorded) and propagates the
+    callee's mutations/raises/I/O/global-writes/`is_generator`/`unresolved_effects` onto the
+    caller, remapping mutation targets positionally (or unchanged for `self`/global roots).
+    Iterates to a fixpoint (bounded by `signatures.len() + 1` sweeps) so multi-hop chains and
+    recursion (direct or mutual) settle without an infinite loop. Calls through imports or to
+    otherwise-unresolved callees are left as opaque `unresolved_effects`, unchanged — this pass
+    is **intra-file only**; cross-file propagation (following a resolved import to another
+    project file's signatures) is future work.
+  - **TypeCheck** (`passes/type_check.rs`) — compares each function's final `returns` may-set
+    against its untrusted `declared_return` annotation, appending a `type_mismatches` entry only
+    when the two are fully disjoint (never on a mere subset mismatch, and never for a wildcard
+    annotation like `Any`/`Optional`). Runs after Effects/Interprocedural since it needs the
+    final `returns` set; interprocedural propagation never touches `returns`, so the ordering
+    relative to Interprocedural doesn't matter in practice.
+  - **Purity** — derived classification from collected facts (runs last, after propagation so it
+    sees a caller's *complete* effect set); any unresolved effect or unrecognized decorator ⇒
+    `unknown`, never `pure`.
 - `generate/` — usage-shape-directed input generation: an even spread over the cartesian
   product of per-parameter candidates (so argument *combinations* are exercised), recursive and
   breadth-capped for nested shapes; `*args`/`**kwargs` are excluded from positional generation,
-  keyword-only params are generated and passed by name.
+  keyword-only params are generated and passed by name. **Guard-guided**: each parameter's
+  candidate pool is extended with the literal/boundary samples the guards collector pulled off
+  the function's own guard expressions, so generation is more likely to land on both sides of a
+  guarded branch instead of missing it by chance.
 - `record/` — joins static signatures with jailed execution into per-function records:
   dependency probing, module-load + constructor probing (so an unloadable module or
   unbuildable receiver is reported once as `uncallable`, not as N identical per-case failures),
@@ -152,6 +177,32 @@ not prove it.
   flagged `unresolved_effects`). Pure, no jail, no I/O — driven by `pylens validate`.
 - `report/` — output formatting: versioned JSON (top-level `schema_version`) and a thin
   terminal `--format summary` for `analyze`/`record`/`validate`.
+- `project/` — multi-file ("directory") mode: walks a directory for `*.py` files (skipping
+  VCS/venv/build noise dirs), runs `analyze`/`record`/`validate` over each, and aggregates into
+  one project report (`{ schema_version, root, files: [...], summary }`); a file that fails to
+  read/parse/record becomes a `{ path, error }` entry rather than aborting the whole run. The
+  CPU-bound, jail-free `analyze` path fans files out across a small worker-thread pool;
+  `record`/`validate` stay sequential over one shared jailed pool (spawning a pool per file would
+  repay nsjail startup cost per file).
+  - `project::resolve` — static, jail-free **project-local import resolution**: builds a
+    `ModuleIndex` (dotted importable path → project file) once per project, then resolves each
+    file's imports (absolute *and* relative, including `__init__.py` package semantics and
+    `level > 1` climbing) against it, tagging each import/dependency with a `resolution`
+    (`project_local` / `external` / `unresolved_relative`) and, when project-local, a
+    `project_target` path. Applies equally to `analyze` (no jail) and `record`/`validate`
+    (already jailed, but resolution itself needs none). Independent of and unrelated to the
+    jailed dependency probing in `record/` (which answers "does this module *load*", not "is it
+    a project file").
+- `stub/` — pure string rendering of inferred `.pyi` type-hint stubs (Python 3.10+ syntax:
+  `list[...]`/`dict[...]` builtin generics, `X | Y` unions, `Iterator[Any]` for generators) from
+  the same `EffectSignature`s `analyze` produces; no jail, no I/O. Consumed by `analyze --format
+  pyi` only.
+- `html/` — renders an already-assembled `analyze`/`record`/`validate` JSON body (the same
+  `serde_json::Value` the JSON output emits) into one self-contained `<!doctype html>` document
+  (inline `<style>` only, no external assets); one renderer handles both the single-file shape
+  and the project-report shape (detected by the presence of a top-level `files` array). All
+  dynamic text is HTML-escaped before being written, since it originates in analyzed Python
+  source. Consumed by `--format html` on all three commands.
 
 ## Execution layer (sandbox model — decided)
 
@@ -234,14 +285,18 @@ consumes.
    *Keystone: proves the analyzer. The records already carry both sides; this adds the check.*
    *(Done — `pylens validate` and `src/validate.rs`; the example corpus validates with zero
    hard defects.)*
-5. **Guided generation** — guard-directed inputs + minimization to reach deep paths.
+5. **Guided generation** — guard-directed inputs (literals/boundaries pulled from `if`/`assert`/
+   `while`/ternary guards on parameters) to reach guarded branches. *(Done — see `collect/guards.rs`
+   and `generate/`; minimization is not implemented.)*
 
 **Out of scope:** comparing a candidate to a reference and scoring it (an RL *reward*). pylens
 produces records; how a consumer turns records into a training signal is theirs to decide.
 
 ## Open questions
 
-- **Interprocedural effects** — resolve calls to local helpers vs treat as `unresolved`.
+- **Cross-file interprocedural effects** — intra-file call resolution is done (see
+  `analyze::passes::interprocedural`); a call through a `project_local`-resolved import into
+  another project file's signatures is still treated as `unresolved`.
 - **Return aliasing** — a function returning an argument it also mutated.
 - **Mutation readback** — exact mechanism in the chosen executor.
 - **Equality semantics** for return/exception comparison — float tolerance, set/dict ordering,
