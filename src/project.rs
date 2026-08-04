@@ -14,6 +14,9 @@ use crate::model::Purity;
 use crate::record::record_with;
 use crate::validate::{Severity, validate_function};
 
+pub mod resolve;
+use resolve::{ModuleIndex, annotate_with_resolution, resolve_import};
+
 /// Directory names skipped anywhere in the tree, plus any directory whose name starts with
 /// `.`. Honoring `.gitignore` is future work; this is a fixed list of well-known noise dirs.
 const SKIP_DIRS: &[&str] = &[
@@ -67,7 +70,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn relative_path(root: &Path, path: &Path) -> String {
+pub(crate) fn relative_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()
@@ -175,7 +178,7 @@ where
     results.into_inner().unwrap()
 }
 
-fn analyze_file_entry(root: &Path, path: &Path) -> FileEntry {
+fn analyze_file_entry(root: &Path, path: &Path, index: &ModuleIndex) -> FileEntry {
     let rel = relative_path(root, path);
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -184,9 +187,13 @@ fn analyze_file_entry(root: &Path, path: &Path) -> FileEntry {
     match (crate::imports_of(&src), crate::analyze_source(&src)) {
         (Ok(imports), Ok(functions)) => {
             let purities = functions.iter().map(|f| f.purity).collect();
+            let imports_json: Vec<Value> = imports
+                .iter()
+                .map(|imp| annotate_with_resolution(imp, &resolve_import(index, &rel, imp)))
+                .collect();
             let json = serde_json::json!({
                 "path": rel,
-                "imports": imports,
+                "imports": imports_json,
                 "functions": functions,
             });
             FileEntry {
@@ -204,14 +211,23 @@ fn analyze_file_entry(root: &Path, path: &Path) -> FileEntry {
 }
 
 /// Static effect analysis over every `*.py` file under `root`. Pure and CPU-bound, so files
-/// are analyzed in parallel across a small worker-thread pool; no jail is involved.
+/// are analyzed in parallel across a small worker-thread pool; no jail is involved. Each file's
+/// imports are also statically resolved against the other files in the project (see
+/// `resolve::resolve_import`), independent of the parallel per-file analysis.
 pub fn analyze_project(root: &Path) -> Value {
     let files = collect_py_files(root);
-    let entries = parallel_map(&files, |path| analyze_file_entry(root, path));
+    let index = ModuleIndex::build(root, &files);
+    let entries = parallel_map(&files, |path| analyze_file_entry(root, path, &index));
     build_report(root, entries, false)
 }
 
-fn record_file_entry(sandbox: &dyn Sandbox, root: &Path, path: &Path, max_inputs: usize) -> FileEntry {
+fn record_file_entry(
+    sandbox: &dyn Sandbox,
+    root: &Path,
+    path: &Path,
+    max_inputs: usize,
+    index: &ModuleIndex,
+) -> FileEntry {
     let rel = relative_path(root, path);
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -220,9 +236,14 @@ fn record_file_entry(sandbox: &dyn Sandbox, root: &Path, path: &Path, max_inputs
     match record_with(sandbox, &src, max_inputs) {
         Ok(record) => {
             let purities = record.functions.iter().map(|f| f.signature.purity).collect();
+            let deps_json: Vec<Value> = record
+                .dependencies
+                .iter()
+                .map(|dep| annotate_with_resolution(dep, &resolve_import(index, &rel, &dep.import)))
+                .collect();
             let json = serde_json::json!({
                 "path": rel,
-                "dependencies": record.dependencies,
+                "dependencies": deps_json,
                 "functions": record.functions,
             });
             FileEntry {
@@ -246,10 +267,11 @@ fn record_file_entry(sandbox: &dyn Sandbox, root: &Path, path: &Path, max_inputs
 /// failure becomes a `{path, error}` entry instead.
 pub fn record_project(root: &Path, max_inputs: usize) -> Result<Value, String> {
     let files = collect_py_files(root);
+    let index = ModuleIndex::build(root, &files);
     let sandbox = NsjailPool::new(1)?;
     let entries: Vec<FileEntry> = files
         .iter()
-        .map(|path| record_file_entry(&sandbox, root, path, max_inputs))
+        .map(|path| record_file_entry(&sandbox, root, path, max_inputs, &index))
         .collect();
     Ok(build_report(root, entries, false))
 }

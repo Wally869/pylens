@@ -63,6 +63,45 @@ fn analyze_project_reports_a_bad_file_without_aborting_the_run() {
 }
 
 #[test]
+fn analyze_project_resolves_project_local_and_external_imports() {
+    let report = analyze_project(Path::new("tests/fixtures/pkg"));
+    let files = report["files"].as_array().expect("files array");
+    let main = files
+        .iter()
+        .find(|f| f["path"] == "main.py")
+        .expect("main.py entry");
+    let imports = main["imports"].as_array().expect("imports array");
+
+    let os = imports
+        .iter()
+        .find(|i| i["module"]["package"] == "os")
+        .expect("os import");
+    assert_eq!(os["resolution"], "external");
+    assert!(os.get("project_target").is_none());
+
+    let util = imports
+        .iter()
+        .find(|i| i["module"]["package"] == "util")
+        .expect(".util import");
+    assert_eq!(util["resolution"], "project_local");
+    assert_eq!(util["project_target"], "util.py");
+
+    let helper = imports
+        .iter()
+        .find(|i| i["module"]["package"] == "sub")
+        .expect(".sub.helper import");
+    assert_eq!(helper["resolution"], "project_local");
+    assert_eq!(helper["project_target"], "sub/helper.py");
+
+    let missing = imports
+        .iter()
+        .find(|i| i["module"]["package"] == "missing")
+        .expect(".missing import");
+    assert_eq!(missing["resolution"], "unresolved_relative");
+    assert!(missing.get("project_target").is_none());
+}
+
+#[test]
 fn walk_skips_pycache_and_dotfile_directories() {
     let report = analyze_project(Path::new("tests/fixtures/project_skip"));
     let files = report["files"].as_array().expect("files array");
