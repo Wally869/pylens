@@ -4,6 +4,7 @@
 pub mod analyze;
 pub mod exec;
 pub mod generate;
+pub mod html;
 pub mod model;
 pub mod parse;
 pub mod project;

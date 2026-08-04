@@ -1,9 +1,10 @@
 //! pylens CLI.
 //!
-//!   pylens analyze  <file.py|dir> [--format json|summary|pyi]          static effect signatures
-//!   pylens record   <file.py|dir> [--inputs N] [--format json|summary] signatures + observed
-//!                                                                       cases (runs the jail)
-//!   pylens validate <file.py|dir> [--inputs N] [--format json|summary] observed ⊆ static
+//!   pylens analyze  <file.py|dir> [--format json|summary|pyi|html]      static effect signatures
+//!   pylens record   <file.py|dir> [--inputs N] [--format json|summary|html] signatures +
+//!                                                                       observed cases (runs the
+//!                                                                       jail)
+//!   pylens validate <file.py|dir> [--inputs N] [--format json|summary|html] observed ⊆ static
 //!                                                                       soundness-defect report
 //!                                                                       (runs the jail); exits
 //!                                                                       non-zero on any hard
@@ -15,7 +16,8 @@
 //!
 //! `--format` defaults to `json`. `--format summary` renders a thin terminal summary instead
 //! (see `pylens::report`). `analyze --format pyi` renders inferred `.pyi` type-hint stubs
-//! instead (see `pylens::stub`); it is not available on `record`/`validate`.
+//! instead (see `pylens::stub`); it is not available on `record`/`validate`. `--format html`
+//! renders a self-contained HTML report (see `pylens::html`), available on all three commands.
 
 use std::io::Read;
 
@@ -31,9 +33,9 @@ fn main() {
         Some("validate") => cmd_validate(&args[2..]),
         _ => {
             eprintln!(
-                "usage:\n  pylens analyze <file.py|dir> [--format json|summary|pyi]\n  \
-                 pylens record <file.py|dir> [--inputs <N>] [--format json|summary]\n  \
-                 pylens validate <file.py|dir> [--inputs <N>] [--format json|summary]"
+                "usage:\n  pylens analyze <file.py|dir> [--format json|summary|pyi|html]\n  \
+                 pylens record <file.py|dir> [--inputs <N>] [--format json|summary|html]\n  \
+                 pylens validate <file.py|dir> [--inputs <N>] [--format json|summary|html]"
             );
             std::process::exit(2);
         }
@@ -52,10 +54,10 @@ fn cmd_analyze(args: &[String]) {
             return;
         }
         let report = pylens::project::analyze_project(root);
-        if format == Format::Summary {
-            print!("{}", report::project_summary(&report));
-        } else {
-            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        match format {
+            Format::Summary => print!("{}", report::project_summary(&report)),
+            Format::Html => print!("{}", pylens::html::render("analyze", &report)),
+            _ => println!("{}", serde_json::to_string_pretty(&report).unwrap()),
         }
         return;
     }
@@ -72,6 +74,15 @@ fn cmd_analyze(args: &[String]) {
                 }
                 Format::Pyi => {
                     print!("{}", stub::render_stub(&functions));
+                }
+                Format::Html => {
+                    let out = serde_json::json!({
+                        "schema_version": pylens::SCHEMA_VERSION,
+                        "source": label,
+                        "imports": imports,
+                        "functions": functions,
+                    });
+                    print!("{}", pylens::html::render("analyze", &out));
                 }
                 Format::Json => {
                     let out = serde_json::json!({
@@ -128,13 +139,11 @@ fn cmd_record(args: &[String]) {
 
     if std::path::Path::new(&path).is_dir() {
         match pylens::project::record_project(std::path::Path::new(&path), inputs) {
-            Ok(report) => {
-                if format == Format::Summary {
-                    print!("{}", report::project_summary(&report));
-                } else {
-                    println!("{}", serde_json::to_string_pretty(&report).unwrap());
-                }
-            }
+            Ok(report) => match format {
+                Format::Summary => print!("{}", report::project_summary(&report)),
+                Format::Html => print!("{}", pylens::html::render("record", &report)),
+                _ => println!("{}", serde_json::to_string_pretty(&report).unwrap()),
+            },
             Err(e) => fail(&format!("record error: {e}")),
         }
         return;
@@ -152,6 +161,12 @@ fn cmd_record(args: &[String]) {
                 "dependencies": record.dependencies,
                 "functions": record.functions,
             });
+            if format == Format::Html {
+                let mut html_data = out;
+                html_data["source"] = serde_json::json!(path);
+                print!("{}", pylens::html::render("record", &html_data));
+                return;
+            }
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
         }
         Err(e) => fail(&format!("record error: {e}")),
@@ -171,10 +186,10 @@ fn cmd_validate(args: &[String]) {
     if std::path::Path::new(&path).is_dir() {
         match pylens::project::validate_project(std::path::Path::new(&path), inputs) {
             Ok((report, hard_total)) => {
-                if format == Format::Summary {
-                    print!("{}", report::project_summary(&report));
-                } else {
-                    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                match format {
+                    Format::Summary => print!("{}", report::project_summary(&report)),
+                    Format::Html => print!("{}", pylens::html::render("validate", &report)),
+                    _ => println!("{}", serde_json::to_string_pretty(&report).unwrap()),
                 }
                 if hard_total > 0 {
                     std::process::exit(1);
@@ -250,7 +265,13 @@ fn cmd_validate(args: &[String]) {
                 "functions_checked": record.functions.len(),
             }
         });
-        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        if format == Format::Html {
+            let mut html_data = out;
+            html_data["source"] = serde_json::json!(path);
+            print!("{}", pylens::html::render("validate", &html_data));
+        } else {
+            println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        }
     }
     if hard_total > 0 {
         std::process::exit(1);
@@ -263,15 +284,18 @@ enum Format {
     Summary,
     /// `.pyi` type-hint stub output — `analyze` only (see `cmd_analyze`).
     Pyi,
+    /// Self-contained HTML report (see `pylens::html`).
+    Html,
 }
 
 fn format_of(args: &[String]) -> Format {
     match flag(args, "--format").as_deref() {
         Some("summary") => Format::Summary,
         Some("pyi") => Format::Pyi,
+        Some("html") => Format::Html,
         Some("json") | None => Format::Json,
         Some(other) => fail(&format!(
-            "unknown --format '{other}' (expected json|summary|pyi)"
+            "unknown --format '{other}' (expected json|summary|pyi|html)"
         )),
     }
 }
