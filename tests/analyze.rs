@@ -409,3 +409,35 @@ fn varargs_and_kwargs_are_marked_by_kind() {
     assert_eq!(by_name("args").kind, ParamKind::VarPositional);
     assert_eq!(by_name("kw").kind, ParamKind::VarKeyword);
 }
+
+#[test]
+fn declared_int_but_returns_str_is_flagged() {
+    let s = analyze("def f(x) -> int:\n    return \"a\"\n");
+    let f = sig(&s, "f");
+    assert_eq!(f.type_mismatches.len(), 1);
+    let m = &f.type_mismatches[0];
+    assert_eq!(m.kind, "return");
+    assert_eq!(m.declared, "int");
+    assert_eq!(m.inferred, vec![ReturnKind::Str]);
+}
+
+#[test]
+fn opaque_inferred_return_is_never_flagged() {
+    let s = analyze("def f(x) -> int:\n    return x\n");
+    let f = sig(&s, "f");
+    assert!(f.type_mismatches.is_empty());
+}
+
+#[test]
+fn matching_declared_and_inferred_return_is_not_flagged() {
+    let s = analyze("def f(x) -> list:\n    return []\n");
+    let f = sig(&s, "f");
+    assert!(f.type_mismatches.is_empty());
+}
+
+#[test]
+fn unannotated_function_is_never_flagged() {
+    let s = analyze("def f(x):\n    return \"a\"\n");
+    let f = sig(&s, "f");
+    assert!(f.type_mismatches.is_empty());
+}

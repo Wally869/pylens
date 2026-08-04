@@ -1,5 +1,5 @@
 //! The module-level pipeline passes, run in order by `analyze::analyze_module`: Imports ->
-//! Declarations -> Shapes -> Effects -> Interprocedural -> Purity.
+//! Declarations -> Shapes -> Effects -> Interprocedural -> TypeCheck -> Purity.
 
 pub(super) mod declarations;
 pub(super) mod effects;
@@ -7,3 +7,4 @@ pub(super) mod imports;
 pub(super) mod interprocedural;
 pub(super) mod purity;
 pub(super) mod shapes;
+pub(super) mod type_check;

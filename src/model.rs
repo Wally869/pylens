@@ -38,6 +38,20 @@ pub enum ReturnKind {
     Opaque,
 }
 
+/// A contradiction between an untrusted declared annotation and the statically inferred
+/// may-set. See `analyze::passes::type_check` for the conservative flagging rule (only raised
+/// on full disjointness, never on a mere subset mismatch).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeMismatch {
+    /// What was checked — `"return"` today; param-annotation mismatch is future work (params
+    /// aren't captured yet).
+    pub kind: String,
+    /// The untrusted declared annotation name.
+    pub declared: String,
+    /// The inferred may-set that contradicts it.
+    pub inferred: Vec<ReturnKind>,
+}
+
 /// The root object a mutation targets.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "root", rename_all = "snake_case")]
@@ -446,6 +460,10 @@ pub struct EffectSignature {
     /// see the Purity pass.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decorators: Vec<String>,
+    /// Declared-vs-inferred contradictions found by the TypeCheck pass. Empty unless the
+    /// declared annotation and the inferred may-set are fully disjoint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub type_mismatches: Vec<TypeMismatch>,
 }
 
 impl EffectSignature {
@@ -468,6 +486,7 @@ impl EffectSignature {
             uses: Vec::new(),
             may_use_star: false,
             decorators: Vec::new(),
+            type_mismatches: Vec::new(),
         }
     }
 }
