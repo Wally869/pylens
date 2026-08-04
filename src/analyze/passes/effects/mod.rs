@@ -18,6 +18,14 @@ use super::super::context::{FunctionFacts, ModuleAnalysis};
 use super::super::pass::Pass;
 use super::declarations::ReceiverKind;
 
+mod builtins;
+mod dedup;
+mod setup;
+
+use builtins::is_known_pure_builtin;
+use dedup::{dedup, dedup_mutations};
+use setup::{annotation_name, collect_param_defs, collect_param_names, decorator_names};
+
 /// Runs the per-function walk for every module-level function and method, appending the
 /// resulting (not-yet-purity-classified) signatures to `ModuleAnalysis::signatures`.
 pub(in crate::analyze) struct EffectsPass;
@@ -574,123 +582,4 @@ impl Walker<'_, '_> {
         }
         out
     }
-}
-
-fn collect_param_names(params: &ast::Parameters) -> Vec<String> {
-    let mut out = Vec::new();
-    for p in &params.posonlyargs {
-        out.push(p.parameter.name.as_str().to_string());
-    }
-    for p in &params.args {
-        out.push(p.parameter.name.as_str().to_string());
-    }
-    if let Some(v) = &params.vararg {
-        out.push(v.name.as_str().to_string());
-    }
-    for p in &params.kwonlyargs {
-        out.push(p.parameter.name.as_str().to_string());
-    }
-    if let Some(k) = &params.kwarg {
-        out.push(k.name.as_str().to_string());
-    }
-    out
-}
-
-fn collect_param_defs(params: &ast::Parameters, skip: Option<&str>) -> Vec<ParamInfo> {
-    let mut raw: Vec<(String, bool, ParamKind)> = Vec::new();
-    for p in &params.posonlyargs {
-        raw.push((
-            p.parameter.name.as_str().to_string(),
-            p.default.is_some(),
-            ParamKind::Positional,
-        ));
-    }
-    for p in &params.args {
-        raw.push((
-            p.parameter.name.as_str().to_string(),
-            p.default.is_some(),
-            ParamKind::Positional,
-        ));
-    }
-    if let Some(v) = &params.vararg {
-        raw.push((v.name.as_str().to_string(), false, ParamKind::VarPositional));
-    }
-    for p in &params.kwonlyargs {
-        raw.push((
-            p.parameter.name.as_str().to_string(),
-            p.default.is_some(),
-            ParamKind::KeywordOnly,
-        ));
-    }
-    if let Some(k) = &params.kwarg {
-        raw.push((k.name.as_str().to_string(), false, ParamKind::VarKeyword));
-    }
-    raw.into_iter()
-        .filter(|(n, _, _)| Some(n.as_str()) != skip)
-        .map(|(name, has_default, kind)| ParamInfo {
-            name,
-            shape: Shape::Any,
-            has_default,
-            kind,
-        })
-        .collect()
-}
-
-/// Dotted decorator names applied to this def, in source order (e.g. `@app.route(...)` ->
-/// `"app.route"`), for the Purity pass to check against the recognized-transparent set.
-fn decorator_names(def: &ast::StmtFunctionDef) -> Vec<String> {
-    def.decorator_list
-        .iter()
-        .filter_map(|d| decorator_dotted_name(&d.expression))
-        .collect()
-}
-
-fn decorator_dotted_name(expr: &ast::Expr) -> Option<String> {
-    match expr {
-        ast::Expr::Call(c) => decorator_dotted_name(&c.func),
-        _ => dotted_attr(expr),
-    }
-}
-
-fn annotation_name(ann: Option<&ast::Expr>) -> Option<String> {
-    match ann? {
-        ast::Expr::Name(n) => Some(n.id.as_str().to_string()),
-        ast::Expr::Subscript(s) => Some(leftmost_name(&s.value)?.to_string()),
-        _ => None,
-    }
-}
-
-fn is_known_pure_builtin(name: &str) -> bool {
-    matches!(
-        name,
-        "len" | "range" | "enumerate" | "zip" | "map" | "filter" | "sorted" | "reversed"
-            | "int" | "float" | "str" | "bool" | "bytes" | "list" | "dict" | "set"
-            | "tuple" | "frozenset" | "abs" | "min" | "max" | "sum" | "round" | "ord"
-            | "chr" | "repr" | "hash" | "isinstance" | "issubclass" | "type" | "all"
-            | "any" | "divmod" | "pow" | "hex" | "oct" | "bin" | "format"
-    )
-}
-
-fn dedup<T: Clone + PartialEq>(v: &mut Vec<T>) {
-    let mut seen: Vec<T> = Vec::new();
-    v.retain(|x| {
-        if seen.contains(x) {
-            false
-        } else {
-            seen.push(x.clone());
-            true
-        }
-    });
-}
-
-fn dedup_mutations(v: &mut Vec<Mutation>) {
-    let mut seen: Vec<Mutation> = Vec::new();
-    v.retain(|x| {
-        if seen.contains(x) {
-            false
-        } else {
-            seen.push(x.clone());
-            true
-        }
-    });
 }
