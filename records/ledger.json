@@ -24,78 +24,15 @@
   ],
   "functions": [
     {
-      "name": "add",
-      "kind": "method",
-      "owner": "Ledger",
-      "params": [
-        {
-          "name": "label",
-          "shape": "any",
-          "has_default": false
-        },
-        {
-          "name": "amount",
-          "shape": "int",
-          "has_default": false
-        }
-      ],
-      "is_generator": false,
-      "returns": [
-        "opaque"
-      ],
-      "raises": {
-        "explicit": [
-          "ValueError"
-        ],
-        "implicit": []
-      },
-      "mutations": [
-        {
-          "target": {
-            "root": "self_attr",
-            "name": "total"
-          },
-          "via": "aug_attr",
-          "name": "total"
-        },
-        {
-          "target": {
-            "root": "param",
-            "name": "self"
-          },
-          "via": "method",
-          "name": "append"
-        }
-      ],
-      "global_writes": [],
-      "io": [],
-      "unresolved_effects": [],
-      "purity": "impure",
       "cases": [
         {
+          "ctor_args": [],
           "input": [
             "ab",
             0
           ],
-          "ctor_args": [],
-          "outcome": "returned",
-          "return": 0,
           "mutations": [
             {
-              "target": "self",
-              "before": {
-                "__t__": "dict",
-                "items": [
-                  [
-                    "entries",
-                    []
-                  ],
-                  [
-                    "total",
-                    0
-                  ]
-                ]
-              },
               "after": {
                 "__t__": "dict",
                 "items": [
@@ -116,21 +53,7 @@
                     0
                   ]
                 ]
-              }
-            }
-          ]
-        },
-        {
-          "input": [
-            "ab",
-            1
-          ],
-          "ctor_args": [],
-          "outcome": "returned",
-          "return": 1,
-          "mutations": [
-            {
-              "target": "self",
+              },
               "before": {
                 "__t__": "dict",
                 "items": [
@@ -144,6 +67,20 @@
                   ]
                 ]
               },
+              "target": "self"
+            }
+          ],
+          "outcome": "returned",
+          "return": 0
+        },
+        {
+          "ctor_args": [],
+          "input": [
+            "ab",
+            1
+          ],
+          "mutations": [
+            {
               "after": {
                 "__t__": "dict",
                 "items": [
@@ -164,31 +101,7 @@
                     1
                   ]
                 ]
-              }
-            }
-          ]
-        },
-        {
-          "input": [
-            "ab",
-            -3
-          ],
-          "ctor_args": [],
-          "outcome": "raised",
-          "raises": "ValueError",
-          "mutations": []
-        },
-        {
-          "input": [
-            "ab",
-            7
-          ],
-          "ctor_args": [],
-          "outcome": "returned",
-          "return": 7,
-          "mutations": [
-            {
-              "target": "self",
+              },
               "before": {
                 "__t__": "dict",
                 "items": [
@@ -202,6 +115,30 @@
                   ]
                 ]
               },
+              "target": "self"
+            }
+          ],
+          "outcome": "returned",
+          "return": 1
+        },
+        {
+          "ctor_args": [],
+          "input": [
+            "ab",
+            -3
+          ],
+          "mutations": [],
+          "outcome": "raised",
+          "raises": "ValueError"
+        },
+        {
+          "ctor_args": [],
+          "input": [
+            "ab",
+            7
+          ],
+          "mutations": [
+            {
               "after": {
                 "__t__": "dict",
                 "items": [
@@ -222,35 +159,107 @@
                     7
                   ]
                 ]
-              }
+              },
+              "before": {
+                "__t__": "dict",
+                "items": [
+                  [
+                    "entries",
+                    []
+                  ],
+                  [
+                    "total",
+                    0
+                  ]
+                ]
+              },
+              "target": "self"
             }
-          ]
+          ],
+          "outcome": "returned",
+          "return": 7
         }
-      ]
-    },
-    {
-      "name": "digest",
-      "kind": "method",
-      "owner": "Ledger",
-      "params": [],
+      ],
+      "global_writes": [],
+      "io": [],
       "is_generator": false,
+      "kind": "method",
+      "mutations": [
+        {
+          "name": "total",
+          "target": {
+            "name": "total",
+            "root": "self_attr"
+          },
+          "via": "aug_attr"
+        },
+        {
+          "name": "append",
+          "target": {
+            "name": "entries",
+            "root": "self_attr"
+          },
+          "via": "method"
+        }
+      ],
+      "name": "add",
+      "owner": "Ledger",
+      "params": [
+        {
+          "has_default": false,
+          "name": "label",
+          "shape": "any"
+        },
+        {
+          "has_default": false,
+          "name": "amount",
+          "shape": "int"
+        }
+      ],
+      "purity": "impure",
+      "raises": {
+        "explicit": [
+          "ValueError"
+        ],
+        "implicit": []
+      },
       "returns": [
         "opaque"
       ],
+      "unresolved_effects": []
+    },
+    {
+      "cases": [
+        {
+          "ctor_args": [],
+          "input": [],
+          "mutations": [],
+          "outcome": "returned",
+          "return": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        }
+      ],
+      "global_writes": [],
+      "io": [],
+      "is_generator": false,
+      "kind": "method",
+      "mutations": [],
+      "name": "digest",
+      "owner": "Ledger",
+      "params": [],
+      "purity": "unknown",
       "raises": {
         "explicit": [],
         "implicit": []
       },
-      "mutations": [],
-      "global_writes": [],
-      "io": [],
+      "returns": [
+        "opaque"
+      ],
       "unresolved_effects": [
         {
-          "reason": "call_import",
-          "callee": "hashlib.sha256"
+          "callee": "hashlib.sha256",
+          "reason": "call_import"
         }
       ],
-      "purity": "unknown",
       "uses": [
         {
           "binding": "hashlib",
@@ -258,16 +267,8 @@
             "package": "hashlib"
           }
         }
-      ],
-      "cases": [
-        {
-          "input": [],
-          "ctor_args": [],
-          "outcome": "returned",
-          "return": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-          "mutations": []
-        }
       ]
     }
-  ]
+  ],
+  "schema_version": "1.0"
 }

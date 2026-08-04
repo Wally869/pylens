@@ -11,57 +11,16 @@
   ],
   "functions": [
     {
-      "name": "tokenize",
-      "kind": "function",
-      "params": [
-        {
-          "name": "text",
-          "shape": "any",
-          "has_default": false
-        }
-      ],
-      "is_generator": true,
-      "returns": [
-        "none"
-      ],
-      "raises": {
-        "explicit": [],
-        "implicit": []
-      },
-      "mutations": [],
-      "global_writes": [],
-      "io": [],
-      "unresolved_effects": [
-        {
-          "reason": "call_import",
-          "callee": "re.finditer",
-          "may_affect": [
-            {
-              "root": "param",
-              "name": "text"
-            }
-          ]
-        }
-      ],
-      "purity": "unknown",
-      "uses": [
-        {
-          "binding": "re",
-          "module": {
-            "package": "re"
-          }
-        }
-      ],
       "cases": [
         {
           "input": [
             "ab"
           ],
+          "mutations": [],
           "outcome": "returned",
           "return": [
             "ab"
-          ],
-          "mutations": []
+          ]
         },
         {
           "input": [
@@ -71,67 +30,76 @@
               3
             ]
           ],
+          "mutations": [],
           "outcome": "raised",
-          "raises": "TypeError",
-          "mutations": []
+          "raises": "TypeError"
         },
         {
           "input": [
             null
           ],
+          "mutations": [],
           "outcome": "raised",
-          "raises": "TypeError",
-          "mutations": []
+          "raises": "TypeError"
         },
         {
           "input": [
             1.5
           ],
+          "mutations": [],
           "outcome": "raised",
-          "raises": "TypeError",
-          "mutations": []
+          "raises": "TypeError"
         }
-      ]
-    },
-    {
-      "name": "histogram",
+      ],
+      "global_writes": [],
+      "io": [],
+      "is_generator": true,
       "kind": "function",
+      "mutations": [],
+      "name": "tokenize",
       "params": [
         {
+          "has_default": false,
           "name": "text",
-          "shape": "any",
-          "has_default": false
+          "shape": "any"
         }
       ],
-      "is_generator": false,
-      "returns": [
-        "opaque"
-      ],
+      "purity": "unknown",
       "raises": {
         "explicit": [],
         "implicit": []
       },
-      "mutations": [],
-      "global_writes": [],
-      "io": [],
+      "returns": [
+        "none"
+      ],
       "unresolved_effects": [
         {
-          "reason": "call_unknown_callee",
-          "callee": "tokenize",
+          "callee": "re.finditer",
           "may_affect": [
             {
-              "root": "param",
-              "name": "text"
+              "name": "text",
+              "root": "param"
             }
-          ]
+          ],
+          "reason": "call_import"
         }
       ],
-      "purity": "unknown",
+      "uses": [
+        {
+          "binding": "re",
+          "module": {
+            "package": "re"
+          }
+        }
+      ]
+    },
+    {
       "cases": [
         {
           "input": [
             "ab"
           ],
+          "mutations": [],
           "outcome": "returned",
           "return": {
             "__t__": "dict",
@@ -141,8 +109,7 @@
                 1
               ]
             ]
-          },
-          "mutations": []
+          }
         },
         {
           "input": [
@@ -152,112 +119,169 @@
               3
             ]
           ],
+          "mutations": [],
           "outcome": "raised",
-          "raises": "TypeError",
-          "mutations": []
+          "raises": "TypeError"
         },
         {
           "input": [
             null
           ],
+          "mutations": [],
           "outcome": "raised",
-          "raises": "TypeError",
-          "mutations": []
+          "raises": "TypeError"
         },
         {
           "input": [
             1.5
           ],
+          "mutations": [],
           "outcome": "raised",
-          "raises": "TypeError",
-          "mutations": []
+          "raises": "TypeError"
         }
-      ]
-    },
-    {
-      "name": "report",
+      ],
+      "global_writes": [],
+      "io": [],
+      "is_generator": false,
       "kind": "function",
+      "mutations": [],
+      "name": "histogram",
       "params": [
         {
-          "name": "rows",
-          "shape": "sequence",
-          "has_default": false
-        },
-        {
-          "name": "sink",
-          "shape": "any",
-          "has_default": false
+          "has_default": false,
+          "name": "text",
+          "shape": "any"
         }
       ],
-      "is_generator": false,
-      "returns": [
-        "opaque"
-      ],
+      "purity": "unknown",
       "raises": {
         "explicit": [],
         "implicit": []
       },
-      "mutations": [],
-      "global_writes": [],
-      "io": [
-        "stdout"
+      "returns": [
+        "opaque"
       ],
-      "unresolved_effects": [],
-      "purity": "impure",
+      "unresolved_effects": [
+        {
+          "callee": "tokenize",
+          "may_affect": [
+            {
+              "name": "text",
+              "root": "param"
+            }
+          ],
+          "reason": "call_unknown_callee"
+        }
+      ]
+    },
+    {
       "cases": [
         {
           "input": [
             [],
             "ab"
           ],
+          "mutations": [],
           "outcome": "returned",
           "return": 0,
-          "mutations": [],
           "stdout": "wrote 0 rows\n"
         },
         {
           "input": [
-            [
-              1
-            ],
+            [],
             [
               1,
               2,
               3
             ]
           ],
-          "outcome": "raised",
-          "raises": "AttributeError",
-          "mutations": []
+          "mutations": [],
+          "outcome": "returned",
+          "return": 0,
+          "stdout": "wrote 0 rows\n"
         },
         {
           "input": [
             [
-              3,
-              1,
-              2
+              "ab"
             ],
             null
           ],
+          "mutations": [],
           "outcome": "raised",
-          "raises": "AttributeError",
-          "mutations": []
+          "raises": "AttributeError"
         },
         {
           "input": [
             [
-              5,
-              5,
-              2,
-              8
+              "ab",
+              0,
+              [
+                1,
+                2,
+                3
+              ]
             ],
             1.5
           ],
+          "mutations": [],
           "outcome": "raised",
-          "raises": "AttributeError",
-          "mutations": []
+          "raises": "AttributeError"
+        }
+      ],
+      "global_writes": [],
+      "io": [
+        "stdout"
+      ],
+      "is_generator": false,
+      "kind": "function",
+      "mutations": [],
+      "name": "report",
+      "params": [
+        {
+          "has_default": false,
+          "name": "rows",
+          "shape": {
+            "seq": "any"
+          }
+        },
+        {
+          "has_default": false,
+          "name": "sink",
+          "shape": "any"
+        }
+      ],
+      "purity": "unknown",
+      "raises": {
+        "explicit": [],
+        "implicit": []
+      },
+      "returns": [
+        "opaque"
+      ],
+      "unresolved_effects": [
+        {
+          "callee": "write",
+          "may_affect": [
+            {
+              "name": "sink",
+              "root": "param"
+            }
+          ],
+          "reason": "call_method_unknown"
+        },
+        {
+          "callee": "format_row",
+          "may_affect": [
+            {
+              "name": "rows",
+              "root": "param"
+            }
+          ],
+          "reason": "call_unknown_callee"
         }
       ]
     }
-  ]
+  ],
+  "schema_version": "1.0"
 }

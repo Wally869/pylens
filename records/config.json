@@ -2,160 +2,97 @@
   "dependencies": [],
   "functions": [
     {
-      "name": "update",
-      "kind": "method",
-      "owner": "Config",
-      "params": [
+      "cases": [
         {
-          "name": "kwargs",
-          "shape": "mapping",
-          "has_default": true
+          "ctor_args": [],
+          "input": [],
+          "mutations": [],
+          "outcome": "returned",
+          "return": {
+            "__t__": "dict",
+            "items": []
+          }
         }
       ],
+      "global_writes": [],
+      "io": [],
       "is_generator": false,
-      "returns": [
-        "opaque"
-      ],
-      "raises": {
-        "explicit": [],
-        "implicit": []
-      },
+      "kind": "method",
       "mutations": [
         {
           "target": {
-            "root": "param",
-            "name": "self"
+            "name": "values",
+            "root": "self_attr"
           },
           "via": "subscript_set"
         }
       ],
-      "global_writes": [],
-      "io": [],
-      "unresolved_effects": [
+      "name": "update",
+      "owner": "Config",
+      "params": [
         {
-          "reason": "dynamic_setattr",
-          "callee": "setattr",
-          "may_affect": [
-            {
-              "root": "param",
-              "name": "self"
+          "has_default": false,
+          "kind": "var_keyword",
+          "name": "kwargs",
+          "shape": {
+            "map": {
+              "key": "any",
+              "value": "any"
             }
-          ]
+          }
         }
       ],
       "purity": "unknown",
-      "cases": [
-        {
-          "input": [
-            null
-          ],
-          "ctor_args": [],
-          "outcome": "raised",
-          "raises": "TypeError",
-          "mutations": []
-        },
-        {
-          "input": [
-            {}
-          ],
-          "ctor_args": [],
-          "outcome": "raised",
-          "raises": "TypeError",
-          "mutations": []
-        },
-        {
-          "input": [
-            {
-              "a": 1
-            }
-          ],
-          "ctor_args": [],
-          "outcome": "raised",
-          "raises": "TypeError",
-          "mutations": []
-        },
-        {
-          "input": [
-            {
-              "a": 1,
-              "b": 2
-            }
-          ],
-          "ctor_args": [],
-          "outcome": "raised",
-          "raises": "TypeError",
-          "mutations": []
-        }
-      ]
-    },
-    {
-      "name": "apply_patch",
-      "kind": "function",
-      "params": [
-        {
-          "name": "obj",
-          "shape": "any",
-          "has_default": false
-        },
-        {
-          "name": "patch",
-          "shape": "mapping",
-          "has_default": false
-        }
-      ],
-      "is_generator": false,
-      "returns": [
-        "opaque"
-      ],
       "raises": {
         "explicit": [],
         "implicit": []
       },
-      "mutations": [],
-      "global_writes": [],
-      "io": [],
+      "returns": [
+        "opaque"
+      ],
       "unresolved_effects": [
         {
-          "reason": "dynamic_setattr",
           "callee": "setattr",
           "may_affect": [
             {
-              "root": "param",
-              "name": "obj"
+              "name": "self",
+              "root": "param"
             }
-          ]
+          ],
+          "reason": "dynamic_setattr"
         }
-      ],
-      "purity": "unknown",
+      ]
+    },
+    {
       "cases": [
         {
           "input": [
             "ab",
             {}
           ],
+          "mutations": [],
           "outcome": "returned",
-          "return": "ab",
-          "mutations": []
+          "return": "ab"
         },
         {
           "input": [
             1.5,
             {}
           ],
+          "mutations": [],
           "outcome": "returned",
-          "return": 1.5,
-          "mutations": []
+          "return": 1.5
         },
         {
           "input": [
             null,
             {
-              "a": 1
+              "ab": "ab"
             }
           ],
+          "mutations": [],
           "outcome": "raised",
-          "raises": "AttributeError",
-          "mutations": []
+          "raises": "AttributeError"
         },
         {
           "input": [
@@ -165,15 +102,59 @@
               3
             ],
             {
-              "a": 1,
-              "b": 2
+              "ab": "ab",
+              "k1": 0
             }
           ],
+          "mutations": [],
           "outcome": "raised",
-          "raises": "AttributeError",
-          "mutations": []
+          "raises": "AttributeError"
+        }
+      ],
+      "global_writes": [],
+      "io": [],
+      "is_generator": false,
+      "kind": "function",
+      "mutations": [],
+      "name": "apply_patch",
+      "params": [
+        {
+          "has_default": false,
+          "name": "obj",
+          "shape": "any"
+        },
+        {
+          "has_default": false,
+          "name": "patch",
+          "shape": {
+            "map": {
+              "key": "any",
+              "value": "any"
+            }
+          }
+        }
+      ],
+      "purity": "unknown",
+      "raises": {
+        "explicit": [],
+        "implicit": []
+      },
+      "returns": [
+        "opaque"
+      ],
+      "unresolved_effects": [
+        {
+          "callee": "setattr",
+          "may_affect": [
+            {
+              "name": "obj",
+              "root": "param"
+            }
+          ],
+          "reason": "dynamic_setattr"
         }
       ]
     }
-  ]
+  ],
+  "schema_version": "1.0"
 }

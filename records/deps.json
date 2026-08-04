@@ -9,27 +9,27 @@
       "status": "resolved"
     },
     {
+      "alias": "np",
+      "error": {
+        "kind": "ModuleNotFoundError",
+        "message": "No module named 'numpy'",
+        "module": "numpy",
+        "stage": "setup"
+      },
       "from": false,
       "module": {
         "package": "numpy"
       },
-      "alias": "np",
       "scope": "module",
-      "status": "unresolved",
-      "error": {
-        "stage": "setup",
-        "kind": "ModuleNotFoundError",
-        "message": "No module named 'numpy'",
-        "module": "numpy"
-      }
+      "status": "unresolved"
     },
     {
+      "alias": "ET",
       "from": false,
       "module": {
         "package": "xml",
         "path": "etree.ElementTree"
       },
-      "alias": "ET",
       "scope": "module",
       "status": "resolved"
     },
@@ -63,6 +63,12 @@
       "status": "resolved"
     },
     {
+      "error": {
+        "kind": "ModuleNotFoundError",
+        "message": "No module named 'nonexistent_pkg'",
+        "module": "nonexistent_pkg",
+        "stage": "setup"
+      },
       "from": true,
       "module": {
         "package": "nonexistent_pkg"
@@ -73,15 +79,15 @@
         }
       ],
       "scope": "module",
-      "status": "unresolved",
-      "error": {
-        "stage": "setup",
-        "kind": "ModuleNotFoundError",
-        "message": "No module named 'nonexistent_pkg'",
-        "module": "nonexistent_pkg"
-      }
+      "status": "unresolved"
     },
     {
+      "error": {
+        "kind": "ModuleNotFoundError",
+        "message": "No module named 'fakelib'",
+        "module": "fakelib",
+        "stage": "setup"
+      },
       "from": true,
       "module": {
         "package": "fakelib",
@@ -93,13 +99,7 @@
         }
       ],
       "scope": "module",
-      "status": "unresolved",
-      "error": {
-        "stage": "setup",
-        "kind": "ModuleNotFoundError",
-        "message": "No module named 'fakelib'",
-        "module": "fakelib"
-      }
+      "status": "unresolved"
     },
     {
       "from": true,
@@ -107,16 +107,16 @@
         "package": "os",
         "path": "path"
       },
-      "star": true,
       "scope": "module",
+      "star": true,
       "status": "resolved"
     },
     {
       "from": true,
+      "level": 1,
       "module": {
         "package": ""
       },
-      "level": 1,
       "names": [
         {
           "name": "sibling"
@@ -128,39 +128,49 @@
   ],
   "functions": [
     {
-      "name": "summarize",
+      "cases": [],
+      "global_writes": [],
+      "io": [],
+      "is_generator": false,
       "kind": "function",
+      "mutations": [],
+      "name": "summarize",
       "params": [
         {
+          "has_default": false,
           "name": "rows",
-          "shape": "any",
-          "has_default": false
+          "shape": "any"
         }
       ],
-      "is_generator": false,
-      "returns": [
-        "opaque"
-      ],
+      "purity": "unknown",
       "raises": {
         "explicit": [],
         "implicit": []
       },
-      "mutations": [],
-      "global_writes": [],
-      "io": [],
+      "returns": [
+        "opaque"
+      ],
+      "uncallable": {
+        "error": {
+          "kind": "ModuleNotFoundError",
+          "message": "No module named 'numpy'",
+          "module": "numpy",
+          "stage": "setup"
+        },
+        "reason": "module_not_loadable"
+      },
       "unresolved_effects": [
         {
-          "reason": "call_import",
           "callee": "np.array",
           "may_affect": [
             {
-              "root": "param",
-              "name": "rows"
+              "name": "rows",
+              "root": "param"
             }
-          ]
+          ],
+          "reason": "call_import"
         }
       ],
-      "purity": "unknown",
       "uses": [
         {
           "binding": "np",
@@ -168,17 +178,8 @@
             "package": "numpy"
           }
         }
-      ],
-      "uncallable": {
-        "reason": "module_not_loadable",
-        "error": {
-          "stage": "setup",
-          "kind": "ModuleNotFoundError",
-          "message": "No module named 'numpy'",
-          "module": "numpy"
-        }
-      },
-      "cases": []
+      ]
     }
-  ]
+  ],
+  "schema_version": "1.0"
 }

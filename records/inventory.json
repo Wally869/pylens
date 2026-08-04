@@ -2,25 +2,200 @@
   "dependencies": [],
   "functions": [
     {
-      "name": "add",
+      "cases": [
+        {
+          "ctor_args": [],
+          "input": [
+            "ab",
+            0
+          ],
+          "mutations": [],
+          "outcome": "raised",
+          "raises": "ValueError"
+        },
+        {
+          "ctor_args": [],
+          "input": [
+            "ab",
+            1
+          ],
+          "mutations": [
+            {
+              "after": {
+                "__t__": "dict",
+                "items": [
+                  [
+                    "capacity",
+                    100
+                  ],
+                  [
+                    "items",
+                    {
+                      "__t__": "dict",
+                      "items": [
+                        [
+                          "ab",
+                          1
+                        ]
+                      ]
+                    }
+                  ],
+                  [
+                    "log",
+                    [
+                      {
+                        "__t__": "tuple",
+                        "items": [
+                          "add",
+                          "ab",
+                          1
+                        ]
+                      }
+                    ]
+                  ]
+                ]
+              },
+              "before": {
+                "__t__": "dict",
+                "items": [
+                  [
+                    "capacity",
+                    100
+                  ],
+                  [
+                    "items",
+                    {
+                      "__t__": "dict",
+                      "items": []
+                    }
+                  ],
+                  [
+                    "log",
+                    []
+                  ]
+                ]
+              },
+              "target": "self"
+            }
+          ],
+          "outcome": "returned",
+          "return": 1
+        },
+        {
+          "ctor_args": [],
+          "input": [
+            "ab",
+            -3
+          ],
+          "mutations": [],
+          "outcome": "raised",
+          "raises": "ValueError"
+        },
+        {
+          "ctor_args": [],
+          "input": [
+            "ab",
+            7
+          ],
+          "mutations": [
+            {
+              "after": {
+                "__t__": "dict",
+                "items": [
+                  [
+                    "capacity",
+                    100
+                  ],
+                  [
+                    "items",
+                    {
+                      "__t__": "dict",
+                      "items": [
+                        [
+                          "ab",
+                          7
+                        ]
+                      ]
+                    }
+                  ],
+                  [
+                    "log",
+                    [
+                      {
+                        "__t__": "tuple",
+                        "items": [
+                          "add",
+                          "ab",
+                          7
+                        ]
+                      }
+                    ]
+                  ]
+                ]
+              },
+              "before": {
+                "__t__": "dict",
+                "items": [
+                  [
+                    "capacity",
+                    100
+                  ],
+                  [
+                    "items",
+                    {
+                      "__t__": "dict",
+                      "items": []
+                    }
+                  ],
+                  [
+                    "log",
+                    []
+                  ]
+                ]
+              },
+              "target": "self"
+            }
+          ],
+          "outcome": "returned",
+          "return": 7
+        }
+      ],
+      "global_writes": [],
+      "io": [],
+      "is_generator": false,
       "kind": "method",
+      "mutations": [
+        {
+          "target": {
+            "name": "items",
+            "root": "self_attr"
+          },
+          "via": "subscript_set"
+        },
+        {
+          "name": "append",
+          "target": {
+            "name": "log",
+            "root": "self_attr"
+          },
+          "via": "method"
+        }
+      ],
+      "name": "add",
       "owner": "Inventory",
       "params": [
         {
+          "has_default": false,
           "name": "name",
-          "shape": "any",
-          "has_default": false
+          "shape": "any"
         },
         {
+          "has_default": false,
           "name": "qty",
-          "shape": "int",
-          "has_default": false
+          "shape": "int"
         }
       ],
-      "is_generator": false,
-      "returns": [
-        "opaque"
-      ],
+      "purity": "impure",
       "raises": {
         "explicit": [
           "ValueError",
@@ -28,206 +203,97 @@
         ],
         "implicit": []
       },
-      "mutations": [
-        {
-          "target": {
-            "root": "param",
-            "name": "self"
-          },
-          "via": "subscript_set"
-        },
-        {
-          "target": {
-            "root": "param",
-            "name": "self"
-          },
-          "via": "method",
-          "name": "append"
-        }
+      "returns": [
+        "opaque"
       ],
-      "global_writes": [],
-      "io": [],
-      "unresolved_effects": [],
-      "purity": "impure",
+      "unresolved_effects": []
+    },
+    {
       "cases": [
         {
+          "ctor_args": [],
           "input": [
             "ab",
             0
           ],
-          "ctor_args": [],
+          "mutations": [],
           "outcome": "raised",
-          "raises": "ValueError",
-          "mutations": []
+          "raises": "KeyError"
         },
         {
+          "ctor_args": [],
           "input": [
             "ab",
             1
           ],
-          "ctor_args": [],
-          "outcome": "returned",
-          "return": 1,
-          "mutations": [
-            {
-              "target": "self",
-              "before": {
-                "__t__": "dict",
-                "items": [
-                  [
-                    "capacity",
-                    100
-                  ],
-                  [
-                    "items",
-                    {
-                      "__t__": "dict",
-                      "items": []
-                    }
-                  ],
-                  [
-                    "log",
-                    []
-                  ]
-                ]
-              },
-              "after": {
-                "__t__": "dict",
-                "items": [
-                  [
-                    "capacity",
-                    100
-                  ],
-                  [
-                    "items",
-                    {
-                      "__t__": "dict",
-                      "items": [
-                        [
-                          "ab",
-                          1
-                        ]
-                      ]
-                    }
-                  ],
-                  [
-                    "log",
-                    [
-                      {
-                        "__t__": "tuple",
-                        "items": [
-                          "add",
-                          "ab",
-                          1
-                        ]
-                      }
-                    ]
-                  ]
-                ]
-              }
-            }
-          ]
+          "mutations": [],
+          "outcome": "raised",
+          "raises": "KeyError"
         },
         {
+          "ctor_args": [],
           "input": [
             "ab",
             -3
           ],
-          "ctor_args": [],
+          "mutations": [],
           "outcome": "raised",
-          "raises": "ValueError",
-          "mutations": []
+          "raises": "KeyError"
         },
         {
+          "ctor_args": [],
           "input": [
             "ab",
             7
           ],
-          "ctor_args": [],
-          "outcome": "returned",
-          "return": 7,
-          "mutations": [
-            {
-              "target": "self",
-              "before": {
-                "__t__": "dict",
-                "items": [
-                  [
-                    "capacity",
-                    100
-                  ],
-                  [
-                    "items",
-                    {
-                      "__t__": "dict",
-                      "items": []
-                    }
-                  ],
-                  [
-                    "log",
-                    []
-                  ]
-                ]
-              },
-              "after": {
-                "__t__": "dict",
-                "items": [
-                  [
-                    "capacity",
-                    100
-                  ],
-                  [
-                    "items",
-                    {
-                      "__t__": "dict",
-                      "items": [
-                        [
-                          "ab",
-                          7
-                        ]
-                      ]
-                    }
-                  ],
-                  [
-                    "log",
-                    [
-                      {
-                        "__t__": "tuple",
-                        "items": [
-                          "add",
-                          "ab",
-                          7
-                        ]
-                      }
-                    ]
-                  ]
-                ]
-              }
-            }
-          ]
+          "mutations": [],
+          "outcome": "raised",
+          "raises": "KeyError"
         }
-      ]
-    },
-    {
-      "name": "remove",
+      ],
+      "global_writes": [],
+      "io": [],
+      "is_generator": false,
       "kind": "method",
+      "mutations": [
+        {
+          "target": {
+            "name": "items",
+            "root": "self_attr"
+          },
+          "via": "aug_subscript"
+        },
+        {
+          "target": {
+            "name": "items",
+            "root": "self_attr"
+          },
+          "via": "subscript_del"
+        },
+        {
+          "name": "append",
+          "target": {
+            "name": "log",
+            "root": "self_attr"
+          },
+          "via": "method"
+        }
+      ],
+      "name": "remove",
       "owner": "Inventory",
       "params": [
         {
+          "has_default": false,
           "name": "name",
-          "shape": "any",
-          "has_default": false
+          "shape": "any"
         },
         {
+          "has_default": false,
           "name": "qty",
-          "shape": "any",
-          "has_default": false
+          "shape": "int"
         }
       ],
-      "is_generator": false,
-      "returns": [
-        "opaque"
-      ],
+      "purity": "impure",
       "raises": {
         "explicit": [
           "KeyError",
@@ -235,115 +301,42 @@
         ],
         "implicit": []
       },
-      "mutations": [
-        {
-          "target": {
-            "root": "param",
-            "name": "self"
-          },
-          "via": "aug_subscript"
-        },
-        {
-          "target": {
-            "root": "param",
-            "name": "self"
-          },
-          "via": "subscript_del"
-        },
-        {
-          "target": {
-            "root": "param",
-            "name": "self"
-          },
-          "via": "method",
-          "name": "append"
-        }
-      ],
-      "global_writes": [],
-      "io": [],
-      "unresolved_effects": [],
-      "purity": "impure",
-      "cases": [
-        {
-          "input": [
-            "ab",
-            "ab"
-          ],
-          "ctor_args": [],
-          "outcome": "raised",
-          "raises": "KeyError",
-          "mutations": []
-        },
-        {
-          "input": [
-            [
-              1,
-              2,
-              3
-            ],
-            [
-              1,
-              2,
-              3
-            ]
-          ],
-          "ctor_args": [],
-          "outcome": "raised",
-          "raises": "TypeError",
-          "mutations": []
-        },
-        {
-          "input": [
-            null,
-            null
-          ],
-          "ctor_args": [],
-          "outcome": "raised",
-          "raises": "KeyError",
-          "mutations": []
-        },
-        {
-          "input": [
-            1.5,
-            1.5
-          ],
-          "ctor_args": [],
-          "outcome": "raised",
-          "raises": "KeyError",
-          "mutations": []
-        }
-      ]
-    },
-    {
-      "name": "view",
-      "kind": "method",
-      "owner": "Inventory",
-      "params": [],
-      "is_generator": false,
       "returns": [
         "opaque"
       ],
-      "raises": {
-        "explicit": [],
-        "implicit": []
-      },
-      "mutations": [],
-      "global_writes": [],
-      "io": [],
-      "unresolved_effects": [],
-      "purity": "pure",
+      "unresolved_effects": []
+    },
+    {
       "cases": [
         {
-          "input": [],
           "ctor_args": [],
+          "input": [],
+          "mutations": [],
           "outcome": "returned",
           "return": {
             "__t__": "dict",
             "items": []
-          },
-          "mutations": []
+          }
         }
-      ]
+      ],
+      "global_writes": [],
+      "io": [],
+      "is_generator": false,
+      "kind": "method",
+      "mutations": [],
+      "name": "view",
+      "owner": "Inventory",
+      "params": [],
+      "purity": "pure",
+      "raises": {
+        "explicit": [],
+        "implicit": []
+      },
+      "returns": [
+        "opaque"
+      ],
+      "unresolved_effects": []
     }
-  ]
+  ],
+  "schema_version": "1.0"
 }
