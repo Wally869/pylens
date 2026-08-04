@@ -1,6 +1,6 @@
 //! pylens CLI.
 //!
-//!   pylens analyze  <file.py|dir> [--format json|summary]              static effect signatures
+//!   pylens analyze  <file.py|dir> [--format json|summary|pyi]          static effect signatures
 //!   pylens record   <file.py|dir> [--inputs N] [--format json|summary] signatures + observed
 //!                                                                       cases (runs the jail)
 //!   pylens validate <file.py|dir> [--inputs N] [--format json|summary] observed ⊆ static
@@ -14,11 +14,13 @@
 //! unchanged.
 //!
 //! `--format` defaults to `json`. `--format summary` renders a thin terminal summary instead
-//! (see `pylens::report`).
+//! (see `pylens::report`). `analyze --format pyi` renders inferred `.pyi` type-hint stubs
+//! instead (see `pylens::stub`); it is not available on `record`/`validate`.
 
 use std::io::Read;
 
 use pylens::report::{self, FunctionValidation};
+use pylens::stub;
 use pylens::validate::{Severity, validate_function};
 
 fn main() {
@@ -29,7 +31,7 @@ fn main() {
         Some("validate") => cmd_validate(&args[2..]),
         _ => {
             eprintln!(
-                "usage:\n  pylens analyze <file.py|dir> [--format json|summary]\n  \
+                "usage:\n  pylens analyze <file.py|dir> [--format json|summary|pyi]\n  \
                  pylens record <file.py|dir> [--inputs <N>] [--format json|summary]\n  \
                  pylens validate <file.py|dir> [--inputs <N>] [--format json|summary]"
             );
@@ -44,7 +46,12 @@ fn cmd_analyze(args: &[String]) {
     if let Some(p) = path
         && std::path::Path::new(p.as_str()).is_dir()
     {
-        let report = pylens::project::analyze_project(std::path::Path::new(p.as_str()));
+        let root = std::path::Path::new(p.as_str());
+        if format == Format::Pyi {
+            print!("{}", analyze_project_pyi(root));
+            return;
+        }
+        let report = pylens::project::analyze_project(root);
         if format == Format::Summary {
             print!("{}", report::project_summary(&report));
         } else {
@@ -59,23 +66,59 @@ fn cmd_analyze(args: &[String]) {
     let label = path.map(String::as_str).unwrap_or("<stdin>");
     match (pylens::imports_of(&src), pylens::analyze_source(&src)) {
         (Ok(imports), Ok(functions)) => {
-            if format == Format::Summary {
-                print!("{}", report::analyze_summary(label, &functions));
-                return;
+            match format {
+                Format::Summary => {
+                    print!("{}", report::analyze_summary(label, &functions));
+                }
+                Format::Pyi => {
+                    print!("{}", stub::render_stub(&functions));
+                }
+                Format::Json => {
+                    let out = serde_json::json!({
+                        "schema_version": pylens::SCHEMA_VERSION,
+                        "imports": imports,
+                        "functions": functions,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+                }
             }
-            let out = serde_json::json!({
-                "schema_version": pylens::SCHEMA_VERSION,
-                "imports": imports,
-                "functions": functions,
-            });
-            println!("{}", serde_json::to_string_pretty(&out).unwrap());
         }
         (Err(e), _) | (_, Err(e)) => fail(&format!("parse error: {e}")),
     }
 }
 
+/// Render `.pyi` stubs for every `*.py` file under `root`, each preceded by a `# <relative
+/// path>` comment line. A file that fails to read or parse is skipped with an inline error
+/// comment instead of aborting the whole run, consistent with the JSON project-report behavior.
+fn analyze_project_pyi(root: &std::path::Path) -> String {
+    let files = pylens::project::collect_py_files(root);
+    let mut out = String::new();
+    for path in files {
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        out.push_str(&format!("# {rel}\n"));
+        let src = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                out.push_str(&format!("# read error: {e}\n\n"));
+                continue;
+            }
+        };
+        match pylens::analyze_source(&src) {
+            Ok(functions) => out.push_str(&stub::render_stub(&functions)),
+            Err(e) => out.push_str(&format!("# parse error: {e}\n")),
+        }
+        out.push('\n');
+    }
+    out
+}
+
 fn cmd_record(args: &[String]) {
     let format = format_of(args);
+    reject_pyi_format(&format);
     let path = args
         .iter()
         .find(|a| !a.starts_with("--"))
@@ -119,6 +162,7 @@ fn cmd_record(args: &[String]) {
 
 fn cmd_validate(args: &[String]) {
     let format = format_of(args);
+    reject_pyi_format(&format);
     let path = args
         .iter()
         .find(|a| !a.starts_with("--"))
@@ -221,13 +265,24 @@ fn cmd_validate(args: &[String]) {
 enum Format {
     Json,
     Summary,
+    /// `.pyi` type-hint stub output — `analyze` only (see `cmd_analyze`).
+    Pyi,
 }
 
 fn format_of(args: &[String]) -> Format {
     match flag(args, "--format").as_deref() {
         Some("summary") => Format::Summary,
+        Some("pyi") => Format::Pyi,
         Some("json") | None => Format::Json,
-        Some(other) => fail(&format!("unknown --format '{other}' (expected json|summary)")),
+        Some(other) => fail(&format!(
+            "unknown --format '{other}' (expected json|summary|pyi)"
+        )),
+    }
+}
+
+fn reject_pyi_format(format: &Format) {
+    if *format == Format::Pyi {
+        fail("--format pyi is only supported by 'analyze'");
     }
 }
 

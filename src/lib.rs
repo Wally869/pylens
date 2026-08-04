@@ -9,6 +9,7 @@ pub mod parse;
 pub mod project;
 pub mod record;
 pub mod report;
+pub mod stub;
 pub mod validate;
 
 /// The version of the top-level JSON contract emitted by `analyze` / `record` / `validate`.
