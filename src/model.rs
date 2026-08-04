@@ -4,7 +4,9 @@
 //! whatever any execution actually does, so the soundness invariant `observed ⊆ static`
 //! holds. See DESIGN.md.
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, Visitor};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Whether the analyzed definition is a free function or a method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +62,10 @@ pub enum MutationKind {
     Method,
     AugSubscript,
     AugAttr,
+    /// `+=`/`-=`/... on a plain name (e.g. `p += [1]`) — a may-mutation since the operator's
+    /// effect on the underlying object depends on its runtime type (list `+=` mutates in
+    /// place, int `+=` does not).
+    AugName,
 }
 
 /// A single may-mutation: some root, mutated some way.
@@ -224,29 +230,182 @@ pub struct ImportUse {
 }
 
 /// A usage-inferred shape for a parameter, used to direct input generation. Inferred from how
-/// the parameter is used in the body (not from annotations).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ParamShape {
+/// the parameter is used in the body (not from annotations). Recursive: a container shape
+/// carries the shape of its elements/keys/values, which in turn may be `Any` (unknown) or
+/// another container. Scalars serialize as a lowercase string (e.g. `"int"`, `"any"`);
+/// containers serialize as a tagged object (`{"seq": <elem>}`, `{"map": {"key": ..., "value":
+/// ...}}`, `{"set": <elem>}`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Shape {
     Int,
     Float,
-    Str,
     Bool,
-    /// list/tuple-like: indexed, iterated, `len()`-ed, or list-mutated.
-    Sequence,
-    /// dict-like: `.keys`/`.get`/`.items`/`.update`.
-    Mapping,
-    Set,
+    Str,
+    Bytes,
+    None,
+    /// list/tuple-like: indexed, iterated, `len()`-ed, or list-mutated. Carries the element
+    /// shape.
+    Seq(Box<Shape>),
+    /// dict-like: `.keys`/`.get`/`.items`/`.update`. Carries the key and value shapes.
+    Map(Box<Shape>, Box<Shape>),
+    /// Carries the element shape.
+    Set(Box<Shape>),
     /// No discriminating usage observed.
     Any,
+}
+
+impl Shape {
+    /// `Seq(Any)` — a sequence with no discriminating element usage observed.
+    pub fn any_seq() -> Self {
+        Shape::Seq(Box::new(Shape::Any))
+    }
+
+    /// `Map(Any, Any)` — a mapping with no discriminating key/value usage observed.
+    pub fn any_map() -> Self {
+        Shape::Map(Box::new(Shape::Any), Box::new(Shape::Any))
+    }
+
+    /// `Set(Any)` — a set with no discriminating element usage observed.
+    pub fn any_set() -> Self {
+        Shape::Set(Box::new(Shape::Any))
+    }
+
+    /// Merge two pieces of shape evidence for the same root. Matching constructors recurse into
+    /// their children; `Any` defers to the other side; conflicting constructors (e.g. `Int` vs
+    /// `Seq`) resolve to `Any` since the evidence disagrees and the analyzer must over-approximate
+    /// rather than pick arbitrarily.
+    pub fn join(a: Shape, b: Shape) -> Shape {
+        match (a, b) {
+            (Shape::Any, other) | (other, Shape::Any) => other,
+            (Shape::Seq(e1), Shape::Seq(e2)) => Shape::Seq(Box::new(Shape::join(*e1, *e2))),
+            (Shape::Set(e1), Shape::Set(e2)) => Shape::Set(Box::new(Shape::join(*e1, *e2))),
+            (Shape::Map(k1, v1), Shape::Map(k2, v2)) => Shape::Map(
+                Box::new(Shape::join(*k1, *k2)),
+                Box::new(Shape::join(*v1, *v2)),
+            ),
+            (a, b) if a == b => a,
+            _ => Shape::Any,
+        }
+    }
+}
+
+/// Scalars serialize as a lowercase tag string; containers serialize as a single-key tagged
+/// object (`{"seq": <elem>}`, `{"set": <elem>}`, `{"map": {"key": ..., "value": ...}}`).
+impl Serialize for Shape {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Shape::Int => serializer.serialize_str("int"),
+            Shape::Float => serializer.serialize_str("float"),
+            Shape::Bool => serializer.serialize_str("bool"),
+            Shape::Str => serializer.serialize_str("str"),
+            Shape::Bytes => serializer.serialize_str("bytes"),
+            Shape::None => serializer.serialize_str("none"),
+            Shape::Any => serializer.serialize_str("any"),
+            Shape::Seq(elem) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("seq", elem)?;
+                map.end()
+            }
+            Shape::Set(elem) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("set", elem)?;
+                map.end()
+            }
+            Shape::Map(key, value) => {
+                #[derive(Serialize)]
+                struct MapFields<'a> {
+                    key: &'a Shape,
+                    value: &'a Shape,
+                }
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("map", &MapFields { key, value })?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Shape {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ShapeVisitor;
+
+        impl<'de> Visitor<'de> for ShapeVisitor {
+            type Value = Shape;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a shape tag string or a tagged shape object")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Shape, E> {
+                match v {
+                    "int" => Ok(Shape::Int),
+                    "float" => Ok(Shape::Float),
+                    "bool" => Ok(Shape::Bool),
+                    "str" => Ok(Shape::Str),
+                    "bytes" => Ok(Shape::Bytes),
+                    "none" => Ok(Shape::None),
+                    "any" => Ok(Shape::Any),
+                    other => Err(de::Error::unknown_variant(
+                        other,
+                        &["int", "float", "bool", "str", "bytes", "none", "any"],
+                    )),
+                }
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Shape, A::Error> {
+                let tag: String = map
+                    .next_key()?
+                    .ok_or_else(|| de::Error::custom("expected a shape tag key"))?;
+                match tag.as_str() {
+                    "seq" => Ok(Shape::Seq(Box::new(map.next_value()?))),
+                    "set" => Ok(Shape::Set(Box::new(map.next_value()?))),
+                    "map" => {
+                        #[derive(Deserialize)]
+                        struct MapFields {
+                            key: Shape,
+                            value: Shape,
+                        }
+                        let fields: MapFields = map.next_value()?;
+                        Ok(Shape::Map(Box::new(fields.key), Box::new(fields.value)))
+                    }
+                    other => Err(de::Error::unknown_variant(other, &["seq", "set", "map"])),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(ShapeVisitor)
+    }
+}
+
+/// Whether a parameter binds one positional/keyword argument, or collects a variable number of
+/// them (`*args` / `**kwargs`). A var-positional/var-keyword parameter never receives a single
+/// generated value positionally — see `generate::gen_inputs`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParamKind {
+    #[default]
+    Positional,
+    /// A parameter after a bare `*` or `*args` that only binds by keyword (`def f(a, *, b)`).
+    /// Generated and passed as a named keyword argument — see `generate::gen_inputs`.
+    KeywordOnly,
+    /// `*args`.
+    VarPositional,
+    /// `**kwargs`.
+    VarKeyword,
+}
+
+fn is_positional(k: &ParamKind) -> bool {
+    matches!(k, ParamKind::Positional)
 }
 
 /// A parameter and its inferred shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParamInfo {
     pub name: String,
-    pub shape: ParamShape,
+    pub shape: Shape,
     pub has_default: bool,
+    #[serde(default, skip_serializing_if = "is_positional")]
+    pub kind: ParamKind,
 }
 
 /// The full effect signature of one function/method.
@@ -282,6 +441,11 @@ pub struct EffectSignature {
     /// resolve — so that name *may* come from the star import.
     #[serde(default, skip_serializing_if = "is_false")]
     pub may_use_star: bool,
+    /// Dotted decorator names applied to this def, in source order. A decorator outside the
+    /// recognized-transparent set can replace the function entirely, so it downgrades purity —
+    /// see the Purity pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decorators: Vec<String>,
 }
 
 impl EffectSignature {
@@ -303,6 +467,7 @@ impl EffectSignature {
             purity: Purity::Unknown,
             uses: Vec::new(),
             may_use_star: false,
+            decorators: Vec::new(),
         }
     }
 }

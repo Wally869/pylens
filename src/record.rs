@@ -6,10 +6,10 @@
 use std::collections::HashMap;
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::exec::{CallResult, HarnessError, NsjailPool, Sandbox};
-use crate::generate::gen_inputs;
+use crate::generate::{GenInput, gen_inputs, keyword_only_params, positional_params};
 use crate::model::{DefKind, EffectSignature, Import};
 use crate::{analyze_source, imports_of};
 
@@ -31,10 +31,19 @@ pub struct ObservedMutation {
 #[derive(Serialize)]
 pub struct Case {
     pub input: Vec<Value>,
+    /// Keyword-only arguments passed this call, name → value.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub kwargs: Map<String, Value>,
     /// Constructor arguments used to build the receiver (methods only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ctor_args: Option<Vec<Value>>,
-    /// `returned` | `raised` | `error` (harness/setup failure).
+    /// `returned` | `raised` | `error`. **`raised` means the function itself raised a semantic
+    /// exception** (part of its behavior/spec) — `raises` carries the exception type. A
+    /// **resource kill** (out-of-memory, recursion limit, timeout — an artifact of the sandbox,
+    /// not the function's semantics) is never `raised`: it is always `error`, with the
+    /// structured `error.stage == "resource"` (see [`crate::exec::HarnessError::is_resource`]).
+    /// Other harness/setup failures (bad source, missing function, timeout-unrelated crashes)
+    /// are also `error`, with a different `stage`.
     pub outcome: String,
     #[serde(rename = "return", skip_serializing_if = "Option::is_none")]
     pub ret: Option<Value>,
@@ -213,7 +222,7 @@ fn function_cases(
 ) -> Result<Vec<Case>, String> {
     let mut cases = Vec::new();
     for input in gen_inputs(sig, max_inputs) {
-        let result = sandbox.call(src, &sig.name, &input)?;
+        let result = sandbox.call(src, &sig.name, &input.positional, &input.kwargs)?;
         cases.push(build_case(sig, &input, None, &result));
     }
     Ok(cases)
@@ -253,14 +262,15 @@ fn method_record(
 
     let mut cases = Vec::new();
     for input in gen_inputs(sig, max_inputs) {
-        let result = sandbox.call_method(src, class, &ctor_args, &sig.name, &input)?;
+        let result =
+            sandbox.call_method(src, class, &ctor_args, &sig.name, &input.positional, &input.kwargs)?;
         cases.push(build_case(sig, &input, Some(ctor_args.clone()), &result));
     }
     Ok((None, cases))
 }
 
 /// Constructor arguments for `class`: empty when `__init__` is absent or fully defaulted
-/// (so a no-arg receiver is valid), else the first generated vector.
+/// (so a no-arg receiver is valid), else the first generated vector's positional arguments.
 fn constructor_args(all: &[EffectSignature], class: &str) -> Vec<Value> {
     let Some(init) = all
         .iter()
@@ -271,22 +281,42 @@ fn constructor_args(all: &[EffectSignature], class: &str) -> Vec<Value> {
     if init.params.iter().all(|p| p.has_default) {
         return Vec::new();
     }
-    gen_inputs(init, 1).into_iter().next().unwrap_or_default()
+    gen_inputs(init, 1)
+        .into_iter()
+        .next()
+        .map(|g| g.positional)
+        .unwrap_or_default()
 }
 
 fn build_case(
     sig: &EffectSignature,
-    input: &[Value],
+    input: &GenInput,
     ctor_args: Option<Vec<Value>>,
     r: &CallResult,
 ) -> Case {
     let mut mutations = Vec::new();
 
-    // Argument mutations: diff the pre-call snapshot against the post-call state. Both come
-    // from the worker in the same tagged encoding, so equal values compare equal.
+    // Positional argument mutations: diff the pre-call snapshot against the post-call state.
+    // Both come from the worker in the same tagged encoding, so equal values compare equal.
+    // `positional_params(sig)` is the same filter used to build `input.positional`, so the
+    // index alignment holds.
     if let (Some(pre), Some(post)) = (&r.args_pre, &r.args_post) {
-        for (i, p) in sig.params.iter().enumerate() {
+        for (i, p) in positional_params(sig).into_iter().enumerate() {
             if let (Some(before), Some(after)) = (pre.get(i), post.get(i))
+                && !value_eq(before, after)
+            {
+                mutations.push(ObservedMutation {
+                    target: p.name.clone(),
+                    before: before.clone(),
+                    after: after.clone(),
+                });
+            }
+        }
+    }
+    // Keyword-only argument mutations: diff by name, symmetric to the positional case above.
+    if let (Some(pre), Some(post)) = (&r.kwargs_pre, &r.kwargs_post) {
+        for p in keyword_only_params(sig) {
+            if let (Some(before), Some(after)) = (pre.get(&p.name), post.get(&p.name))
                 && !value_eq(before, after)
             {
                 mutations.push(ObservedMutation {
@@ -310,10 +340,12 @@ fn build_case(
 
     let stdout = r.stdout.clone();
     let stderr = r.stderr.clone();
+    let kwargs: Map<String, Value> = input.kwargs.iter().cloned().collect();
 
     if let Some(err) = &r.error {
         return Case {
-            input: input.to_vec(),
+            input: input.positional.clone(),
+            kwargs,
             ctor_args,
             outcome: "error".to_string(),
             ret: None,
@@ -327,7 +359,8 @@ fn build_case(
     }
     if r.ok {
         Case {
-            input: input.to_vec(),
+            input: input.positional.clone(),
+            kwargs,
             ctor_args,
             outcome: "returned".to_string(),
             ret: Some(r.ret.clone()),
@@ -340,7 +373,8 @@ fn build_case(
         }
     } else {
         Case {
-            input: input.to_vec(),
+            input: input.positional.clone(),
+            kwargs,
             ctor_args,
             outcome: "raised".to_string(),
             ret: None,

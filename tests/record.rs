@@ -110,3 +110,132 @@ fn unresolved_module_import_hoists_to_uncallable() {
     assert_eq!(unc.error.module.as_deref(), Some("definitely_not_a_real_module_xyz"));
     assert!(f.cases.is_empty(), "no per-case spam when the module can't load");
 }
+
+#[test]
+fn recursion_error_is_reported_as_resource_kill_not_raised() {
+    if !ready("recursion_error_is_reported_as_resource_kill_not_raised") {
+        return;
+    }
+    // Infinite recursion hits Python's recursion limit and raises RecursionError — a resource
+    // kill, an artifact of the sandbox, NOT part of the function's semantics. It must never
+    // surface as outcome "raised".
+    // `n - 1` votes the param shape to Int (see `analyze/passes/effects.rs`), so every
+    // generated case is a plain integer and recursion depth is what exhausts the limit, not a
+    // spurious `TypeError` from a mismatched shape guess.
+    let src = "def f(n):\n    return f(n - 1)\n";
+    let rec = record_file(src, 3).expect("record");
+    let f = rec
+        .functions
+        .iter()
+        .find(|r| r.signature.name == "f")
+        .expect("f record");
+    assert!(!f.cases.is_empty(), "expected generated cases");
+    for c in &f.cases {
+        assert_ne!(
+            c.outcome, "raised",
+            "recursion exhaustion must not be reported as a semantic raise: {:?}",
+            c.raises
+        );
+        assert_eq!(c.outcome, "error", "expected a resource-kill error outcome");
+        let err = c.error.as_ref().expect("structured error for resource kill");
+        assert!(
+            err.is_resource(),
+            "expected stage == \"resource\", got {:?}",
+            err.stage
+        );
+        assert_eq!(err.kind, "RecursionError");
+    }
+}
+
+#[test]
+fn semantic_raise_is_unaffected_by_resource_kill_handling() {
+    if !ready("semantic_raise_is_unaffected_by_resource_kill_handling") {
+        return;
+    }
+    // A genuine `raise` inside the function is unambiguously semantic and must still surface
+    // as outcome "raised" with the exception type in `raises`.
+    let src = "def g():\n    raise ValueError('x')\n";
+    let rec = record_file(src, 3).expect("record");
+    let g = rec
+        .functions
+        .iter()
+        .find(|r| r.signature.name == "g")
+        .expect("g record");
+    assert!(!g.cases.is_empty(), "expected generated cases");
+    for c in &g.cases {
+        assert_eq!(c.outcome, "raised");
+        assert_eq!(c.raises.as_deref(), Some("ValueError"));
+        assert!(c.error.is_none(), "a semantic raise carries no structured error");
+    }
+}
+
+#[test]
+fn kwargs_param_does_not_produce_spurious_type_error() {
+    if !ready("kwargs_param_does_not_produce_spurious_type_error") {
+        return;
+    }
+    let src = "def f(a, **kw):\n    return a\n";
+    let rec = record_file(src, 4).expect("record");
+    let f = rec
+        .functions
+        .iter()
+        .find(|r| r.signature.name == "f")
+        .expect("f record");
+    assert!(!f.cases.is_empty(), "expected generated cases");
+    for c in &f.cases {
+        assert_eq!(
+            c.outcome, "returned",
+            "a **kwargs param must not be passed positionally: {:?}",
+            c.raises
+        );
+    }
+}
+
+#[test]
+fn keyword_only_param_is_passed_by_name_and_returns() {
+    if !ready("keyword_only_param_is_passed_by_name_and_returns") {
+        return;
+    }
+    // `b` is keyword-only; before this fix it was generated but passed POSITIONALLY, so every
+    // case raised a spurious TypeError ("too many positional arguments" / "missing keyword-only
+    // argument"). It must now be generated and passed as a keyword argument instead, so at
+    // least the type-compatible cases (e.g. `a` and `b` both strings/numbers) actually return.
+    let src = "def f(a, *, b=5):\n    return a + b\n";
+    let rec = record_file(src, 4).expect("record");
+    let f = rec
+        .functions
+        .iter()
+        .find(|r| r.signature.name == "f")
+        .expect("f record");
+    assert!(!f.cases.is_empty(), "expected generated cases");
+    for c in &f.cases {
+        assert!(!c.kwargs.is_empty(), "case should record the kwarg passed");
+        assert!(c.kwargs.contains_key("b"));
+    }
+    assert!(
+        f.cases.iter().any(|c| c.outcome == "returned"),
+        "expected at least one case to return successfully via keyword passing: {:?}",
+        f.cases.iter().map(|c| &c.outcome).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn keyword_only_mutation_is_detected() {
+    if !ready("keyword_only_mutation_is_detected") {
+        return;
+    }
+    // `acc` is keyword-only and mutated in place; the worker must snapshot kwargs before/after
+    // the same way it does positional args, or this mutation is invisible.
+    let src = "def f(*, acc):\n    acc.append(1)\n    return None\n";
+    let rec = record_file(src, 4).expect("record");
+    let f = rec
+        .functions
+        .iter()
+        .find(|r| r.signature.name == "f")
+        .expect("f record");
+    assert!(!f.cases.is_empty(), "expected generated cases");
+    let mutated_acc = f.cases.iter().any(|c| {
+        c.outcome == "returned" && c.mutations.iter().any(|m| m.target == "acc")
+    });
+    assert!(mutated_acc, "expected a case mutating the keyword-only `acc` param");
+}

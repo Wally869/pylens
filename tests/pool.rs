@@ -17,7 +17,7 @@ fn pool_executes_and_isolates_across_calls() {
 
     // A mutation + return-aliasing call.
     let r = pool
-        .call("def f(xs):\n    xs.append(1)\n    return xs", "f", &[json!([0])])
+        .call("def f(xs):\n    xs.append(1)\n    return xs", "f", &[json!([0])], &[])
         .expect("call f");
     assert!(r.ok, "f should run: {:?}", r.error);
     assert_eq!(r.ret, json!([0, 1]));
@@ -30,10 +30,11 @@ fn pool_executes_and_isolates_across_calls() {
             "import builtins\ndef p(x):\n    builtins.len = lambda z: 999\n    return len(x)",
             "p",
             &[json!([1, 2, 3])],
+            &[],
         )
         .expect("call p");
     let clean = pool
-        .call("def q(x):\n    return len(x)", "q", &[json!([1, 2, 3])])
+        .call("def q(x):\n    return len(x)", "q", &[json!([1, 2, 3])], &[])
         .expect("call q");
     assert!(clean.ok);
     assert_eq!(clean.ret, json!(3), "builtins patch leaked across pool calls");

@@ -158,6 +158,127 @@ fn print_is_stdout_io() {
 }
 
 #[test]
+fn comprehension_call_is_descended_into() {
+    let s = analyze("def f(items):\n    return [helper(x) for x in items]\n");
+    let f = sig(&s, "f");
+    assert!(
+        f.unresolved_effects
+            .iter()
+            .any(|u| u.reason == "call_unknown_callee" && u.callee.as_deref() == Some("helper"))
+    );
+    assert_eq!(f.purity, Purity::Unknown);
+    // The comprehension's `for` iterable votes shape like an ordinary `for` loop's.
+    assert!(f.params.iter().any(|p| p.name == "items" && p.shape == Shape::any_seq()));
+}
+
+#[test]
+fn unknown_method_on_param_is_unresolved() {
+    let s = analyze("def g(obj):\n    obj.frobnicate()\n");
+    let g = sig(&s, "g");
+    assert!(g.unresolved_effects.iter().any(|u| u.reason == "call_method_unknown"
+        && u.callee.as_deref() == Some("frobnicate")
+        && u.may_affect.contains(&MutationTarget::Param { name: "obj".into() })));
+    assert_eq!(g.purity, Purity::Unknown);
+}
+
+#[test]
+fn aug_assign_on_param_name_is_a_mutation() {
+    let s = analyze("def h(p):\n    p += [1]\n    return p\n");
+    let h = sig(&s, "h");
+    assert!(has_mutation(
+        h,
+        &MutationTarget::Param { name: "p".into() },
+        MutationKind::AugName
+    ));
+    assert_eq!(h.purity, Purity::Impure);
+}
+
+#[test]
+fn classmethod_cls_attr_write_is_a_receiver_mutation() {
+    let s = analyze(
+        "class C:\n\
+         \x20   @classmethod\n\
+         \x20   def register(cls, x):\n\
+         \x20       cls.registry.append(x)\n",
+    );
+    let m = sig(&s, "register");
+    assert!(has_mutation(
+        m,
+        &MutationTarget::SelfAttr { name: "registry".into() },
+        MutationKind::Method
+    ));
+    // `cls` is the receiver, not a generatable param.
+    assert!(!m.params.iter().any(|p| p.name == "cls"));
+    assert_eq!(m.purity, Purity::Impure);
+}
+
+#[test]
+fn unknown_decorator_downgrades_purity() {
+    let s = analyze("@some_decorator\ndef g(x):\n    return x\n");
+    let g = sig(&s, "g");
+    assert_eq!(g.decorators, vec!["some_decorator".to_string()]);
+    assert!(
+        g.unresolved_effects
+            .iter()
+            .any(|u| u.reason == "decorator" && u.callee.as_deref() == Some("some_decorator"))
+    );
+    assert_eq!(g.purity, Purity::Unknown);
+}
+
+#[test]
+fn assert_yields_explicit_assertion_error() {
+    let s = analyze("def f(a, b):\n    assert a > 0\n    return a / b\n");
+    let f = sig(&s, "f");
+    assert_eq!(f.raises.explicit, vec!["AssertionError".to_string()]);
+    assert!(f.raises.implicit.contains(&"ZeroDivisionError".to_string()));
+}
+
+#[test]
+fn division_yields_implicit_zero_division_error() {
+    let s = analyze("def f(a, b):\n    return a / b\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"ZeroDivisionError".to_string()));
+    assert!(f.raises.explicit.is_empty());
+}
+
+#[test]
+fn ordered_compare_on_any_param_yields_implicit_type_error() {
+    let s = analyze("def f(a, b):\n    if a > b:\n        return 1\n    return 0\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"TypeError".to_string()));
+}
+
+#[test]
+fn ordered_compare_on_pinned_shape_param_yields_no_type_error() {
+    let s = analyze("def f(a):\n    if a > 0:\n        return 1\n    return 0\n");
+    let f = sig(&s, "f");
+    assert!(!f.raises.implicit.contains(&"TypeError".to_string()));
+}
+
+#[test]
+fn mapping_shaped_subscript_read_yields_key_error() {
+    let s = analyze("def f(d, k):\n    d.get(k)\n    return d[k]\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"KeyError".to_string()));
+    assert!(!f.raises.implicit.contains(&"IndexError".to_string()));
+}
+
+#[test]
+fn sequence_shaped_subscript_read_yields_index_error() {
+    let s = analyze("def f(xs, i):\n    xs.append(1)\n    return xs[i]\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"IndexError".to_string()));
+    assert!(!f.raises.implicit.contains(&"KeyError".to_string()));
+}
+
+#[test]
+fn int_conversion_yields_implicit_value_error() {
+    let s = analyze("def f(s):\n    return int(s)\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"ValueError".to_string()));
+}
+
+#[test]
 fn staticmethod_first_param_is_not_self() {
     let s = analyze(
         "class C:\n\
@@ -172,4 +293,43 @@ fn staticmethod_first_param_is_not_self() {
         &MutationTarget::Param { name: "x".into() },
         MutationKind::Method
     ));
+}
+
+#[test]
+fn nested_container_shape_is_inferred_from_loop_variable_usage() {
+    let s = analyze(
+        "def f(m):\n\
+         \x20   for row in m:\n\
+         \x20       s = sum(row)\n\
+         \x20   return 0\n",
+    );
+    let f = sig(&s, "f");
+    let m = f.params.iter().find(|p| p.name == "m").unwrap();
+    assert_eq!(m.shape, Shape::Seq(Box::new(Shape::any_seq())));
+}
+
+#[test]
+fn nested_numeric_container_shape_is_inferred_from_subscript_division() {
+    let s = analyze(
+        "def g(rows):\n\
+         \x20   for r in rows:\n\
+         \x20       for i in range(len(r)):\n\
+         \x20           r[i] = r[i] / 2\n",
+    );
+    let s = sig(&s, "g");
+    let rows = s.params.iter().find(|p| p.name == "rows").unwrap();
+    assert_eq!(
+        rows.shape,
+        Shape::Seq(Box::new(Shape::Seq(Box::new(Shape::Float))))
+    );
+}
+
+#[test]
+fn varargs_and_kwargs_are_marked_by_kind() {
+    let s = analyze("def f(a, *args, **kw):\n    return a\n");
+    let f = sig(&s, "f");
+    let by_name = |n: &str| f.params.iter().find(|p| p.name == n).unwrap();
+    assert_eq!(by_name("a").kind, ParamKind::Positional);
+    assert_eq!(by_name("args").kind, ParamKind::VarPositional);
+    assert_eq!(by_name("kw").kind, ParamKind::VarKeyword);
 }

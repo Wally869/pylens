@@ -17,6 +17,11 @@ exception, captured stdout and stderr (separately), and whether the return value
 one of the arguments. Non-JSON-native types (set / tuple / dict / objects) use a tagged encoding
 so they round-trip and compare stably. Harness/setup failures are returned as a structured
 `error` ({stage, kind, message, module?}), never as a bare string.
+
+Resource exhaustion (`MemoryError`, `RecursionError`, a call that exceeds the wall-time budget)
+is a sandbox artifact, not the function's behavior — it is reported through `error` with
+`stage="resource"`, distinct from a genuine `raise` inside the function (which stays on
+`exception`). See `RESOURCE_EXCEPTIONS` below.
 """
 
 import sys
@@ -74,6 +79,7 @@ def base_response():
         "ok": False,
         "return": None,
         "args_post": None,
+        "kwargs_post": None,
         "exception": None,
         "return_aliases_arg": None,
         "error": None,
@@ -93,6 +99,16 @@ def exc_error(stage, exc):
     """Structured error from a caught exception. ModuleNotFoundError/ImportError carry the
     missing module in `.name`, which we surface as `module` so callers needn't parse strings."""
     return make_error(stage, type(exc).__name__, str(exc), getattr(exc, "name", None))
+
+
+RESOURCE_EXCEPTIONS = (MemoryError, RecursionError)
+"""Exceptions that mean the sandbox ran out of a resource, not that the function under test
+raised as part of its behavior. Caught ahead of the generic `except Exception` in `run_request`
+and reported through `error` (stage `"resource"`), never through `exception` — so a consumer
+can never mistake "ran out of memory/stack" for a semantic raise. `KeyboardInterrupt` /
+`SystemExit` need no special handling here: they are `BaseException`, not `Exception`, so they
+already fall outside the `except Exception` catch and crash the (forked) child, which surfaces
+as `no_output` — already on the error side, never `exception`."""
 
 
 def _clip(text):
@@ -122,6 +138,7 @@ def run_request(req):
         source = req["source"]
         fn_name = req.get("fn")
         args_in = req.get("args", [])
+        kwargs_in = req.get("kwargs", {})
         class_name = req.get("class")
         ctor_in = req.get("ctor_args", [])
     except Exception as e:
@@ -154,6 +171,7 @@ def run_request(req):
         ns = {}
         exec(compile(source, "<pylens>", "exec"), ns)
         args = [deserialize(a) for a in args_in]
+        kwargs = {k: deserialize(v) for k, v in kwargs_in.items()}
         if class_name is not None:
             cls = ns.get(class_name)
             if cls is None:
@@ -177,6 +195,7 @@ def run_request(req):
     # Snapshot the arguments in the SAME tagged encoding used for args_post, so mutation
     # detection compares like-with-like (not the raw plain-JSON input against tagged output).
     resp["args_pre"] = [serialize(a) for a in args]
+    resp["kwargs_pre"] = {k: serialize(v) for k, v in kwargs.items()}
 
     # Capture the function's stdout/stderr on SEPARATE buffers so they can't corrupt the JSON
     # protocol channel and so each is recorded as the channel it actually is.
@@ -184,7 +203,7 @@ def run_request(req):
     err_buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
-            ret = fn(*args)
+            ret = fn(*args, **kwargs)
             if hasattr(ret, "__next__"):  # drain generators/iterators to realize effects
                 collected = []
                 for i, x in enumerate(ret):
@@ -202,6 +221,9 @@ def run_request(req):
                     alias = i
                     break
         resp["return_aliases_arg"] = alias
+    except RESOURCE_EXCEPTIONS as e:
+        resp["ok"] = False
+        resp["error"] = exc_error("resource", e)
     except Exception as e:
         resp["ok"] = False
         resp["exception"] = {"type": type(e).__name__, "message": str(e)}
@@ -221,6 +243,7 @@ def run_request(req):
 
     try:
         resp["args_post"] = [serialize(a) for a in args]
+        resp["kwargs_post"] = {k: serialize(v) for k, v in kwargs.items()}
     except Exception as e:
         resp["error"] = exc_error("serialize", e)
 
@@ -295,10 +318,15 @@ def serve():
             continue
         out = _handle_in_child(line, timeout)
         if out is None:
+            # Wall-time exceeded: as much a resource kill as MemoryError/RecursionError, so it
+            # gets the same `stage="resource"` category (kind distinguishes the specific cause).
             resp = base_response()
-            resp["error"] = make_error("timeout", "timeout", f"request exceeded {timeout}s")
+            resp["error"] = make_error("resource", "timeout", f"request exceeded {timeout}s")
             out = json.dumps(resp).encode()
         elif not out:
+            # The child produced nothing at all — most likely SIGKILLed by an rlimit (CPU/mem)
+            # or crashed outright. Either way this is a harness-side failure, never a semantic
+            # result, so it stays on the `error` channel (never `exception`).
             resp = base_response()
             resp["error"] = make_error("harness", "no_output", "child produced no output")
             out = json.dumps(resp).encode()

@@ -24,7 +24,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Condvar, Mutex};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 #[derive(Serialize)]
 struct Request<'a> {
@@ -34,6 +34,9 @@ struct Request<'a> {
     #[serde(rename = "fn")]
     fn_name: Option<&'a str>,
     args: &'a [Value],
+    /// Keyword-only arguments, name → value.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    kwargs: Map<String, Value>,
     /// For a method call: the class to instantiate as the receiver.
     #[serde(skip_serializing_if = "Option::is_none")]
     class: Option<&'a str>,
@@ -51,9 +54,14 @@ pub struct Exc {
 }
 
 /// A structured harness/setup failure — *not* a Python `raise` from the function under test.
-/// `stage` is where it happened (`setup`, `ctor`, `harness`, `timeout`, `serialize`,
+/// `stage` is where it happened (`setup`, `ctor`, `harness`, `resource`, `serialize`,
 /// `bad_request`); `kind` is the exception type (e.g. `ModuleNotFoundError`) or a harness code;
 /// `module` carries the missing module for import failures.
+///
+/// `stage == "resource"` is a **resource kill**: the sandbox ran the function out of memory
+/// (`kind = "MemoryError"`), recursion depth (`kind = "RecursionError"`), or wall time
+/// (`kind = "timeout"`). This is strictly distinct from a semantic Python raise — see
+/// [`HarnessError::is_resource`] and `Case::outcome` in `record.rs`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HarnessError {
     pub stage: String,
@@ -61,6 +69,14 @@ pub struct HarnessError {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module: Option<String>,
+}
+
+impl HarnessError {
+    /// Whether this error is a resource kill (out-of-memory, recursion limit, timeout) rather
+    /// than a harness/setup failure — an artifact of the sandbox, never the function's behavior.
+    pub fn is_resource(&self) -> bool {
+        self.stage == "resource"
+    }
 }
 
 /// The observed effects of one execution.
@@ -73,6 +89,12 @@ pub struct CallResult {
     #[serde(default)]
     pub args_pre: Option<Vec<Value>>,
     pub args_post: Option<Vec<Value>>,
+    /// Keyword-only argument state (name → serialized value) captured *before* the call — the
+    /// baseline for kwarg mutation diffs.
+    #[serde(default)]
+    pub kwargs_pre: Option<Map<String, Value>>,
+    #[serde(default)]
+    pub kwargs_post: Option<Map<String, Value>>,
     pub exception: Option<Exc>,
     pub return_aliases_arg: Option<i64>,
     /// Anything the function wrote to stdout during the call (captured, not leaked).
@@ -98,13 +120,19 @@ pub trait Sandbox {
     /// Send one already-encoded request to a jailed worker and parse its response.
     fn transport(&self, body: &[u8]) -> Result<CallResult, String>;
 
-    /// Execute free function `fn_name(*args)`.
-    fn call(&self, source: &str, fn_name: &str, args: &[Value]) -> Result<CallResult, String> {
-        let body = encode_request(source, Some(fn_name), args, None, None)?;
+    /// Execute free function `fn_name(*args, **kwargs)`.
+    fn call(
+        &self,
+        source: &str,
+        fn_name: &str,
+        args: &[Value],
+        kwargs: &[(String, Value)],
+    ) -> Result<CallResult, String> {
+        let body = encode_request(source, Some(fn_name), args, kwargs, None, None)?;
         self.transport(&body)
     }
 
-    /// Execute `class(*ctor_args).method(*args)`, capturing receiver pre/post state.
+    /// Execute `class(*ctor_args).method(*args, **kwargs)`, capturing receiver pre/post state.
     fn call_method(
         &self,
         source: &str,
@@ -112,8 +140,9 @@ pub trait Sandbox {
         ctor_args: &[Value],
         method: &str,
         args: &[Value],
+        kwargs: &[(String, Value)],
     ) -> Result<CallResult, String> {
-        let body = encode_request(source, Some(method), args, Some(class), Some(ctor_args))?;
+        let body = encode_request(source, Some(method), args, kwargs, Some(class), Some(ctor_args))?;
         self.transport(&body)
     }
 
@@ -127,7 +156,7 @@ pub trait Sandbox {
         class: Option<&str>,
         ctor_args: Option<&[Value]>,
     ) -> Result<CallResult, String> {
-        let body = encode_request(source, None, &[], class, ctor_args)?;
+        let body = encode_request(source, None, &[], &[], class, ctor_args)?;
         self.transport(&body)
     }
 }
@@ -136,6 +165,7 @@ fn encode_request(
     source: &str,
     fn_name: Option<&str>,
     args: &[Value],
+    kwargs: &[(String, Value)],
     class: Option<&str>,
     ctor_args: Option<&[Value]>,
 ) -> Result<Vec<u8>, String> {
@@ -143,6 +173,7 @@ fn encode_request(
         source,
         fn_name,
         args,
+        kwargs: kwargs.iter().cloned().collect(),
         class,
         ctor_args,
     };

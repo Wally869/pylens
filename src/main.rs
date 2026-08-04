@@ -1,19 +1,32 @@
 //! pylens CLI.
 //!
-//!   pylens analyze <file.py>                static effect signatures as JSON
-//!   pylens record  <file.py> [--inputs N]   signatures + observed cases (runs the jail), JSON
+//!   pylens analyze  <file.py> [--format json|summary]              static effect signatures
+//!   pylens record   <file.py> [--inputs N] [--format json|summary] signatures + observed cases
+//!                                                                   (runs the jail)
+//!   pylens validate <file.py> [--inputs N] [--format json|summary] observed ⊆ static
+//!                                                                   soundness-defect report
+//!                                                                   (runs the jail); exits
+//!                                                                   non-zero on any hard defect
+//!
+//! `--format` defaults to `json`. `--format summary` renders a thin terminal summary instead
+//! (see `pylens::report`).
 
 use std::io::Read;
+
+use pylens::report::{self, FunctionValidation};
+use pylens::validate::{Severity, validate_function};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("analyze") => cmd_analyze(&args[2..]),
         Some("record") => cmd_record(&args[2..]),
+        Some("validate") => cmd_validate(&args[2..]),
         _ => {
             eprintln!(
-                "usage:\n  pylens analyze <file.py>\n  \
-                 pylens record <file.py> [--inputs <N>]"
+                "usage:\n  pylens analyze <file.py> [--format json|summary]\n  \
+                 pylens record <file.py> [--inputs <N>] [--format json|summary]\n  \
+                 pylens validate <file.py> [--inputs <N>] [--format json|summary]"
             );
             std::process::exit(2);
         }
@@ -21,13 +34,24 @@ fn main() {
 }
 
 fn cmd_analyze(args: &[String]) {
-    let src = match args.first() {
-        Some(path) => read_file(path),
+    let format = format_of(args);
+    let path = args.iter().find(|a| !a.starts_with("--"));
+    let src = match path {
+        Some(p) => read_file(p),
         None => read_stdin(),
     };
+    let label = path.map(String::as_str).unwrap_or("<stdin>");
     match (pylens::imports_of(&src), pylens::analyze_source(&src)) {
         (Ok(imports), Ok(functions)) => {
-            let out = serde_json::json!({ "imports": imports, "functions": functions });
+            if format == Format::Summary {
+                print!("{}", report::analyze_summary(label, &functions));
+                return;
+            }
+            let out = serde_json::json!({
+                "schema_version": pylens::SCHEMA_VERSION,
+                "imports": imports,
+                "functions": functions,
+            });
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
         }
         (Err(e), _) | (_, Err(e)) => fail(&format!("parse error: {e}")),
@@ -35,6 +59,7 @@ fn cmd_analyze(args: &[String]) {
 }
 
 fn cmd_record(args: &[String]) {
+    let format = format_of(args);
     let path = args
         .iter()
         .find(|a| !a.starts_with("--"))
@@ -46,8 +71,116 @@ fn cmd_record(args: &[String]) {
 
     let src = read_file(&path);
     match pylens::record::record_file(&src, inputs) {
-        Ok(records) => println!("{}", serde_json::to_string_pretty(&records).unwrap()),
+        Ok(record) => {
+            if format == Format::Summary {
+                print!("{}", report::record_summary(&path, &record));
+                return;
+            }
+            let out = serde_json::json!({
+                "schema_version": pylens::SCHEMA_VERSION,
+                "dependencies": record.dependencies,
+                "functions": record.functions,
+            });
+            println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        }
         Err(e) => fail(&format!("record error: {e}")),
+    }
+}
+
+fn cmd_validate(args: &[String]) {
+    let format = format_of(args);
+    let path = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
+        .unwrap_or_else(|| fail("validate needs a <file.py>"));
+    let inputs: usize = flag(args, "--inputs")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+
+    let src = read_file(&path);
+    let record = match pylens::record::record_file(&src, inputs) {
+        Ok(r) => r,
+        Err(e) => fail(&format!("record error: {e}")),
+    };
+
+    let mut hard_total = 0usize;
+    let mut soft_total = 0usize;
+    let per_function: Vec<_> = record
+        .functions
+        .iter()
+        .map(|f| {
+            let defects = validate_function(f);
+            let hard = defects
+                .iter()
+                .filter(|d| d.severity == Severity::Hard)
+                .count();
+            let soft = defects.len() - hard;
+            hard_total += hard;
+            soft_total += soft;
+            (f, defects)
+        })
+        .collect();
+
+    if format == Format::Summary {
+        let results: Vec<FunctionValidation> = per_function
+            .iter()
+            .map(|(f, defects)| FunctionValidation {
+                name: &f.signature.name,
+                owner: f.signature.owner.as_deref(),
+                defects,
+            })
+            .collect();
+        print!(
+            "{}",
+            report::validate_summary(&path, record.functions.len(), hard_total, soft_total, &results)
+        );
+    } else {
+        let functions: Vec<serde_json::Value> = per_function
+            .iter()
+            .map(|(f, defects)| {
+                let hard = defects
+                    .iter()
+                    .filter(|d| d.severity == Severity::Hard)
+                    .count();
+                let soft = defects.len() - hard;
+                serde_json::json!({
+                    "name": f.signature.name,
+                    "owner": f.signature.owner,
+                    "hard_defects": hard,
+                    "soft_defects": soft,
+                    "defects": defects,
+                })
+            })
+            .collect();
+
+        let out = serde_json::json!({
+            "schema_version": pylens::SCHEMA_VERSION,
+            "functions": functions,
+            "summary": {
+                "hard_defects": hard_total,
+                "soft_defects": soft_total,
+                "functions_checked": record.functions.len(),
+            }
+        });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+    }
+    if hard_total > 0 {
+        std::process::exit(1);
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum Format {
+    Json,
+    Summary,
+}
+
+fn format_of(args: &[String]) -> Format {
+    match flag(args, "--format").as_deref() {
+        Some("summary") => Format::Summary,
+        Some("json") | None => Format::Json,
+        Some(other) => fail(&format!("unknown --format '{other}' (expected json|summary)")),
     }
 }
 
