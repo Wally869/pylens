@@ -325,6 +325,82 @@ fn nested_numeric_container_shape_is_inferred_from_subscript_division() {
 }
 
 #[test]
+fn local_helper_mutation_propagates_to_caller() {
+    let s = analyze(
+        "def helper(xs):\n\
+         \x20   xs.append(1)\n\
+         def caller(data):\n\
+         \x20   helper(data)\n",
+    );
+    let caller = sig(&s, "caller");
+    assert!(has_mutation(
+        caller,
+        &MutationTarget::Param { name: "data".into() },
+        MutationKind::Method
+    ));
+    assert_eq!(caller.purity, Purity::Impure);
+    assert!(caller.unresolved_effects.is_empty());
+}
+
+#[test]
+fn pure_local_helper_call_keeps_caller_pure() {
+    let s = analyze(
+        "def add_one(x):\n\
+         \x20   return x + 1\n\
+         def caller(y):\n\
+         \x20   return add_one(y)\n",
+    );
+    let caller = sig(&s, "caller");
+    assert!(caller.mutations.is_empty());
+    assert!(caller.unresolved_effects.is_empty());
+    assert_eq!(caller.purity, Purity::Pure);
+}
+
+#[test]
+fn call_to_genuinely_unknown_callee_stays_unresolved() {
+    let s = analyze("def f(data):\n    unknown_thing(data)\n");
+    let f = sig(&s, "f");
+    assert!(
+        f.unresolved_effects
+            .iter()
+            .any(|u| u.reason == "call_unknown_callee" && u.callee.as_deref() == Some("unknown_thing"))
+    );
+    assert_eq!(f.purity, Purity::Unknown);
+}
+
+#[test]
+fn direct_recursion_terminates_and_is_pure() {
+    let s = analyze(
+        "def fact(n):\n\
+         \x20   if n <= 1:\n\
+         \x20       return 1\n\
+         \x20   return n * fact(n - 1)\n",
+    );
+    let f = sig(&s, "fact");
+    assert!(f.mutations.is_empty());
+    assert!(f.unresolved_effects.is_empty());
+    assert_eq!(f.purity, Purity::Pure);
+}
+
+#[test]
+fn self_method_call_propagates_receiver_mutation_to_caller() {
+    let s = analyze(
+        "class C:\n\
+         \x20   def helper(self, x):\n\
+         \x20       self.data.append(x)\n\
+         \x20   def caller(self, y):\n\
+         \x20       self.helper(y)\n",
+    );
+    let caller = sig(&s, "caller");
+    assert!(has_mutation(
+        caller,
+        &MutationTarget::SelfAttr { name: "data".into() },
+        MutationKind::Method
+    ));
+    assert_eq!(caller.purity, Purity::Impure);
+}
+
+#[test]
 fn varargs_and_kwargs_are_marked_by_kind() {
     let s = analyze("def f(a, *args, **kw):\n    return a\n");
     let f = sig(&s, "f");

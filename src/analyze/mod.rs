@@ -19,11 +19,13 @@ use pass::Pass;
 /// Analyze every function and method defined at module top level (functions) or directly in
 /// a class body (methods). Nested functions are not descended into yet.
 ///
-/// Runs the pipeline **Imports -> Declarations -> Shapes -> Effects -> Purity**. Shapes settles
-/// a fixpoint-inferred name->shape environment per function before Effects runs, so Effects
-/// reads final parameter shapes instead of voting during its own walk. A future Interprocedural
-/// pass — resolving intra-file calls via the Declarations symbol table — would insert between
-/// Effects and Purity.
+/// Runs the pipeline **Imports -> Declarations -> Shapes -> Effects -> Interprocedural ->
+/// Purity**. Shapes settles a fixpoint-inferred name->shape environment per function before
+/// Effects runs, so Effects reads final parameter shapes instead of voting during its own walk.
+/// Interprocedural resolves calls to functions/methods defined in this same module (recorded by
+/// Effects as structured call sites) and propagates the callee's effects onto the caller to a
+/// fixpoint, so Purity — which runs last — classifies callers against their complete,
+/// propagated effect set rather than treating every local call as opaque.
 pub fn analyze_module(module: &ast::ModModule) -> Vec<EffectSignature> {
     let mut ctx = ModuleAnalysis::new();
     let pipeline: Vec<Box<dyn Pass>> = vec![
@@ -31,6 +33,7 @@ pub fn analyze_module(module: &ast::ModModule) -> Vec<EffectSignature> {
         Box::new(passes::declarations::DeclarationsPass),
         Box::new(passes::shapes::ShapesPass),
         Box::new(passes::effects::EffectsPass),
+        Box::new(passes::interprocedural::InterproceduralPass),
         Box::new(passes::purity::PurityPass),
     ];
     for pass in &pipeline {

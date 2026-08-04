@@ -24,6 +24,29 @@ fn attr_off_receiver<'e>(expr: &'e ast::Expr, self_param: &str) -> Option<&'e st
     }
 }
 
+/// One resolved intra-module call: a call site, inside some caller function, whose callee the
+/// Effects pass determined (via the Declarations symbol table) is a function/method defined in
+/// this same module. Consumed by the Interprocedural pass.
+///
+/// Argument -> parameter mapping is **positional only** (v1); keyword-argument mapping is a
+/// future refinement. A call the analyzer can't line up 1:1 with the callee's declared
+/// positional parameters (keywords, `*args`/`**kwargs` at the call site) simply yields `None`
+/// roots for the unmapped positions — sound, since an unmapped root means the caller didn't hand
+/// the callee a trackable object there, so nothing to (mis)attribute.
+#[derive(Debug, Clone)]
+pub(in crate::analyze) struct CallSite {
+    /// Index into `ModuleAnalysis::declarations` / `ModuleAnalysis::signatures` (the two are
+    /// built in the same module-traversal order) identifying the callee.
+    pub(in crate::analyze) callee: usize,
+    /// The call was `self.method(...)` / `cls.method(...)` on the caller's own receiver — so
+    /// the callee's `SelfAttr` mutations are mutations of the caller's own receiver too, and
+    /// propagate unchanged rather than through `arg_roots`.
+    pub(in crate::analyze) via_self: bool,
+    /// The caller-side root each positional call argument resolves to (`None` where it doesn't
+    /// root to a tracked target), parallel in order to the call's positional arguments.
+    pub(in crate::analyze) arg_roots: Vec<Option<MutationTarget>>,
+}
+
 /// Module-wide state threaded through the pass pipeline.
 #[derive(Default)]
 pub(in crate::analyze) struct ModuleAnalysis {
@@ -33,21 +56,38 @@ pub(in crate::analyze) struct ModuleAnalysis {
     pub(in crate::analyze) bindings: HashMap<String, ModuleRef>,
     /// A `from m import *` is in scope somewhere in the module. Built by the Imports pass.
     pub(in crate::analyze) has_star: bool,
-    /// Function/method symbol table built by the Declarations pass. Groundwork for a future
-    /// Interprocedural pass; not yet consumed, never serialized.
+    /// Function/method symbol table built by the Declarations pass; the enabler for intra-file
+    /// call resolution (Effects) and effect propagation (Interprocedural).
     pub(in crate::analyze) declarations: Vec<DeclInfo>,
     /// Per-function name->shape environments (params and locals) built by the Shapes pass, one
     /// entry per function/method in the same order as `declarations`. The Effects pass reads
     /// the parameter shapes out of these; never serialized directly.
     pub(in crate::analyze) shapes: Vec<HashMap<String, Shape>>,
-    /// Effect signatures produced by the Effects pass and finalized by the Purity pass.
+    /// Effect signatures produced by the Effects pass, enriched in place by the Interprocedural
+    /// pass, and finalized by the Purity pass.
     pub(in crate::analyze) signatures: Vec<EffectSignature>,
+    /// Structured intra-module call sites recorded by the Effects pass, one entry per
+    /// function/method in the same order as `signatures`/`declarations`. Consumed by the
+    /// Interprocedural pass; never serialized.
+    pub(in crate::analyze) call_sites: Vec<Vec<CallSite>>,
 }
 
 impl ModuleAnalysis {
     pub(in crate::analyze) fn new() -> Self {
         Self::default()
     }
+}
+
+/// Read-only module-wide inputs every function's Effects walk needs but none of them mutate —
+/// bundled into one value so per-function setup doesn't take a long parameter list.
+#[derive(Clone, Copy)]
+pub(in crate::analyze) struct ModuleCtx<'a> {
+    /// In-scope import binding -> the module it names.
+    pub(in crate::analyze) imports: &'a HashMap<String, ModuleRef>,
+    /// A `from m import *` is in scope.
+    pub(in crate::analyze) has_star: bool,
+    /// The module-wide function/method symbol table, for resolving local calls.
+    pub(in crate::analyze) declarations: &'a [DeclInfo],
 }
 
 /// Per-function accumulator: the mutable state one function's Effects walk reads and writes,
@@ -71,6 +111,15 @@ pub(in crate::analyze) struct FunctionFacts<'a> {
     pub(in crate::analyze) used_imports: Vec<String>,
     /// Set when an unresolved free callee is seen while a star import is in scope.
     pub(in crate::analyze) may_use_star: bool,
+    /// The module-wide symbol table (read-only here), for resolving a call to a locally-defined
+    /// function/method — see `passes::declarations::resolve_unique`.
+    pub(in crate::analyze) declarations: &'a [DeclInfo],
+    /// The class this function is a method of, `None` for a free function — the `owner` half of
+    /// resolving `self.method(...)` / `cls.method(...)` against `declarations`.
+    pub(in crate::analyze) owner: Option<String>,
+    /// Structured call sites recorded when a call resolves to a local function/method, consumed
+    /// by the Interprocedural pass.
+    pub(in crate::analyze) call_sites: Vec<CallSite>,
     pub(in crate::analyze) sig: EffectSignature,
 }
 
@@ -78,10 +127,10 @@ impl<'a> FunctionFacts<'a> {
     pub(in crate::analyze) fn new(
         self_param: Option<String>,
         params: &[String],
-        imports: &'a HashMap<String, ModuleRef>,
-        has_star: bool,
+        module: ModuleCtx<'a>,
         shapes: HashMap<String, Shape>,
         sig: EffectSignature,
+        owner: Option<String>,
     ) -> Self {
         let mut aliases = HashMap::new();
         for p in params {
@@ -93,10 +142,13 @@ impl<'a> FunctionFacts<'a> {
             globals: HashSet::new(),
             nonlocals: HashSet::new(),
             shapes,
-            imports,
-            has_star,
+            imports: module.imports,
+            has_star: module.has_star,
             used_imports: Vec::new(),
             may_use_star: false,
+            declarations: module.declarations,
+            owner,
+            call_sites: Vec::new(),
             sig,
         }
     }

@@ -89,6 +89,28 @@ fn decorator_name(expr: &ast::Expr) -> Option<String> {
     }
 }
 
+/// Find the unique declaration named `name` owned by `owner` (`None` for a free function,
+/// `Some(class)` for a method of `class`). Returns `None` — deliberately, not a best guess — if
+/// there is no match or more than one (an ambiguous name, e.g. a module-level function redefined
+/// later): resolving to the wrong one could misattribute a callee's effects, so an unresolved
+/// call stays unresolved rather than risk that.
+pub(in crate::analyze) fn resolve_unique(
+    declarations: &[DeclInfo],
+    owner: Option<&str>,
+    name: &str,
+) -> Option<usize> {
+    let mut found = None;
+    for (i, d) in declarations.iter().enumerate() {
+        if d.owner.as_deref() == owner && d.name == name {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(i);
+        }
+    }
+    found
+}
+
 fn param_names(params: &ast::Parameters) -> Vec<String> {
     let mut out = Vec::new();
     for p in &params.posonlyargs {

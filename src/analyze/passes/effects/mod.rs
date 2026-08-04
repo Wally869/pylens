@@ -14,9 +14,9 @@ use super::super::collect::exceptions::{
     binop_implicit_exception, call_implicit_exception, exception_name, is_ordered_compare,
     subscript_read_exceptions,
 };
-use super::super::context::{FunctionFacts, ModuleAnalysis};
+use super::super::context::{CallSite, FunctionFacts, ModuleAnalysis, ModuleCtx};
 use super::super::pass::Pass;
-use super::declarations::ReceiverKind;
+use super::declarations::{ReceiverKind, resolve_unique};
 
 mod builtins;
 mod dedup;
@@ -37,36 +37,37 @@ impl Pass for EffectsPass {
         // traversal.
         let mut receivers = ctx.declarations.iter().map(|d| d.receiver);
         let mut shapes_iter = ctx.shapes.iter();
+        let module_ctx = ModuleCtx {
+            imports: &ctx.bindings,
+            has_star: ctx.has_star,
+            declarations: &ctx.declarations,
+        };
         for stmt in &module.body {
             match stmt {
                 ast::Stmt::FunctionDef(def) => {
                     let receiver = receivers.next().unwrap_or(ReceiverKind::None);
                     let shapes = shapes_iter.next().cloned().unwrap_or_default();
-                    let sig = analyze_function(
-                        def,
-                        DefKind::Function,
-                        receiver,
-                        &ctx.bindings,
-                        ctx.has_star,
-                        shapes,
-                    );
+                    let (sig, call_sites) =
+                        analyze_function(def, DefKind::Function, receiver, module_ctx, shapes, None);
                     ctx.signatures.push(sig);
+                    ctx.call_sites.push(call_sites);
                 }
                 ast::Stmt::ClassDef(class) => {
                     for member in &class.body {
                         if let ast::Stmt::FunctionDef(def) = member {
                             let receiver = receivers.next().unwrap_or(ReceiverKind::None);
                             let shapes = shapes_iter.next().cloned().unwrap_or_default();
-                            let mut sig = analyze_function(
+                            let (mut sig, call_sites) = analyze_function(
                                 def,
                                 DefKind::Method,
                                 receiver,
-                                &ctx.bindings,
-                                ctx.has_star,
+                                module_ctx,
                                 shapes,
+                                Some(class.name.as_str()),
                             );
                             sig.owner = Some(class.name.as_str().to_string());
                             ctx.signatures.push(sig);
+                            ctx.call_sites.push(call_sites);
                         }
                     }
                 }
@@ -84,10 +85,10 @@ fn analyze_function(
     def: &ast::StmtFunctionDef,
     kind: DefKind,
     receiver: ReceiverKind,
-    imports: &HashMap<String, ModuleRef>,
-    has_star: bool,
+    module: ModuleCtx,
     shapes: HashMap<String, Shape>,
-) -> EffectSignature {
+    owner: Option<&str>,
+) -> (EffectSignature, Vec<CallSite>) {
     let params = collect_param_names(&def.parameters);
     let self_param = match receiver {
         ReceiverKind::SelfParam | ReceiverKind::Cls => params.first().cloned(),
@@ -98,9 +99,11 @@ fn analyze_function(
     sig.declared_return = annotation_name(def.returns.as_deref());
     sig.decorators = decorator_names(def);
 
-    let mut facts = FunctionFacts::new(self_param, &params, imports, has_star, shapes, sig);
+    let mut facts =
+        FunctionFacts::new(self_param, &params, module, shapes, sig, owner.map(str::to_string));
     Walker { facts: &mut facts }.run(&def.body);
-    finish(facts, param_defs)
+    let call_sites = std::mem::take(&mut facts.call_sites);
+    (finish(facts, param_defs), call_sites)
 }
 
 fn finish(facts: FunctionFacts, param_defs: Vec<ParamInfo>) -> EffectSignature {
@@ -497,6 +500,17 @@ impl Walker<'_, '_> {
                         callee: dotted_attr(&call.func),
                         may_affect: self.args_targets(&call.arguments),
                     });
+                } else if self.is_self_receiver(&attr.value)
+                    && let Some(callee) = resolve_unique(
+                        self.facts.declarations,
+                        self.facts.owner.as_deref(),
+                        attr.attr.as_str(),
+                    )
+                {
+                    // `self.method(...)` / `cls.method(...)` resolving to a method defined in
+                    // this same class — a structured call site, not an opaque one.
+                    let arg_roots = self.positional_arg_roots(&call.arguments);
+                    self.facts.call_sites.push(CallSite { callee, via_self: true, arg_roots });
                 } else {
                     let method = attr.attr.as_str();
                     if is_mutating_method(method) {
@@ -526,6 +540,11 @@ impl Walker<'_, '_> {
                         callee: Some(n.to_string()),
                         may_affect: self.args_targets(&call.arguments),
                     });
+                } else if let Some(callee) = resolve_unique(self.facts.declarations, None, n) {
+                    // A call to a module-level function defined in this same module — a
+                    // structured call site, not an opaque one.
+                    let arg_roots = self.positional_arg_roots(&call.arguments);
+                    self.facts.call_sites.push(CallSite { callee, via_self: false, arg_roots });
                 } else {
                     if let Some(exc) = call_implicit_exception(n) {
                         self.facts.sig.raises.implicit.push(exc.to_string());
@@ -569,6 +588,19 @@ impl Walker<'_, '_> {
         for kw in call.arguments.keywords.iter() {
             self.visit_expr(&kw.value);
         }
+    }
+
+    /// Whether `expr` is a bare reference to this function's own receiver (`self`/`cls`) —
+    /// the shape a call must have to be eligible for local-method resolution (`self.cache
+    /// .evict()` doesn't qualify: the receiver there is `self.cache`, not `self`).
+    fn is_self_receiver(&self, expr: &ast::Expr) -> bool {
+        matches!(expr, ast::Expr::Name(n) if Some(n.id.as_str()) == self.facts.self_param.as_deref())
+    }
+
+    /// The caller-side root each positional argument resolves to, `None` where it doesn't root
+    /// to a tracked target — parallel in order to `arguments.args`, for a [`CallSite`].
+    fn positional_arg_roots(&self, arguments: &ast::Arguments) -> Vec<Option<MutationTarget>> {
+        arguments.args.iter().map(|arg| self.facts.resolve_target(arg, None)).collect()
     }
 
     /// Targets among `arguments` that resolve to a tracked root (params passed into a call
