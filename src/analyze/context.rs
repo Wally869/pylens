@@ -47,6 +47,40 @@ pub(in crate::analyze) struct CallSite {
     pub(in crate::analyze) arg_roots: Vec<Option<MutationTarget>>,
 }
 
+/// One call site, inside some caller function, whose callee is an IMPORTED binding (not a
+/// function/method defined in this same module) — the project-facing analogue of [`CallSite`].
+/// The Effects pass records one of these alongside every `call_import` [`UnresolvedEffect`] it
+/// produces (see `passes::effects::visit_call`), so the project layer (`project::interproc`) can
+/// attempt to resolve the import to another file in the same project and propagate that file's
+/// effect summary here, instead of leaving the call opaque. Never serialized directly.
+#[derive(Debug, Clone)]
+pub struct ImportCallSite {
+    /// The bound name the call's callee expression starts with (`helper` in `helper(x)`, or
+    /// `util` in `util.helper(x)`).
+    pub binding: String,
+    /// The attribute called on `binding` (`helper` in `util.helper(x)`); `None` for a direct
+    /// call of an imported name (`helper(x)` where `helper` itself is the imported binding).
+    pub attr: Option<String>,
+    /// The caller-side root each positional call argument resolves to (`None` where it doesn't
+    /// root to a tracked target), parallel in order to the call's positional arguments — same
+    /// shape, and same **positional-only** limitation, as [`CallSite::arg_roots`]: keyword
+    /// arguments at the call site aren't mapped onto the callee's parameters (future work, as in
+    /// the intra-file pass).
+    pub arg_roots: Vec<Option<MutationTarget>>,
+}
+
+impl ImportCallSite {
+    /// The dotted callee as written at the call site (`"helper"` or `"util.helper"`) — matches
+    /// the `callee` string the Effects pass records on the corresponding `call_import`
+    /// [`UnresolvedEffect`], so a resolved site can be matched back to remove it.
+    pub fn callee_string(&self) -> String {
+        match &self.attr {
+            Some(attr) => format!("{}.{attr}", self.binding),
+            None => self.binding.clone(),
+        }
+    }
+}
+
 /// Module-wide state threaded through the pass pipeline.
 #[derive(Default)]
 pub(in crate::analyze) struct ModuleAnalysis {
@@ -70,6 +104,11 @@ pub(in crate::analyze) struct ModuleAnalysis {
     /// function/method in the same order as `signatures`/`declarations`. Consumed by the
     /// Interprocedural pass; never serialized.
     pub(in crate::analyze) call_sites: Vec<Vec<CallSite>>,
+    /// Structured import-bound call sites recorded by the Effects pass, one entry per
+    /// function/method in the same order as `signatures`/`declarations`. Consumed by the
+    /// project layer's cross-file propagation (`project::interproc`), not by anything
+    /// intra-module; never serialized.
+    pub(in crate::analyze) import_call_sites: Vec<Vec<ImportCallSite>>,
 }
 
 impl ModuleAnalysis {
@@ -120,6 +159,9 @@ pub(in crate::analyze) struct FunctionFacts<'a> {
     /// Structured call sites recorded when a call resolves to a local function/method, consumed
     /// by the Interprocedural pass.
     pub(in crate::analyze) call_sites: Vec<CallSite>,
+    /// Structured call sites recorded when a call resolves to an imported binding, consumed by
+    /// the project layer's cross-file propagation.
+    pub(in crate::analyze) import_call_sites: Vec<ImportCallSite>,
     /// Parameter root -> guard-derived literal samples, collected from `if`/`while`/`assert`
     /// tests and ternary conditions as they're visited — see `collect::guards`. Merged into
     /// `ParamInfo::guard_samples` in `finish`.
@@ -153,6 +195,7 @@ impl<'a> FunctionFacts<'a> {
             declarations: module.declarations,
             owner,
             call_sites: Vec::new(),
+            import_call_sites: Vec::new(),
             guard_samples: HashMap::new(),
             sig,
         }

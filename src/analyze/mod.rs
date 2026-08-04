@@ -7,6 +7,7 @@ mod context;
 mod pass;
 mod passes;
 
+pub use context::ImportCallSite;
 pub use passes::declarations::{DeclInfo, ReceiverKind};
 pub use passes::imports::collect_imports;
 
@@ -15,6 +16,16 @@ use ruff_python_ast as ast;
 use crate::model::EffectSignature;
 use context::ModuleAnalysis;
 use pass::Pass;
+
+/// A module's effect signatures plus, per function (same order/index as `signatures`), the
+/// structured call sites the Effects pass recorded for calls to IMPORTED bindings. Additive to
+/// [`analyze_module`] — used only by the project layer's cross-file propagation
+/// (`project::interproc`), which needs the raw call sites `analyze_module` discards. Single-file
+/// analysis (`analyze_module`/`analyze_source`) is unaffected.
+pub struct ModuleAnalysisResult {
+    pub signatures: Vec<EffectSignature>,
+    pub import_call_sites: Vec<Vec<ImportCallSite>>,
+}
 
 /// Analyze every function and method defined at module top level (functions) or directly in
 /// a class body (methods). Nested functions are not descended into yet.
@@ -29,6 +40,12 @@ use pass::Pass;
 /// disjointness. Purity runs last, classifying callers against their complete, propagated
 /// effect set rather than treating every local call as opaque.
 pub fn analyze_module(module: &ast::ModModule) -> Vec<EffectSignature> {
+    analyze_module_with_call_sites(module).signatures
+}
+
+/// Same pipeline as [`analyze_module`], additionally returning each function's imported call
+/// sites — see [`ModuleAnalysisResult`].
+pub fn analyze_module_with_call_sites(module: &ast::ModModule) -> ModuleAnalysisResult {
     let mut ctx = ModuleAnalysis::new();
     let pipeline: Vec<Box<dyn Pass>> = vec![
         Box::new(passes::imports::ImportsPass),
@@ -42,5 +59,8 @@ pub fn analyze_module(module: &ast::ModModule) -> Vec<EffectSignature> {
     for pass in &pipeline {
         pass.run(module, &mut ctx);
     }
-    ctx.signatures
+    ModuleAnalysisResult {
+        signatures: ctx.signatures,
+        import_call_sites: ctx.import_call_sites,
+    }
 }

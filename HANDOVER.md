@@ -12,10 +12,14 @@ assert zero hard defects across the full corpus — keep it there.
 
 ## Feature follow-ups
 
-- **Cross-file effect propagation.** Import *resolution* across a project is done
-  (`src/project/resolve.rs`); the remaining half is building a project-wide symbol table and
-  propagating effect summaries across files (the cross-file analogue of the intra-file
-  Interprocedural pass), with a fixpoint over the cross-file call graph.
+- **Cross-file effect propagation** is done (`src/project/interproc.rs`): a project-wide symbol
+  table (free functions only) plus a per-file import-binding resolver map calls to project-local
+  imported functions onto their target, and a fixpoint (mirroring the intra-file
+  `Interprocedural` pass's mapping rules) propagates the callee's effects onto the caller across
+  file boundaries — resolving the `call_import` unresolved effect the intra-file Effects pass
+  otherwise leaves. Wired into `analyze_project`, `record_project`, and `validate_project` (via
+  `record::record_with_signatures`); single-file mode is unaffected. Keyword-argument -> param
+  mapping is future work, same as the intra-file pass.
 - **`.pyi` / type model depth.** Stubs render from the recursive `Shape` + return may-set today.
   Richer output (param-annotation mismatch, union/optional in the `Shape` model itself, observed
   dynamic types folded in) is future work.

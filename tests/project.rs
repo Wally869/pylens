@@ -102,6 +102,47 @@ fn analyze_project_resolves_project_local_and_external_imports() {
 }
 
 #[test]
+fn analyze_project_propagates_cross_file_mutation_onto_the_caller() {
+    let report = analyze_project(Path::new("tests/fixtures/xfile"));
+    let files = report["files"].as_array().expect("files array");
+    let main = files.iter().find(|f| f["path"] == "main.py").expect("main.py entry");
+    let functions = main["functions"].as_array().expect("functions array");
+
+    let caller = functions.iter().find(|f| f["name"] == "caller").expect("caller function");
+    assert_ne!(caller["purity"], "unknown");
+    let mutations = caller["mutations"].as_array().expect("mutations array");
+    assert!(
+        mutations.iter().any(|m| m["target"]["root"] == "param" && m["target"]["name"] == "data"),
+        "expected caller to show a propagated mutation on `data`, got {mutations:?}"
+    );
+    let unresolved = caller["unresolved_effects"].as_array().expect("unresolved_effects array");
+    assert!(
+        !unresolved.iter().any(|u| u["reason"] == "call_import" && u["callee"] == "touch"),
+        "expected no call_import unresolved effect for touch, got {unresolved:?}"
+    );
+
+    let uses_external =
+        functions.iter().find(|f| f["name"] == "uses_external").expect("uses_external function");
+    let unresolved = uses_external["unresolved_effects"].as_array().expect("unresolved_effects array");
+    assert!(
+        unresolved
+            .iter()
+            .any(|u| u["reason"] == "call_import" && u["callee"] == "os.getcwd"),
+        "expected an external import to stay unresolved, got {unresolved:?}"
+    );
+}
+
+#[test]
+fn analyze_project_cross_file_recursion_terminates() {
+    let report = analyze_project(Path::new("tests/fixtures/xfile_recursive"));
+    let files = report["files"].as_array().expect("files array");
+    for f in files {
+        assert!(f.get("error").is_none(), "unexpected per-file error: {f:?}");
+    }
+    assert_eq!(report["summary"]["files"], 3);
+}
+
+#[test]
 fn walk_skips_pycache_and_dotfile_directories() {
     let report = analyze_project(Path::new("tests/fixtures/project_skip"));
     let files = report["files"].as_array().expect("files array");

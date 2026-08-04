@@ -9,12 +9,15 @@ use std::sync::Mutex;
 
 use serde_json::Value;
 
+use crate::analyze::{analyze_module_with_call_sites, collect_imports};
 use crate::exec::{NsjailPool, Sandbox};
-use crate::model::Purity;
-use crate::record::record_with;
+use crate::model::{EffectSignature, Import, Purity};
+use crate::record::record_with_signatures;
 use crate::validate::{Severity, validate_function};
 
+pub mod interproc;
 pub mod resolve;
+use interproc::{FileUnit, propagate};
 use resolve::{ModuleIndex, annotate_with_resolution, resolve_import};
 
 /// Directory names skipped anywhere in the tree, plus any directory whose name starts with
@@ -152,9 +155,10 @@ fn build_report(root: &Path, mut entries: Vec<FileEntry>, include_defects: bool)
 /// parallelism`, capped at `items.len()`), then return the results in whatever order the
 /// threads finished. Used only for the CPU-bound, jail-free `analyze` path: `record`/`validate`
 /// go through the jail and stay sequential (see [`record_project`]).
-fn parallel_map<F>(items: &[PathBuf], f: F) -> Vec<FileEntry>
+fn parallel_map<T, F>(items: &[PathBuf], f: F) -> Vec<T>
 where
-    F: Fn(&Path) -> FileEntry + Sync,
+    T: Send,
+    F: Fn(&Path) -> T + Sync,
 {
     if items.is_empty() {
         return Vec::new();
@@ -170,7 +174,7 @@ where
             let f = &f;
             let results = &results;
             scope.spawn(move || {
-                let local: Vec<FileEntry> = chunk.iter().map(|p| f(p)).collect();
+                let local: Vec<T> = chunk.iter().map(|p| f(p)).collect();
                 results.lock().unwrap().extend(local);
             });
         }
@@ -178,76 +182,136 @@ where
     results.into_inner().unwrap()
 }
 
-fn analyze_file_entry(root: &Path, path: &Path, index: &ModuleIndex) -> FileEntry {
+/// One file's raw (not yet cross-file-propagated) static analysis: its imports, the Effects
+/// pass's signatures, and the imported call sites cross-file propagation needs — see
+/// `interproc::FileUnit`.
+struct AnalyzedFile {
+    path: String,
+    src: String,
+    imports: Vec<Import>,
+    signatures: Vec<EffectSignature>,
+    import_call_sites: Vec<Vec<crate::analyze::ImportCallSite>>,
+}
+
+fn analyze_file_raw(root: &Path, path: &Path) -> Result<AnalyzedFile, FileEntry> {
     let rel = relative_path(root, path);
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
-        Err(e) => return error_entry(rel, format!("read error: {e}")),
+        Err(e) => return Err(error_entry(rel, format!("read error: {e}"))),
     };
-    match (crate::imports_of(&src), crate::analyze_source(&src)) {
-        (Ok(imports), Ok(functions)) => {
-            let purities = functions.iter().map(|f| f.purity).collect();
-            let imports_json: Vec<Value> = imports
-                .iter()
-                .map(|imp| annotate_with_resolution(imp, &resolve_import(index, &rel, imp)))
-                .collect();
-            let json = serde_json::json!({
-                "path": rel,
-                "imports": imports_json,
-                "functions": functions,
-            });
-            FileEntry {
-                path: rel,
-                json,
-                purities,
-                hard_defects: 0,
-                soft_defects: 0,
-                functions_checked: 0,
-                ok: true,
+    let parsed = match crate::parse::parse_source(&src) {
+        Ok(p) => p,
+        Err(e) => return Err(error_entry(rel, format!("parse error: {e}"))),
+    };
+    let imports = collect_imports(parsed.syntax());
+    let result = analyze_module_with_call_sites(parsed.syntax());
+    Ok(AnalyzedFile {
+        path: rel,
+        src,
+        imports,
+        signatures: result.signatures,
+        import_call_sites: result.import_call_sites,
+    })
+}
+
+/// One project file's static analysis, after cross-file effect propagation has settled — the
+/// enriched inputs `record`/`validate` (as well as `analyze`'s own report) build on.
+struct EnrichedFile {
+    path: String,
+    src: String,
+    imports: Vec<Import>,
+    signatures: Vec<EffectSignature>,
+}
+
+/// Analyze every project file (in parallel — pure and CPU-bound, no jail involved), then run
+/// cross-file effect propagation (`interproc::propagate`) once over all of them together. Shared
+/// by `analyze_project`, `record_project`, and `validate_project` so every project-mode entry
+/// point works from the same cross-file-propagated signatures. A file that fails to read or
+/// parse becomes an error [`FileEntry`] instead, kept out of propagation.
+fn analyze_and_propagate(root: &Path, files: &[PathBuf]) -> (Vec<EnrichedFile>, Vec<FileEntry>) {
+    let raw: Vec<Result<AnalyzedFile, FileEntry>> = parallel_map(files, |path| analyze_file_raw(root, path));
+
+    let mut srcs = Vec::new();
+    let mut units = Vec::new();
+    let mut errors = Vec::new();
+    for r in raw {
+        match r {
+            Ok(af) => {
+                srcs.push(af.src);
+                units.push(FileUnit {
+                    path: af.path,
+                    signatures: af.signatures,
+                    import_call_sites: af.import_call_sites,
+                    imports: af.imports,
+                });
             }
+            Err(e) => errors.push(e),
         }
-        (Err(e), _) | (_, Err(e)) => error_entry(rel, format!("parse error: {e}")),
+    }
+    propagate(&mut units, root);
+
+    let enriched = units
+        .into_iter()
+        .zip(srcs)
+        .map(|(fu, src)| EnrichedFile { path: fu.path, src, imports: fu.imports, signatures: fu.signatures })
+        .collect();
+    (enriched, errors)
+}
+
+fn build_analyze_entry(ef: EnrichedFile, index: &ModuleIndex) -> FileEntry {
+    let purities = ef.signatures.iter().map(|f| f.purity).collect();
+    let imports_json: Vec<Value> = ef
+        .imports
+        .iter()
+        .map(|imp| annotate_with_resolution(imp, &resolve_import(index, &ef.path, imp)))
+        .collect();
+    let json = serde_json::json!({
+        "path": ef.path,
+        "imports": imports_json,
+        "functions": ef.signatures,
+    });
+    FileEntry {
+        path: ef.path,
+        json,
+        purities,
+        hard_defects: 0,
+        soft_defects: 0,
+        functions_checked: 0,
+        ok: true,
     }
 }
 
-/// Static effect analysis over every `*.py` file under `root`. Pure and CPU-bound, so files
-/// are analyzed in parallel across a small worker-thread pool; no jail is involved. Each file's
-/// imports are also statically resolved against the other files in the project (see
-/// `resolve::resolve_import`), independent of the parallel per-file analysis.
+/// Static effect analysis over every `*.py` file under `root`. Each file's imports are also
+/// statically resolved against the other files in the project (see `resolve::resolve_import`).
+/// Once every file's raw signatures are in, cross-file effect propagation
+/// (`interproc::propagate`) runs once over all of them together before the report is built, so
+/// the reported `functions` reflect cross-file-propagated effects.
 pub fn analyze_project(root: &Path) -> Value {
     let files = collect_py_files(root);
+    let (enriched, errors) = analyze_and_propagate(root, &files);
     let index = ModuleIndex::build(root, &files);
-    let entries = parallel_map(&files, |path| analyze_file_entry(root, path, &index));
+    let mut entries: Vec<FileEntry> = enriched.into_iter().map(|ef| build_analyze_entry(ef, &index)).collect();
+    entries.extend(errors);
     build_report(root, entries, false)
 }
 
-fn record_file_entry(
-    sandbox: &dyn Sandbox,
-    root: &Path,
-    path: &Path,
-    max_inputs: usize,
-    index: &ModuleIndex,
-) -> FileEntry {
-    let rel = relative_path(root, path);
-    let src = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => return error_entry(rel, format!("read error: {e}")),
-    };
-    match record_with(sandbox, &src, max_inputs) {
+fn record_file_entry(sandbox: &dyn Sandbox, index: &ModuleIndex, ef: EnrichedFile, max_inputs: usize) -> FileEntry {
+    let EnrichedFile { path, src, imports, signatures } = ef;
+    match record_with_signatures(sandbox, &src, imports, signatures, max_inputs) {
         Ok(record) => {
             let purities = record.functions.iter().map(|f| f.signature.purity).collect();
             let deps_json: Vec<Value> = record
                 .dependencies
                 .iter()
-                .map(|dep| annotate_with_resolution(dep, &resolve_import(index, &rel, &dep.import)))
+                .map(|dep| annotate_with_resolution(dep, &resolve_import(index, &path, &dep.import)))
                 .collect();
             let json = serde_json::json!({
-                "path": rel,
+                "path": path,
                 "dependencies": deps_json,
                 "functions": record.functions,
             });
             FileEntry {
-                path: rel,
+                path,
                 json,
                 purities,
                 hard_defects: 0,
@@ -256,7 +320,7 @@ fn record_file_entry(
                 ok: true,
             }
         }
-        Err(e) => error_entry(rel, format!("record error: {e}")),
+        Err(e) => error_entry(path, format!("record error: {e}")),
     }
 }
 
@@ -264,27 +328,26 @@ fn record_file_entry(
 /// for the whole run — spawning a pool per file would pay nsjail startup repeatedly). Sequential
 /// across files for v1; parallelizing jailed record across a multi-worker pool is future work.
 /// Fails the whole run only if the sandbox can't be provisioned at all; a per-file record
-/// failure becomes a `{path, error}` entry instead.
+/// failure becomes a `{path, error}` entry instead. Records against cross-file-propagated
+/// signatures, same as `analyze_project`.
 pub fn record_project(root: &Path, max_inputs: usize) -> Result<Value, String> {
     let files = collect_py_files(root);
     let index = ModuleIndex::build(root, &files);
     let sandbox = NsjailPool::new(1)?;
-    let entries: Vec<FileEntry> = files
-        .iter()
-        .map(|path| record_file_entry(&sandbox, root, path, max_inputs, &index))
+    let (enriched, error_entries) = analyze_and_propagate(root, &files);
+    let mut entries: Vec<FileEntry> = enriched
+        .into_iter()
+        .map(|ef| record_file_entry(&sandbox, &index, ef, max_inputs))
         .collect();
+    entries.extend(error_entries);
     Ok(build_report(root, entries, false))
 }
 
-fn validate_file_entry(sandbox: &dyn Sandbox, root: &Path, path: &Path, max_inputs: usize) -> FileEntry {
-    let rel = relative_path(root, path);
-    let src = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => return error_entry(rel, format!("read error: {e}")),
-    };
-    let record = match record_with(sandbox, &src, max_inputs) {
+fn validate_file_entry(sandbox: &dyn Sandbox, ef: EnrichedFile, max_inputs: usize) -> FileEntry {
+    let EnrichedFile { path, src, imports, signatures } = ef;
+    let record = match record_with_signatures(sandbox, &src, imports, signatures, max_inputs) {
         Ok(r) => r,
-        Err(e) => return error_entry(rel, format!("record error: {e}")),
+        Err(e) => return error_entry(path, format!("record error: {e}")),
     };
 
     let mut hard_total = 0usize;
@@ -310,7 +373,7 @@ fn validate_file_entry(sandbox: &dyn Sandbox, root: &Path, path: &Path, max_inpu
     let purities = record.functions.iter().map(|f| f.signature.purity).collect();
     let functions_checked = record.functions.len();
     let json = serde_json::json!({
-        "path": rel,
+        "path": path,
         "functions": functions_json,
         "summary": {
             "hard_defects": hard_total,
@@ -319,7 +382,7 @@ fn validate_file_entry(sandbox: &dyn Sandbox, root: &Path, path: &Path, max_inpu
         }
     });
     FileEntry {
-        path: rel,
+        path,
         json,
         purities,
         hard_defects: hard_total,
@@ -331,14 +394,15 @@ fn validate_file_entry(sandbox: &dyn Sandbox, root: &Path, path: &Path, max_inpu
 
 /// Validate every `*.py` file under `root` (record + `observed ⊆ static` check), aggregating
 /// hard/soft defect totals. Returns the report plus the aggregate hard-defect count so the
-/// caller can set the same non-zero exit code contract as single-file `validate`.
+/// caller can set the same non-zero exit code contract as single-file `validate`. Validates
+/// against cross-file-propagated signatures, same as `analyze_project`.
 pub fn validate_project(root: &Path, max_inputs: usize) -> Result<(Value, usize), String> {
     let files = collect_py_files(root);
     let sandbox = NsjailPool::new(1)?;
-    let entries: Vec<FileEntry> = files
-        .iter()
-        .map(|path| validate_file_entry(&sandbox, root, path, max_inputs))
-        .collect();
+    let (enriched, error_entries) = analyze_and_propagate(root, &files);
+    let mut entries: Vec<FileEntry> =
+        enriched.into_iter().map(|ef| validate_file_entry(&sandbox, ef, max_inputs)).collect();
+    entries.extend(error_entries);
     let hard_total: usize = entries.iter().map(|e| e.hard_defects).sum();
     Ok((build_report(root, entries, true), hard_total))
 }

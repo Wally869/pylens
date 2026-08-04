@@ -132,7 +132,23 @@ pub fn record_file(src: &str, max_inputs: usize) -> Result<ModuleRecord, String>
 pub fn record_with(sandbox: &dyn Sandbox, src: &str, max_inputs: usize) -> Result<ModuleRecord, String> {
     let imports = imports_of(src).map_err(|e| e.to_string())?;
     let sigs = analyze_source(src).map_err(|e| e.to_string())?;
+    record_with_signatures(sandbox, src, imports, sigs, max_inputs)
+}
 
+/// Record a whole file's functions against an already-provisioned sandbox, using precomputed
+/// imports and effect signatures rather than deriving them from `src` with `analyze_source`.
+/// Lets a caller that has already produced (and, in project mode, cross-file-propagated)
+/// signatures — see `project::interproc` — record and validate against those enriched
+/// signatures instead of the plain per-file ones. Behavior is otherwise identical to
+/// [`record_with`], including how `sig.name == "__init__"` is skipped and how `positional_
+/// params(sig)`/`gen_inputs(sig, ...)` read `sigs`.
+pub fn record_with_signatures(
+    sandbox: &dyn Sandbox,
+    src: &str,
+    imports: Vec<Import>,
+    sigs: Vec<EffectSignature>,
+    max_inputs: usize,
+) -> Result<ModuleRecord, String> {
     let dependencies = probe_dependencies(sandbox, imports)?;
 
     // Ground truth for "can anything in this file run": exec the real source once. This

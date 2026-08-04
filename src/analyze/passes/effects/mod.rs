@@ -15,7 +15,7 @@ use super::super::collect::exceptions::{
     subscript_read_exceptions,
 };
 use super::super::collect::guards::guard_samples;
-use super::super::context::{CallSite, FunctionFacts, ModuleAnalysis, ModuleCtx};
+use super::super::context::{CallSite, FunctionFacts, ImportCallSite, ModuleAnalysis, ModuleCtx};
 use super::super::pass::Pass;
 use super::declarations::{ReceiverKind, resolve_unique};
 
@@ -48,17 +48,18 @@ impl Pass for EffectsPass {
                 ast::Stmt::FunctionDef(def) => {
                     let receiver = receivers.next().unwrap_or(ReceiverKind::None);
                     let shapes = shapes_iter.next().cloned().unwrap_or_default();
-                    let (sig, call_sites) =
+                    let (sig, call_sites, import_call_sites) =
                         analyze_function(def, DefKind::Function, receiver, module_ctx, shapes, None);
                     ctx.signatures.push(sig);
                     ctx.call_sites.push(call_sites);
+                    ctx.import_call_sites.push(import_call_sites);
                 }
                 ast::Stmt::ClassDef(class) => {
                     for member in &class.body {
                         if let ast::Stmt::FunctionDef(def) = member {
                             let receiver = receivers.next().unwrap_or(ReceiverKind::None);
                             let shapes = shapes_iter.next().cloned().unwrap_or_default();
-                            let (mut sig, call_sites) = analyze_function(
+                            let (mut sig, call_sites, import_call_sites) = analyze_function(
                                 def,
                                 DefKind::Method,
                                 receiver,
@@ -69,6 +70,7 @@ impl Pass for EffectsPass {
                             sig.owner = Some(class.name.as_str().to_string());
                             ctx.signatures.push(sig);
                             ctx.call_sites.push(call_sites);
+                            ctx.import_call_sites.push(import_call_sites);
                         }
                     }
                 }
@@ -89,7 +91,7 @@ fn analyze_function(
     module: ModuleCtx,
     shapes: HashMap<String, Shape>,
     owner: Option<&str>,
-) -> (EffectSignature, Vec<CallSite>) {
+) -> (EffectSignature, Vec<CallSite>, Vec<ImportCallSite>) {
     let params = collect_param_names(&def.parameters);
     let self_param = match receiver {
         ReceiverKind::SelfParam | ReceiverKind::Cls => params.first().cloned(),
@@ -104,7 +106,8 @@ fn analyze_function(
         FunctionFacts::new(self_param, &params, module, shapes, sig, owner.map(str::to_string));
     Walker { facts: &mut facts }.run(&def.body);
     let call_sites = std::mem::take(&mut facts.call_sites);
-    (finish(facts, param_defs), call_sites)
+    let import_call_sites = std::mem::take(&mut facts.import_call_sites);
+    (finish(facts, param_defs), call_sites, import_call_sites)
 }
 
 fn finish(facts: FunctionFacts, param_defs: Vec<ParamInfo>) -> EffectSignature {
@@ -542,6 +545,17 @@ impl Walker<'_, '_> {
                         callee: dotted_attr(&call.func),
                         may_affect: self.args_targets(&call.arguments),
                     });
+                    // Only a direct `binding.attr(...)` (not a deeper chain like
+                    // `binding.sub.attr(...)`) lines up unambiguously with a project-local
+                    // `binding.attr` symbol — see `ImportCallSite` doc.
+                    if matches!(attr.value.as_ref(), ast::Expr::Name(_)) {
+                        let arg_roots = self.positional_arg_roots(&call.arguments);
+                        self.facts.import_call_sites.push(ImportCallSite {
+                            binding: base.to_string(),
+                            attr: Some(attr.attr.to_string()),
+                            arg_roots,
+                        });
+                    }
                 } else if self.is_self_receiver(&attr.value)
                     && let Some(callee) = resolve_unique(
                         self.facts.declarations,
@@ -581,6 +595,12 @@ impl Walker<'_, '_> {
                         reason: "call_import".to_string(),
                         callee: Some(n.to_string()),
                         may_affect: self.args_targets(&call.arguments),
+                    });
+                    let arg_roots = self.positional_arg_roots(&call.arguments);
+                    self.facts.import_call_sites.push(ImportCallSite {
+                        binding: n.to_string(),
+                        attr: None,
+                        arg_roots,
                     });
                 } else if let Some(callee) = resolve_unique(self.facts.declarations, None, n) {
                     // A call to a module-level function defined in this same module — a
