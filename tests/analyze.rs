@@ -279,8 +279,18 @@ fn subscript_with_any_key_yields_implicit_type_error() {
 }
 
 #[test]
-fn subscript_with_literal_index_yields_no_type_error() {
+fn subscript_with_any_base_yields_implicit_type_error() {
+    // `xs`'s shape is never pinned by anything but the subscript itself, so the BASE — not
+    // just the (here, literal) key — is a genuine `TypeError` candidate: `xs` could be any
+    // non-subscriptable runtime value.
     let s = analyze("def g(xs):\n    return xs[0]\n");
+    let g = sig(&s, "g");
+    assert!(g.raises.implicit.contains(&"TypeError".to_string()));
+}
+
+#[test]
+fn subscript_with_literal_index_on_pinned_base_yields_no_type_error() {
+    let s = analyze("def g(xs):\n    xs.append(1)\n    return xs[0]\n");
     let g = sig(&s, "g");
     assert!(!g.raises.implicit.contains(&"TypeError".to_string()));
 }

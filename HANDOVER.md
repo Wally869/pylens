@@ -1,22 +1,14 @@
 # Handover — open follow-ups
 
 Current state: the analyzer, jailed recorder, `observed ⊆ static` validation harness, multi-file
-mode, `.pyi`/HTML output, and the CLI are in place. `cargo test` is green (100 tests, jail-gated
-ones skip when the sandbox isn't provisioned) and `cargo clippy --all-targets -- -D warnings` is
-clean. See `CLAUDE.md` for the architecture and codemap.
-
-## Known soundness gap (tracked)
-
-- **`examples/graph.py` — `walk` / `merge_into` observe `TypeError` the static may-set doesn't
-  predict.** The cause is deeper than the shipped param-root `TypeError` rules: a param flows
-  through a **local** (`node = stack.pop()`) into a hashable/subscript context, and a subscript
-  **base** (`dst[k] = v` where `dst` is `Any`) can be non-subscriptable. The fix is to generalize
-  implicit-`TypeError` inference to consult the full Shapes-pass env (params **and** locals) and
-  cover membership (`in`), hashable-key operations (`set.add`, `dict.get`/key methods), and
-  `Any` subscript bases — aiming for the whole `examples/` tree at zero hard defects.
-  `tests/validate.rs` currently asserts zero hard defects on the known-clean files
-  (`inventory.py`, `normalize.py`) only. **Do not weaken it to mask new findings** — report and
-  close them.
+mode, `.pyi`/HTML output, and the CLI are in place. `cargo test` is green (jail-gated ones skip
+when the sandbox isn't provisioned) and `cargo clippy --all-targets -- -D warnings` is clean. See
+`CLAUDE.md` for the architecture and codemap. The whole `examples/` tree (not just
+`inventory.py`/`normalize.py`) is at zero hard defects — implicit-`TypeError` inference now
+consults the Shapes pass's full params+locals env (membership, subscript-base, and the existing
+ordered-compare/arithmetic/subscript-key rules all key off it), closing the `graph.py`
+`walk`/`merge_into` gap that used to be tracked here. `tests/validate.rs` and `tests/project.rs`
+assert zero hard defects across the full corpus — keep it there.
 
 ## Feature follow-ups
 

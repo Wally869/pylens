@@ -310,9 +310,10 @@ impl Walker<'_, '_> {
                 }
                 // The key may raise `TypeError` on assignment too (`d[k] = v` with an
                 // unhashable `k`) — see the read-position comment in `visit_expr`.
-                if let Some(root) = self.facts.param_root(&sub.slice) {
-                    self.facts.note_type_error_candidate(&root);
-                }
+                self.facts.note_type_error_candidate(&sub.slice);
+                // The BASE itself may not be subscriptable at all (`alias[k] = v` where
+                // `alias` aliases an `Any`-typed param) — see the read-position comment.
+                self.facts.note_type_error_candidate(&sub.value);
             }
             ast::Expr::Attribute(attr) => {
                 if let Some(t) = self.facts.resolve_target(&attr.value, Some(attr.attr.as_str())) {
@@ -367,9 +368,10 @@ impl Walker<'_, '_> {
                 }
                 // The key may raise `TypeError` on deletion too (`del d[k]` with an
                 // unhashable `k`) — see the read-position comment in `visit_expr`.
-                if let Some(root) = self.facts.param_root(&sub.slice) {
-                    self.facts.note_type_error_candidate(&root);
-                }
+                self.facts.note_type_error_candidate(&sub.slice);
+                // The BASE itself may not be subscriptable at all — see the read-position
+                // comment.
+                self.facts.note_type_error_candidate(&sub.value);
             }
             ast::Expr::Attribute(attr) => {
                 if let Some(t) = self.facts.resolve_target(&attr.value, Some(attr.attr.as_str())) {
@@ -410,8 +412,7 @@ impl Walker<'_, '_> {
                 // and delete targets are handled separately and never call `visit_expr`) may
                 // raise, over-approximated by the base's shape known so far in this forward
                 // walk: mapping ⇒ `KeyError`, sequence/str ⇒ `IndexError`, else both.
-                if let Some(root) = self.facts.param_root(&s.value) {
-                    let shape = self.facts.shapes.get(&root).cloned().unwrap_or(Shape::Any);
+                if let Some(shape) = self.facts.env_shape(&s.value) {
                     for exc in subscript_read_exceptions(&shape) {
                         self.facts.sig.raises.implicit.push((*exc).to_string());
                     }
@@ -420,9 +421,12 @@ impl Walker<'_, '_> {
                 // the analyzer (e.g. an unhashable value used as a dict key) — see
                 // `collect::exceptions` doc. Composes with the base-driven KeyError/IndexError
                 // above: a subscript can contribute both.
-                if let Some(root) = self.facts.param_root(&s.slice) {
-                    self.facts.note_type_error_candidate(&root);
-                }
+                self.facts.note_type_error_candidate(&s.slice);
+                // The BASE itself may not be subscriptable at all (an `Any`-typed base's
+                // runtime value could be anything, including a non-container) — a further
+                // `TypeError` candidate, additive with the base-shape-driven Key/IndexError
+                // above (a subscript on a genuinely unknown base can raise either).
+                self.facts.note_type_error_candidate(&s.value);
                 self.visit_expr(&s.value);
                 self.visit_expr(&s.slice);
             }
@@ -435,9 +439,7 @@ impl Walker<'_, '_> {
                 // Arithmetic on an operand whose type the analyzer never pinned may raise
                 // `TypeError` — see `collect::exceptions` doc.
                 for operand in [b.left.as_ref(), b.right.as_ref()] {
-                    if let Some(root) = self.facts.param_root(operand) {
-                        self.facts.note_type_error_candidate(&root);
-                    }
+                    self.facts.note_type_error_candidate(operand);
                 }
             }
             Expr::BoolOp(b) => {
@@ -457,10 +459,17 @@ impl Walker<'_, '_> {
                     let operands =
                         std::iter::once(c.left.as_ref()).chain(c.comparators.iter());
                     for operand in operands {
-                        if let Some(root) = self.facts.param_root(operand) {
-                            self.facts.note_type_error_candidate(&root);
-                        }
+                        self.facts.note_type_error_candidate(operand);
                     }
+                }
+                // Membership (`in`/`not in`) hashes (or otherwise scans) its LEFT operand
+                // against the right-hand container; an `Any`-typed left operand may genuinely
+                // be unhashable (or otherwise unsupported) at runtime — `TypeError`. Unlike the
+                // ordered-compare rule, only the left operand is checked: the right-hand
+                // container's own shape is covered separately by the base-driven subscript
+                // rules where relevant, and membership never mistypes on the container itself.
+                if c.ops.iter().any(|op| matches!(op, ast::CmpOp::In | ast::CmpOp::NotIn)) {
+                    self.facts.note_type_error_candidate(&c.left);
                 }
             }
             Expr::If(i) => {

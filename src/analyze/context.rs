@@ -184,6 +184,21 @@ impl<'a> FunctionFacts<'a> {
         self.aliases.get(name).cloned()
     }
 
+    /// `expr`'s settled shape per the Shapes pass's full env (params **and** locals), resolved
+    /// through the same alias map `param_root` uses — but, unlike `param_root`, covering *any*
+    /// tracked local, not just names that alias a parameter: a name with no alias entry (e.g. a
+    /// rebound local like `node = stack.pop()`) roots to itself, mirroring the Shapes pass's own
+    /// alias-collapse on rebind. `None` for the method receiver (`self`/`cls`, not shape-tracked)
+    /// or an expression with no leftmost name — the same exclusions `param_root` applies.
+    pub(in crate::analyze) fn env_shape(&self, expr: &ast::Expr) -> Option<Shape> {
+        let name = leftmost_name(expr)?;
+        if Some(name) == self.self_param.as_deref() {
+            return None;
+        }
+        let root = self.aliases.get(name).cloned().unwrap_or_else(|| name.to_string());
+        Some(self.shapes.get(&root).cloned().unwrap_or(Shape::Any))
+    }
+
     /// Resolve the base of a mutation/argument expression to a [`MutationTarget`] root.
     /// `attr` is the attribute name when the mutation is an attribute write on this base.
     pub(in crate::analyze) fn resolve_target(
@@ -233,13 +248,14 @@ impl<'a> FunctionFacts<'a> {
         self.sig.returns.push(kind);
     }
 
-    /// An operand rooting to `root` sits in an ordered comparison or arithmetic binop; if
-    /// `root`'s final settled shape is still `Shape::Any`, its type genuinely is unknown to the
-    /// analyzer and the operation may raise `TypeError` at runtime. A root pinned to a concrete
-    /// shape is confident enough to omit it — input generation respects that shape, so the
-    /// runtime call site won't mistype it.
-    pub(in crate::analyze) fn note_type_error_candidate(&mut self, root: &str) {
-        if self.shapes.get(root).cloned().unwrap_or(Shape::Any) == Shape::Any {
+    /// `expr` sits in a position that mistypes at runtime when its type is unknown (an ordered
+    /// comparison/arithmetic operand, a subscript key or base, a membership test's left
+    /// operand, ...): if `expr`'s rooted [`env_shape`](Self::env_shape) is still `Shape::Any`,
+    /// its type genuinely is unknown to the analyzer and the operation may raise `TypeError` at
+    /// runtime. An operand pinned to a concrete shape is confident enough to omit it — input
+    /// generation respects that shape, so the runtime call site won't mistype it.
+    pub(in crate::analyze) fn note_type_error_candidate(&mut self, expr: &ast::Expr) {
+        if self.env_shape(expr) == Some(Shape::Any) {
             self.sig.raises.implicit.push("TypeError".to_string());
         }
     }

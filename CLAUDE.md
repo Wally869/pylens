@@ -119,9 +119,9 @@ Otherwise jail-gated tests run against the stale worker.
 
 - **May-set semantics, soundness first.** Over-approximation (predicted-but-never-observed) is
   tolerated and kept low; under-approximation (observed-but-not-predicted) is a bug — a **hard
-  defect** in `pylens validate`. The example corpus (`inventory.py`, `normalize.py`) is kept at
-  zero hard defects; `tests/validate.rs` enforces it. `graph.py` has a known tracked gap
-  (see `HANDOVER.md`) — don't weaken the test to hide new findings; report them.
+  defect** in `pylens validate`. The full example corpus (`examples/*.py`) is kept at zero hard
+  defects; `tests/validate.rs` and `tests/project.rs` enforce it — don't weaken either to hide
+  new findings; report them.
 - **Greenfield.** No backwards-compat baggage, no dead code, no "previous approach" comments.
 - **Rust edition 2024.** ruff is pinned to a fixed rev in `Cargo.toml` (reproducible builds).
 - Doc-comment each pass/collector/module with its single responsibility.

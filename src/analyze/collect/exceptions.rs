@@ -41,18 +41,21 @@ pub(in crate::analyze) fn call_implicit_exception(callee: &str) -> Option<&'stat
     matches!(callee, "int" | "float").then_some("ValueError")
 }
 
-/// Whether `op` is an ordered comparison (`<`, `<=`, `>`, `>=`) — the only comparison kind whose
-/// mismatched operand types raise `TypeError`. Equality (`==`/`!=`), identity (`is`/`is not`),
-/// and membership (`in`/`not in`) never raise `TypeError` for a type mismatch, so they're
-/// excluded.
+/// Whether `op` is an ordered comparison (`<`, `<=`, `>`, `>=`) — the comparison kind whose
+/// mismatched operand types raise `TypeError` on *both* operands. Equality (`==`/`!=`) and
+/// identity (`is`/`is not`) never raise `TypeError` for a type mismatch, so they're excluded.
+/// Membership (`in`/`not in`) is handled separately (see the Effects walk's `Compare` arm): it
+/// can raise `TypeError` too, but only via its LEFT operand (an unhashable/unsupported value
+/// probed against the right-hand container), so it doesn't fit this all-operands rule.
 ///
 /// Used, together with `binop_implicit_exception`'s arithmetic operators, to seed implicit
 /// `TypeError` candidates: `TypeError` is a may-raise precisely when an operand's type is
-/// unknown to the analyzer (a param that never got a shape vote), since ordered comparisons and
+/// unknown to the analyzer (a name that never got a shape vote), since ordered comparisons and
 /// arithmetic on such a value can genuinely mistype at runtime. A pinned shape means the
 /// analyzer is confident enough to omit it — input generation respects that shape, so the
 /// runtime call site won't mistype it. See `FunctionFacts::note_type_error_candidate`, which
-/// checks each candidate's root against its *final* settled shape (Shapes runs before Effects).
+/// checks each candidate's rooted *final* settled shape (Shapes runs before Effects, and its
+/// env covers params **and** locals — see `FunctionFacts::env_shape`).
 pub(in crate::analyze) fn is_ordered_compare(op: ast::CmpOp) -> bool {
     matches!(
         op,

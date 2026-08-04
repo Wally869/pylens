@@ -121,20 +121,19 @@ fn validate_project_over_examples_aggregates_the_observed_defect_count() {
         assert!(f.get("error").is_none(), "unexpected per-file error: {f:?}");
     }
 
-    // inventory.py and normalize.py are the curated, known-sound corpus (see tests/validate.rs)
-    // and must stay at zero hard defects here too.
-    for clean in ["inventory.py", "normalize.py"] {
-        let f = files.iter().find(|f| f["path"] == clean).unwrap_or_else(|| panic!("{clean} entry"));
-        assert_eq!(f["summary"]["hard_defects"], 0, "{clean} should be hard-defect-free");
+    // The entire examples/ tree (config.py, deps.py, graph.py, inventory.py, lazy_deps.py,
+    // ledger.py, normalize.py, streaming.py) is sound end to end — every file must be
+    // hard-defect-free, individually and in aggregate.
+    for f in files {
+        let path = f["path"].as_str().unwrap_or_default();
+        assert_eq!(f["summary"]["hard_defects"], 0, "{path} should be hard-defect-free");
     }
 
-    // The aggregate must equal the sum of the per-file hard-defect counts — this is the
-    // number actually observed today (graph.py has known analyzer gaps unrelated to this
-    // task), not an assertion that the whole examples/ tree is sound.
     let expected: u64 = files
         .iter()
         .map(|f| f["summary"]["hard_defects"].as_u64().unwrap_or(0))
         .sum();
+    assert_eq!(expected, 0, "expected zero hard defects across the whole examples/ tree");
     assert_eq!(hard_total as u64, expected);
     assert_eq!(report["summary"]["hard_defects"], expected);
 }
