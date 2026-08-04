@@ -173,6 +173,7 @@ mod tests {
             shape: Shape::Seq(Box::new(Shape::Seq(Box::new(Shape::Float)))),
             has_default: false,
             kind: Default::default(),
+            guard_samples: Vec::new(),
         });
         sig.mutations.push(Mutation {
             target: MutationTarget::Param {

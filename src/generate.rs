@@ -65,12 +65,18 @@ pub fn gen_inputs(sig: &EffectSignature, max_vectors: usize) -> Vec<GenInput> {
 }
 
 /// Candidate values for a parameter, including the None/default-path injection for defaulted
-/// parameters.
+/// parameters and guard-derived literal samples (see `analyze::collect::guards`) so generation
+/// is more likely to exercise both sides of a guarded branch.
 fn candidates_for(p: &ParamInfo) -> Vec<Value> {
     let mut c = candidates(&p.shape);
     // A defaulted parameter is likely Optional — exercise the None/default path.
     if p.has_default && !c.iter().any(Value::is_null) {
         c.insert(0, Value::Null);
+    }
+    for sample in &p.guard_samples {
+        if !c.contains(sample) {
+            c.push(sample.clone());
+        }
     }
     c
 }

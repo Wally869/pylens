@@ -272,6 +272,20 @@ fn sequence_shaped_subscript_read_yields_index_error() {
 }
 
 #[test]
+fn subscript_with_any_key_yields_implicit_type_error() {
+    let s = analyze("def f(d, k):\n    return d[k]\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"TypeError".to_string()));
+}
+
+#[test]
+fn subscript_with_literal_index_yields_no_type_error() {
+    let s = analyze("def g(xs):\n    return xs[0]\n");
+    let g = sig(&s, "g");
+    assert!(!g.raises.implicit.contains(&"TypeError".to_string()));
+}
+
+#[test]
 fn int_conversion_yields_implicit_value_error() {
     let s = analyze("def f(s):\n    return int(s)\n");
     let f = sig(&s, "f");
@@ -440,4 +454,33 @@ fn unannotated_function_is_never_flagged() {
     let s = analyze("def f(x):\n    return \"a\"\n");
     let f = sig(&s, "f");
     assert!(f.type_mismatches.is_empty());
+}
+
+#[test]
+fn equality_guard_records_literal_sample() {
+    let s = analyze("def f(x):\n    if x == 42:\n        return 1\n    return 0\n");
+    let f = sig(&s, "f");
+    let x = f.params.iter().find(|p| p.name == "x").unwrap();
+    assert!(
+        x.guard_samples.contains(&serde_json::json!(42)),
+        "expected 42 among guard samples: {:?}",
+        x.guard_samples
+    );
+}
+
+#[test]
+fn ordered_guard_records_boundary_neighbors() {
+    let s = analyze("def f(x):\n    if x > 10:\n        return 1\n    return 0\n");
+    let f = sig(&s, "f");
+    let x = f.params.iter().find(|p| p.name == "x").unwrap();
+    assert!(
+        x.guard_samples.contains(&serde_json::json!(10)),
+        "expected 10 among guard samples: {:?}",
+        x.guard_samples
+    );
+    assert!(
+        x.guard_samples.contains(&serde_json::json!(11)),
+        "expected 11 among guard samples: {:?}",
+        x.guard_samples
+    );
 }

@@ -220,6 +220,33 @@ fn keyword_only_param_is_passed_by_name_and_returns() {
 }
 
 #[test]
+fn guarded_branch_is_reached_via_guard_sample() {
+    if !ready("guarded_branch_is_reached_via_guard_sample") {
+        return;
+    }
+    // Without guard-directed sampling, an even spread over `x`'s generic candidates is unlikely
+    // to land exactly on 42, so the guarded `"hit"` branch would rarely (if ever) be exercised.
+    let src = "def f(x):\n    if x == 42:\n        return \"hit\"\n    return \"miss\"\n";
+    let rec = record_file(src, 8).expect("record");
+    let f = rec
+        .functions
+        .iter()
+        .find(|r| r.signature.name == "f")
+        .expect("f record");
+    assert!(!f.cases.is_empty(), "expected generated cases");
+    let hit = f.cases.iter().any(|c| {
+        c.outcome == "returned"
+            && c.input == vec![serde_json::json!(42)]
+            && c.ret == Some(serde_json::json!("hit"))
+    });
+    assert!(
+        hit,
+        "expected a case with input [42] returning \"hit\": {:?}",
+        f.cases.iter().map(|c| (&c.input, &c.ret)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn keyword_only_mutation_is_detected() {
     if !ready("keyword_only_mutation_is_detected") {
         return;

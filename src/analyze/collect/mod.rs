@@ -3,6 +3,7 @@
 
 pub(super) mod aliases;
 pub(super) mod exceptions;
+pub(super) mod guards;
 pub(super) mod mutations;
 pub(super) mod returns;
 pub(super) mod shapes;

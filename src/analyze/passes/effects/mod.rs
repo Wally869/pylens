@@ -14,6 +14,7 @@ use super::super::collect::exceptions::{
     binop_implicit_exception, call_implicit_exception, exception_name, is_ordered_compare,
     subscript_read_exceptions,
 };
+use super::super::collect::guards::guard_samples;
 use super::super::context::{CallSite, FunctionFacts, ModuleAnalysis, ModuleCtx};
 use super::super::pass::Pass;
 use super::declarations::{ReceiverKind, resolve_unique};
@@ -118,6 +119,7 @@ fn finish(facts: FunctionFacts, param_defs: Vec<ParamInfo>) -> EffectSignature {
         .into_iter()
         .map(|pi| ParamInfo {
             shape: facts.shapes.get(&pi.name).cloned().unwrap_or(Shape::Any),
+            guard_samples: facts.guard_samples.get(&pi.name).cloned().unwrap_or_default(),
             ..pi
         })
         .collect();
@@ -188,6 +190,7 @@ impl Walker<'_, '_> {
             Stmt::Assert(assert_stmt) => {
                 // Directly visible in the AST — same high-confidence tier as `raise`.
                 self.facts.sig.raises.explicit.push("AssertionError".to_string());
+                self.note_guard_test(&assert_stmt.test);
                 self.visit_expr(&assert_stmt.test);
                 if let Some(msg) = assert_stmt.msg.as_deref() {
                     self.visit_expr(msg);
@@ -226,10 +229,12 @@ impl Walker<'_, '_> {
             }
             Stmt::Expr(e) => self.visit_expr(&e.value),
             Stmt::If(if_stmt) => {
+                self.note_guard_test(&if_stmt.test);
                 self.visit_expr(&if_stmt.test);
                 self.visit_body(&if_stmt.body);
                 for clause in &if_stmt.elif_else_clauses {
                     if let Some(test) = &clause.test {
+                        self.note_guard_test(test);
                         self.visit_expr(test);
                     }
                     self.visit_body(&clause.body);
@@ -250,6 +255,7 @@ impl Walker<'_, '_> {
                 self.visit_body(&for_stmt.orelse);
             }
             Stmt::While(while_stmt) => {
+                self.note_guard_test(&while_stmt.test);
                 self.visit_expr(&while_stmt.test);
                 self.visit_body(&while_stmt.body);
                 self.visit_body(&while_stmt.orelse);
@@ -301,6 +307,11 @@ impl Walker<'_, '_> {
             ast::Expr::Subscript(sub) => {
                 if let Some(t) = self.facts.resolve_target(&sub.value, None) {
                     self.facts.add_mutation(t, MutationKind::SubscriptSet, None);
+                }
+                // The key may raise `TypeError` on assignment too (`d[k] = v` with an
+                // unhashable `k`) — see the read-position comment in `visit_expr`.
+                if let Some(root) = self.facts.param_root(&sub.slice) {
+                    self.facts.note_type_error_candidate(&root);
                 }
             }
             ast::Expr::Attribute(attr) => {
@@ -354,6 +365,11 @@ impl Walker<'_, '_> {
                 if let Some(t) = self.facts.resolve_target(&sub.value, None) {
                     self.facts.add_mutation(t, MutationKind::SubscriptDel, None);
                 }
+                // The key may raise `TypeError` on deletion too (`del d[k]` with an
+                // unhashable `k`) — see the read-position comment in `visit_expr`.
+                if let Some(root) = self.facts.param_root(&sub.slice) {
+                    self.facts.note_type_error_candidate(&root);
+                }
             }
             ast::Expr::Attribute(attr) => {
                 if let Some(t) = self.facts.resolve_target(&attr.value, Some(attr.attr.as_str())) {
@@ -361,6 +377,15 @@ impl Walker<'_, '_> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Extract guard-derived literal samples from a test expression (`if`/`while`/`assert`
+    /// tests, ternary conditions) and record them against the parameters they guard — see
+    /// `collect::guards`.
+    fn note_guard_test(&mut self, test: &ast::Expr) {
+        for (root, value) in guard_samples(self.facts, test) {
+            self.facts.add_guard_sample(root, value);
         }
     }
 
@@ -390,6 +415,13 @@ impl Walker<'_, '_> {
                     for exc in subscript_read_exceptions(&shape) {
                         self.facts.sig.raises.implicit.push((*exc).to_string());
                     }
+                }
+                // The key/index itself may also raise `TypeError` if its type is unknown to
+                // the analyzer (e.g. an unhashable value used as a dict key) — see
+                // `collect::exceptions` doc. Composes with the base-driven KeyError/IndexError
+                // above: a subscript can contribute both.
+                if let Some(root) = self.facts.param_root(&s.slice) {
+                    self.facts.note_type_error_candidate(&root);
                 }
                 self.visit_expr(&s.value);
                 self.visit_expr(&s.slice);
@@ -432,6 +464,7 @@ impl Walker<'_, '_> {
                 }
             }
             Expr::If(i) => {
+                self.note_guard_test(&i.test);
                 self.visit_expr(&i.test);
                 self.visit_expr(&i.body);
                 self.visit_expr(&i.orelse);

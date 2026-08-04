@@ -64,6 +64,7 @@ pub(super) fn collect_param_defs(params: &ast::Parameters, skip: Option<&str>) -
             shape: Shape::Any,
             has_default,
             kind,
+            guard_samples: Vec::new(),
         })
         .collect()
 }

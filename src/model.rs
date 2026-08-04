@@ -420,6 +420,13 @@ pub struct ParamInfo {
     pub has_default: bool,
     #[serde(default, skip_serializing_if = "is_positional")]
     pub kind: ParamKind,
+    /// Literal values pulled from guard conditions (`if`/`while`/`assert` tests, ternary
+    /// conditions) that compare, contain, or identity-test this parameter — e.g. `x == 42`
+    /// records `42`. Feeds `generate::candidates_for` so generated inputs are more likely to
+    /// exercise both sides of a guarded branch. A bounded heuristic, not a solver: direct
+    /// per-parameter literal extraction only. See `analyze::collect::guards`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guard_samples: Vec<serde_json::Value>,
 }
 
 /// The full effect signature of one function/method.

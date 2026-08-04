@@ -33,6 +33,21 @@ fn ordinary_params_unaffected() {
 }
 
 #[test]
+fn guard_samples_appear_in_generated_vectors() {
+    let sigs = analyze_source("def f(x):\n    if x == 42:\n        return 1\n    return 0\n")
+        .expect("parse");
+    let f = sig(&sigs, "f");
+    let vectors = gen_inputs(&f, 32);
+    assert!(!vectors.is_empty());
+    assert!(
+        vectors
+            .iter()
+            .any(|v| v.positional.first() == Some(&serde_json::json!(42))),
+        "expected the guard literal 42 among generated inputs for `x`: {vectors:?}"
+    );
+}
+
+#[test]
 fn keyword_only_params_go_in_kwargs_not_positional() {
     let sigs = analyze_source("def f(a, *, b):\n    return a\n").expect("parse");
     let f = sig(&sigs, "f");

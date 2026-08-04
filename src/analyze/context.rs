@@ -120,6 +120,10 @@ pub(in crate::analyze) struct FunctionFacts<'a> {
     /// Structured call sites recorded when a call resolves to a local function/method, consumed
     /// by the Interprocedural pass.
     pub(in crate::analyze) call_sites: Vec<CallSite>,
+    /// Parameter root -> guard-derived literal samples, collected from `if`/`while`/`assert`
+    /// tests and ternary conditions as they're visited — see `collect::guards`. Merged into
+    /// `ParamInfo::guard_samples` in `finish`.
+    pub(in crate::analyze) guard_samples: HashMap<String, Vec<serde_json::Value>>,
     pub(in crate::analyze) sig: EffectSignature,
 }
 
@@ -149,7 +153,17 @@ impl<'a> FunctionFacts<'a> {
             declarations: module.declarations,
             owner,
             call_sites: Vec::new(),
+            guard_samples: HashMap::new(),
             sig,
+        }
+    }
+
+    /// Record a guard-derived sample value for a parameter root, deduplicating against samples
+    /// already recorded for that root.
+    pub(in crate::analyze) fn add_guard_sample(&mut self, root: String, value: serde_json::Value) {
+        let samples = self.guard_samples.entry(root).or_default();
+        if !samples.contains(&value) {
+            samples.push(value);
         }
     }
 
