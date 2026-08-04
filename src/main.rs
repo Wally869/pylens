@@ -42,7 +42,7 @@ fn main() {
 
 fn cmd_analyze(args: &[String]) {
     let format = format_of(args);
-    let path = args.iter().find(|a| !a.starts_with("--"));
+    let path = positional(args);
     if let Some(p) = path
         && std::path::Path::new(p.as_str()).is_dir()
     {
@@ -119,9 +119,7 @@ fn analyze_project_pyi(root: &std::path::Path) -> String {
 fn cmd_record(args: &[String]) {
     let format = format_of(args);
     reject_pyi_format(&format);
-    let path = args
-        .iter()
-        .find(|a| !a.starts_with("--"))
+    let path = positional(args)
         .cloned()
         .unwrap_or_else(|| fail("record needs a <file.py>"));
     let inputs: usize = flag(args, "--inputs")
@@ -163,9 +161,7 @@ fn cmd_record(args: &[String]) {
 fn cmd_validate(args: &[String]) {
     let format = format_of(args);
     reject_pyi_format(&format);
-    let path = args
-        .iter()
-        .find(|a| !a.starts_with("--"))
+    let path = positional(args)
         .cloned()
         .unwrap_or_else(|| fail("validate needs a <file.py>"));
     let inputs: usize = flag(args, "--inputs")
@@ -291,6 +287,26 @@ fn flag(args: &[String], name: &str) -> Option<String> {
         .position(|a| a == name)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+/// The first positional argument (the path), skipping `--flag` tokens and the value token that
+/// follows a value-taking flag, so `analyze --format pyi file.py` and `analyze file.py --format
+/// pyi` both resolve the path correctly.
+fn positional(args: &[String]) -> Option<&String> {
+    const VALUE_FLAGS: [&str; 2] = ["--format", "--inputs"];
+    let mut skip_next = false;
+    for a in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if a.starts_with("--") {
+            skip_next = VALUE_FLAGS.contains(&a.as_str());
+            continue;
+        }
+        return Some(a);
+    }
+    None
 }
 
 fn read_file(path: &str) -> String {
