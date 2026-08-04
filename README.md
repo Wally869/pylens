@@ -222,11 +222,12 @@ fork-server worker pool ([`src/exec.rs`](src/exec.rs)) that amortizes interprete
 the whole file while keeping per-call isolation. Imports are linked to the functions that use
 them (`uses`), and calls through an import (`mod.fn(param)`) are flagged as `call_import` effects
 so such functions are never mistaken for pure; calls to functions/methods defined in the *same*
-file are resolved and their effects propagated onto the caller instead. All JSON output carries a
-top-level `schema_version`. Not yet done: pylens still doesn't model *what* a library call does
-(whether it mutates its argument, what it returns); interprocedural effect propagation is
-intra-file only — cross-file propagation (following a `project_local` import to its target
-file's signatures) is future work. See [DESIGN.md](DESIGN.md).
+file are resolved and their effects propagated onto the caller, and in project (directory) mode
+calls to `project_local`-imported free functions are propagated **across files** too. All JSON
+output carries a top-level `schema_version`. Not yet done: pylens still doesn't model *what* an
+external library call does (whether it mutates its argument, what it returns); cross-file
+propagation covers free functions (imported methods / deep dotted chains stay unresolved). See
+[DESIGN.md](DESIGN.md).
 
 ## Docs
 

@@ -152,7 +152,7 @@ function is a *set of behaviors*, not one flat type.
 | `is_generator` | the body contains `yield` / `yield from` |
 | `returns` | union of inferred return kinds over all `return` statements (plus `none` for a bare/absent return or fall-through) |
 | `raises.explicit` | exception types from `raise` statements and `assert` (⇒ `AssertionError`) — high confidence |
-| `raises.implicit` | statically-inferred operator-induced may-set: `ZeroDivisionError` (`/`, `//`, `%`), `IndexError`/`KeyError` (subscript read), `ValueError` (`int()`/`float()`), `TypeError` (ordered-compare/arithmetic over `Any`-typed operands, **or** a subscript whose key/index roots to an `Any`-typed param); also folds in a resolved local callee's own explicit + implicit raises (see [interprocedural propagation](#3-analyze--effect-signatures) below) |
+| `raises.implicit` | statically-inferred operator-induced may-set: `ZeroDivisionError` (`/`, `//`, `%`), `IndexError`/`KeyError` (subscript read), `ValueError` (`int()`/`float()`), `TypeError` (operations on an `Any`-typed value — ordered compare/arithmetic, membership (`in`), or a subscript whose base or key is `Any`; keyed off the Shapes-pass env so `Any`-typed **locals** count, not just params); also folds in a resolved local callee's own explicit + implicit raises (see [interprocedural propagation](#3-analyze--effect-signatures) below) |
 | `mutations` | may-set of in-place mutations (see below); also includes mutations propagated in from a resolved local callee |
 | `global_writes` | module-level names written under a `global` declaration |
 | `io` | observed I/O channels (`stdout`, `stdin`, `filesystem`) |
@@ -409,8 +409,9 @@ import is always `not_probed` (§5); in project mode it's resolved against the t
 their *containing package* (importing `pkg.sub` runs `pkg/sub/__init__.py`), and relative-import
 level climbs package directories accordingly.
 
-Interprocedural effect propagation (§4) does **not** yet follow `project_local` imports across
-files — it stays intra-file even in project mode.
+Interprocedural effect propagation (§4) follows `project_local` imports across files in project
+mode: a call to a free function imported from another project file has that callee's effects
+propagated onto the caller, via a project-wide fixpoint (`project::interproc`).
 
 ---
 
@@ -450,9 +451,10 @@ HTML-escaped before being written.
 - **Relative imports resolve only in project mode.** Outside a directory run, `from . import
   sibling` is catalogued and marked `not_probed` (§3, §5) — a single file has no package context.
   In project mode (§8) it's resolved against the other files in the tree.
-- **Interprocedural effect propagation is intra-file only.** Even in project mode, a call through
-  a `project_local`-resolved import into another file isn't followed — only calls to
-  functions/methods defined in the *same* file get their effects propagated onto the caller (§4).
+- **Cross-file propagation covers free functions.** In project mode, calls to
+  `project_local`-imported *free* functions have their effects propagated across files (§4);
+  imported *methods*, deeper dotted call chains, and keyword-argument mappings are not yet
+  followed and stay `unresolved`. Outside project mode, propagation is intra-file only.
 - **Static returns are coarse.** A returned local variable or a returned argument is reported
   as `opaque`; precise return-type tracking is intentionally out of scope (the dynamic layer
   checks actual values).

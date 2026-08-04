@@ -139,9 +139,10 @@ not prove it.
     caller, remapping mutation targets positionally (or unchanged for `self`/global roots).
     Iterates to a fixpoint (bounded by `signatures.len() + 1` sweeps) so multi-hop chains and
     recursion (direct or mutual) settle without an infinite loop. Calls through imports or to
-    otherwise-unresolved callees are left as opaque `unresolved_effects`, unchanged — this pass
-    is **intra-file only**; cross-file propagation (following a resolved import to another
-    project file's signatures) is future work.
+    otherwise-unresolved callees are left as opaque `unresolved_effects` here — this pass is
+    **intra-file only**. Cross-file propagation (following a `project_local`-resolved import into
+    another project file's free-function signatures, with a project-wide fixpoint) runs at the
+    project level in `project::interproc`, in directory/project mode only.
   - **TypeCheck** (`passes/type_check.rs`) — compares each function's final `returns` may-set
     against its untrusted `declared_return` annotation, appending a `type_mismatches` entry only
     when the two are fully disjoint (never on a mere subset mismatch, and never for a wildcard
@@ -294,9 +295,9 @@ produces records; how a consumer turns records into a training signal is theirs 
 
 ## Open questions
 
-- **Cross-file interprocedural effects** — intra-file call resolution is done (see
-  `analyze::passes::interprocedural`); a call through a `project_local`-resolved import into
-  another project file's signatures is still treated as `unresolved`.
+- **Cross-file propagation depth** — cross-file call resolution is done for free functions in
+  project mode (`project::interproc`); imported *methods*, deeper dotted call chains, and
+  keyword-argument mappings across files are still treated as `unresolved`.
 - **Return aliasing** — a function returning an argument it also mutated.
 - **Mutation readback** — exact mechanism in the chosen executor.
 - **Equality semantics** for return/exception comparison — float tolerance, set/dict ordering,

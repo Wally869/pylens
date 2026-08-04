@@ -40,7 +40,9 @@ separate pipelines.
 - **Effects** — the single AST walk that builds each `EffectSignature`, delegating to the
   `collect/` collectors (one traversal, not N).
 - **Interprocedural** — propagates effects of **locally-defined** callees to their callers
-  (fixpoint; handles recursion). Imports / unknown callees stay unresolved. (Cross-file is future.)
+  (fixpoint; handles recursion). Imports / unknown callees stay unresolved intra-file; in
+  **project mode**, calls to `project_local`-imported free functions are propagated across files
+  by `src/project/interproc.rs`.
 - **TypeCheck** — flags declared-vs-inferred return mismatches (`type_mismatches`).
 - **Purity** — derives `Purity` from the accumulated facts.
 
