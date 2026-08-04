@@ -6,6 +6,7 @@ pub mod exec;
 pub mod generate;
 pub mod model;
 pub mod parse;
+pub mod project;
 pub mod record;
 pub mod report;
 pub mod validate;

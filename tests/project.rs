@@ -1,0 +1,101 @@
+//! Directory ("project") mode: walking, aggregation, partial-failure handling, and the
+//! skip-list. Pure (no jail) except the corpus-level validate check, which is jail-gated.
+
+use std::path::Path;
+
+use pylens::exec::probe;
+use pylens::project::{analyze_project, validate_project};
+
+fn ready(test: &str) -> bool {
+    match probe() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("SKIP {test}: {e}");
+            false
+        }
+    }
+}
+
+#[test]
+fn analyze_project_aggregates_sorted_files_with_correct_counts() {
+    let report = analyze_project(Path::new("tests/fixtures/project"));
+
+    assert_eq!(report["schema_version"], pylens::SCHEMA_VERSION);
+    assert!(report.get("files").is_some());
+    // The wrapper carries schema_version at the top only, not per-file.
+    let files = report["files"].as_array().expect("files array");
+    for f in files {
+        assert!(f.get("schema_version").is_none());
+    }
+
+    let paths: Vec<&str> = files.iter().map(|f| f["path"].as_str().unwrap()).collect();
+    assert_eq!(paths, vec!["a.py", "b.py"]);
+
+    let summary = &report["summary"];
+    assert_eq!(summary["files"], 2);
+    assert_eq!(summary["ok"], 2);
+    assert_eq!(summary["errors"], 0);
+    assert_eq!(summary["functions"], 2);
+    assert_eq!(summary["purity"]["pure"], 1);
+    assert_eq!(summary["purity"]["impure"], 1);
+    assert_eq!(summary["purity"]["unknown"], 0);
+}
+
+#[test]
+fn analyze_project_reports_a_bad_file_without_aborting_the_run() {
+    let report = analyze_project(Path::new("tests/fixtures/project_partial"));
+
+    let files = report["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 2);
+
+    let valid = files.iter().find(|f| f["path"] == "valid.py").expect("valid.py entry");
+    assert!(valid.get("error").is_none());
+    assert!(valid.get("functions").is_some());
+
+    let broken = files.iter().find(|f| f["path"] == "broken.py").expect("broken.py entry");
+    assert!(broken.get("error").is_some());
+    assert!(broken.get("functions").is_none());
+
+    let summary = &report["summary"];
+    assert_eq!(summary["files"], 2);
+    assert_eq!(summary["ok"], 1);
+    assert_eq!(summary["errors"], 1);
+}
+
+#[test]
+fn walk_skips_pycache_and_dotfile_directories() {
+    let report = analyze_project(Path::new("tests/fixtures/project_skip"));
+    let files = report["files"].as_array().expect("files array");
+    let paths: Vec<&str> = files.iter().map(|f| f["path"].as_str().unwrap()).collect();
+    assert_eq!(paths, vec!["top.py"]);
+}
+
+#[test]
+fn validate_project_over_examples_aggregates_the_observed_defect_count() {
+    if !ready("validate_project_over_examples_aggregates_the_observed_defect_count") {
+        return;
+    }
+    let (report, hard_total) = validate_project(Path::new("examples"), 4).expect("validate_project");
+    let files = report["files"].as_array().expect("files array");
+    assert!(!files.is_empty());
+    for f in files {
+        assert!(f.get("error").is_none(), "unexpected per-file error: {f:?}");
+    }
+
+    // inventory.py and normalize.py are the curated, known-sound corpus (see tests/validate.rs)
+    // and must stay at zero hard defects here too.
+    for clean in ["inventory.py", "normalize.py"] {
+        let f = files.iter().find(|f| f["path"] == clean).unwrap_or_else(|| panic!("{clean} entry"));
+        assert_eq!(f["summary"]["hard_defects"], 0, "{clean} should be hard-defect-free");
+    }
+
+    // The aggregate must equal the sum of the per-file hard-defect counts — this is the
+    // number actually observed today (graph.py has known analyzer gaps unrelated to this
+    // task), not an assertion that the whole examples/ tree is sound.
+    let expected: u64 = files
+        .iter()
+        .map(|f| f["summary"]["hard_defects"].as_u64().unwrap_or(0))
+        .sum();
+    assert_eq!(hard_total as u64, expected);
+    assert_eq!(report["summary"]["hard_defects"], expected);
+}

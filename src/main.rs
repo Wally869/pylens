@@ -1,12 +1,17 @@
 //! pylens CLI.
 //!
-//!   pylens analyze  <file.py> [--format json|summary]              static effect signatures
-//!   pylens record   <file.py> [--inputs N] [--format json|summary] signatures + observed cases
-//!                                                                   (runs the jail)
-//!   pylens validate <file.py> [--inputs N] [--format json|summary] observed ⊆ static
-//!                                                                   soundness-defect report
-//!                                                                   (runs the jail); exits
-//!                                                                   non-zero on any hard defect
+//!   pylens analyze  <file.py|dir> [--format json|summary]              static effect signatures
+//!   pylens record   <file.py|dir> [--inputs N] [--format json|summary] signatures + observed
+//!                                                                       cases (runs the jail)
+//!   pylens validate <file.py|dir> [--inputs N] [--format json|summary] observed ⊆ static
+//!                                                                       soundness-defect report
+//!                                                                       (runs the jail); exits
+//!                                                                       non-zero on any hard
+//!                                                                       defect
+//!
+//! A directory argument recurses over its `*.py` files and produces an aggregated project
+//! report instead of a single-file one (see `pylens::project`); a single-file/stdin argument is
+//! unchanged.
 //!
 //! `--format` defaults to `json`. `--format summary` renders a thin terminal summary instead
 //! (see `pylens::report`).
@@ -24,9 +29,9 @@ fn main() {
         Some("validate") => cmd_validate(&args[2..]),
         _ => {
             eprintln!(
-                "usage:\n  pylens analyze <file.py> [--format json|summary]\n  \
-                 pylens record <file.py> [--inputs <N>] [--format json|summary]\n  \
-                 pylens validate <file.py> [--inputs <N>] [--format json|summary]"
+                "usage:\n  pylens analyze <file.py|dir> [--format json|summary]\n  \
+                 pylens record <file.py|dir> [--inputs <N>] [--format json|summary]\n  \
+                 pylens validate <file.py|dir> [--inputs <N>] [--format json|summary]"
             );
             std::process::exit(2);
         }
@@ -36,6 +41,17 @@ fn main() {
 fn cmd_analyze(args: &[String]) {
     let format = format_of(args);
     let path = args.iter().find(|a| !a.starts_with("--"));
+    if let Some(p) = path
+        && std::path::Path::new(p.as_str()).is_dir()
+    {
+        let report = pylens::project::analyze_project(std::path::Path::new(p.as_str()));
+        if format == Format::Summary {
+            print!("{}", report::project_summary(&report));
+        } else {
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        }
+        return;
+    }
     let src = match path {
         Some(p) => read_file(p),
         None => read_stdin(),
@@ -69,6 +85,20 @@ fn cmd_record(args: &[String]) {
         .and_then(|s| s.parse().ok())
         .unwrap_or(4);
 
+    if std::path::Path::new(&path).is_dir() {
+        match pylens::project::record_project(std::path::Path::new(&path), inputs) {
+            Ok(report) => {
+                if format == Format::Summary {
+                    print!("{}", report::project_summary(&report));
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                }
+            }
+            Err(e) => fail(&format!("record error: {e}")),
+        }
+        return;
+    }
+
     let src = read_file(&path);
     match pylens::record::record_file(&src, inputs) {
         Ok(record) => {
@@ -97,6 +127,23 @@ fn cmd_validate(args: &[String]) {
     let inputs: usize = flag(args, "--inputs")
         .and_then(|s| s.parse().ok())
         .unwrap_or(4);
+
+    if std::path::Path::new(&path).is_dir() {
+        match pylens::project::validate_project(std::path::Path::new(&path), inputs) {
+            Ok((report, hard_total)) => {
+                if format == Format::Summary {
+                    print!("{}", report::project_summary(&report));
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                }
+                if hard_total > 0 {
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => fail(&format!("record error: {e}")),
+        }
+        return;
+    }
 
     let src = read_file(&path);
     let record = match pylens::record::record_file(&src, inputs) {

@@ -122,11 +122,18 @@ pub struct ModuleRecord {
 /// unresolved), every function is marked `uncallable` once rather than producing identical
 /// per-case setup errors.
 pub fn record_file(src: &str, max_inputs: usize) -> Result<ModuleRecord, String> {
+    let sandbox = NsjailPool::new(POOL_SIZE)?;
+    record_with(&sandbox, src, max_inputs)
+}
+
+/// Record a whole file's functions against an already-provisioned sandbox. Lets a caller
+/// processing many files (see `project.rs`) share one jail pool instead of paying nsjail
+/// startup per file; behavior is otherwise identical to [`record_file`].
+pub fn record_with(sandbox: &dyn Sandbox, src: &str, max_inputs: usize) -> Result<ModuleRecord, String> {
     let imports = imports_of(src).map_err(|e| e.to_string())?;
     let sigs = analyze_source(src).map_err(|e| e.to_string())?;
-    let sandbox = NsjailPool::new(POOL_SIZE)?;
 
-    let dependencies = probe_dependencies(&sandbox, imports)?;
+    let dependencies = probe_dependencies(sandbox, imports)?;
 
     // Ground truth for "can anything in this file run": exec the real source once. This
     // respects guards (e.g. `try: import numpy except ImportError: ...`) that per-import
@@ -152,8 +159,8 @@ pub fn record_file(src: &str, max_inputs: usize) -> Result<ModuleRecord, String>
             continue;
         }
         let (uncallable, cases) = match sig.kind {
-            DefKind::Function => (None, function_cases(&sandbox, src, sig, max_inputs)?),
-            DefKind::Method => method_record(&sandbox, src, sig, &sigs, max_inputs, &mut ctor_cache)?,
+            DefKind::Function => (None, function_cases(sandbox, src, sig, max_inputs)?),
+            DefKind::Method => method_record(sandbox, src, sig, &sigs, max_inputs, &mut ctor_cache)?,
         };
         functions.push(FunctionRecord {
             signature: sig.clone(),

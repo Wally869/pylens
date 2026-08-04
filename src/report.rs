@@ -3,6 +3,8 @@
 //! isolation. Each `*_summary` function renders one command's result as a scannable,
 //! human-readable block; the JSON path in `main.rs` is unaffected by anything here.
 
+use serde_json::Value;
+
 use crate::model::{DefKind, EffectSignature, Shape};
 use crate::record::{DepStatus, ModuleRecord};
 use crate::validate::{Defect, Severity};
@@ -156,6 +158,42 @@ pub fn validate_summary(
                 "    [{:?}/{:?}] {}\n",
                 d.dimension, d.severity, d.observed
             ));
+        }
+    }
+    out
+}
+
+/// Render a project-level report (`pylens::project::{analyze,record,validate}_project`) as a
+/// thin terminal summary: a header line, the purity distribution and function total, the
+/// hard/soft defect totals when present (validate), and one line per file.
+pub fn project_summary(report: &Value) -> String {
+    let root = report["root"].as_str().unwrap_or("?");
+    let summary = &report["summary"];
+    let files = summary["files"].as_u64().unwrap_or(0);
+    let ok = summary["ok"].as_u64().unwrap_or(0);
+    let errors = summary["errors"].as_u64().unwrap_or(0);
+    let functions = summary["functions"].as_u64().unwrap_or(0);
+    let purity = &summary["purity"];
+
+    let mut out = format!("{root}: {files} files, {ok} ok, {errors} errors\n");
+    out.push_str(&format!(
+        "  functions: {functions} (pure={}, impure={}, unknown={})\n",
+        purity["pure"], purity["impure"], purity["unknown"]
+    ));
+    if let Some(hard) = summary.get("hard_defects") {
+        let soft = summary["soft_defects"].as_u64().unwrap_or(0);
+        let checked = summary["functions_checked"].as_u64().unwrap_or(0);
+        out.push_str(&format!(
+            "  HARD DEFECTS: {hard} — {checked} function(s) checked, {soft} soft defect(s)\n"
+        ));
+    }
+    if let Some(files) = report["files"].as_array() {
+        for f in files {
+            let path = f["path"].as_str().unwrap_or("?");
+            match f.get("error") {
+                Some(e) => out.push_str(&format!("  {path}: ERROR {}\n", e.as_str().unwrap_or(""))),
+                None => out.push_str(&format!("  {path}: ok\n")),
+            }
         }
     }
     out
