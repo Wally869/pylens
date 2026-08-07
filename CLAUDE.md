@@ -120,7 +120,7 @@ strategy; the `Sandbox` trait (`exec.rs`) for launchers; `report`/`stub`/`html` 
 
 ```sh
 cargo build --release
-cargo test                          # 100 tests; jail-gated ones skip if sandbox absent
+cargo test                          # jail-gated tests skip if sandbox absent
 cargo clippy --all-targets -- -D warnings
 
 pylens analyze  <file.py|dir> [--format json|summary|pyi|html]

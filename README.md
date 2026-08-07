@@ -107,7 +107,7 @@ A case from `Inventory.add(name, qty)` — a successful call that mutates the re
 | Command | Description |
 |---|---|
 | `pylens analyze <file.py\|dir> [--format json\|summary\|pyi\|html]` | `{ imports, functions }`: catalogued imports + the static effect signature of every function/method. Reads stdin if no file is given. No jail. |
-| `pylens record <file.py\|dir> [--inputs <N>] [--format json\|summary\|html]` | `{ dependencies, functions }`: imports probed for resolution **plus** observed cases per function/method (generated inputs run in the jail). `--inputs` caps generated vectors (default 4). |
+| `pylens record <file.py\|dir> [--inputs <N>] [--format json\|summary\|pyi\|html]` | `{ dependencies, functions }`: imports probed for resolution **plus** observed cases per function/method (generated inputs run in the jail). `--inputs` caps generated vectors (default 4). `pyi` is single-file only. |
 | `pylens validate <file.py\|dir> [--inputs <N>] [--format json\|summary\|html]` | Runs `record`, then checks `observed ⊆ static` per function: any observed effect the static signature didn't predict is a soundness defect. Exits non-zero on any **hard** defect (a function claiming no unresolved effects that still misses one). |
 
 A directory argument recurses over its `*.py` files and produces an aggregated **project
@@ -117,9 +117,9 @@ of a single-file report. Project mode also resolves each file's imports (absolut
 against the other project files; see "Multi-file / project mode" below.
 
 `--format` defaults to `json` (every output is versioned with a top-level `schema_version`);
-`--format summary` renders a thin terminal summary; `--format pyi` (`analyze` only) renders
-inferred `.pyi` type-hint stubs instead of the JSON signature; `--format html` renders a
-self-contained HTML report (all three commands, single-file or project).
+`--format summary` renders a thin terminal summary; `--format pyi` (`analyze`, and single-file
+`record`) renders inferred `.pyi` type-hint stubs instead of the JSON signature; `--format html`
+renders a self-contained HTML report (all three commands, single-file or project).
 
 ## What it detects (static)
 
@@ -131,20 +131,25 @@ Purity**) over a single AST walk:
 - **Argument mutations** — `p[i]=…`, `p.attr=…`, `del`, mutating methods (`append`/`sort`/…),
   augmented assignment, with a local alias map (`q = p; q.append(1)` ⇒ `p`)
 - **`self`-attribute writes** (methods), including `@classmethod` receivers
-- **Recursive parameter shapes** — `int`/`float`/`bool`/`str`/`bytes`/`none`, and nested
-  containers (`Seq`/`Map`/`Set`) inferred to a fixpoint (e.g. `matrix: Seq(Seq(Float))`);
+- **Recursive parameter shapes** — `int`/`float`/`bool`/`str`/`bytes`/`none`, nested
+  containers (`Seq`/`Map`/`Set`), and width-capped **unions** (`Optional[X]` = union with
+  `None`) inferred to a fixpoint (e.g. `matrix: Seq(Seq(Float))`, `x: Int | None`);
   `*args`/`**kwargs` are marked as variadic and never generated positionally, keyword-only
   params are generated and passed by name
 - **Raised exceptions** — explicit (`raise`, `assert` ⇒ `AssertionError`) and statically-inferred
   **implicit** may-sets (`ZeroDivisionError`, `IndexError`/`KeyError` on subscript,
   `ValueError` from `int()`/`float()`, `TypeError` on ordered-compare/arithmetic over
   `Any`-typed operands, and on a subscript whose key roots to an `Any`-typed param)
-- **Declared-vs-inferred return type mismatches** (`type_mismatches`) — flagged when a function's
-  (untrusted) return annotation is fully disjoint from its inferred `returns` may-set
+- **Declared-vs-inferred type mismatches** (`type_mismatches`) — flagged when a function's
+  (untrusted) return or parameter annotation is fully disjoint from the inferred side
+  (advisory only; `bool` ⊆ `int` ⊆ `float` per the PEP 484 numeric tower)
 - **Interprocedural effect propagation (intra-file)** — a call to a function/method defined in
   the same file inherits that callee's mutations/raises/I/O/unresolved effects, to a fixpoint
   (recursion included), so a caller of a mutating local helper is correctly `impure` rather than
-  falsely `unknown`; calls through imports or otherwise unresolved callees are still opaque
+  falsely `unknown`. Arguments map onto callee params by position and by keyword name; a call
+  that unpacks (`f(*xs)` / `f(**kw)`) keeps an acknowledged `call_unpacked_args` blind spot
+  (plus an implicit `TypeError` — the unpack itself can raise) instead of silently dropping
+  effects. Calls through imports or otherwise unresolved callees are still opaque
 - **Generators**, global writes, basic I/O, unknown decorators (recorded and downgrade purity —
   a decorator can replace the function entirely)
 - **`uses`** — the imports each function references (`{ binding, module }`), linking functions
@@ -157,7 +162,9 @@ Purity**) over a single AST walk:
 
 Per generated input: the outcome (`returned`/`raised`/`error`), the return value, observed
 argument and `self` mutations (before/after), return-aliasing, captured stdout and stderr, and
-the exception type when raised. A function that can't run at all (a module-scope import that
+the exception type when raised. A raised case is additionally **minimized**: the input is
+greedily shrunk (bounded budget) while it keeps raising the same exception type, and the smaller
+reproducer lands in `minimized`. A function that can't run at all (a module-scope import that
 won't load, or a constructor that can't be built) is marked `uncallable` once, with a structured
 reason, rather than producing identical failing cases.
 
@@ -174,7 +181,8 @@ function itself raised — part of its behavior.
 ## Multi-file / project mode
 
 Passing a **directory** instead of a file to `analyze`/`record`/`validate` recurses over its
-`*.py` files (skipping VCS/venv/build noise dirs) and aggregates every file's report into one
+`*.py` files (honoring `.gitignore`/`.ignore`, skipping hidden files and common noise dirs) and
+aggregates every file's report into one
 project report: `{ schema_version, root, files: [...], summary }`. A file that fails to read,
 parse, or record becomes `{ path, error }` in `files` instead of aborting the whole run, and
 `summary` carries file/function/purity counts (plus hard/soft defect totals for `validate`).
@@ -193,9 +201,10 @@ resolve when the target is another file in the tree.
 `pylens analyze --format pyi` renders inferred `.pyi` type-hint stubs (Python 3.10+ syntax:
 `list[...]`/`dict[...]` builtin generics, `|` unions, `Iterator[Any]` for generators) instead of
 JSON — one stub per function/method, grouped under `class <Owner>:` blocks for methods, with an
-inline comment when a declared return annotation contradicts the inferred type. It works over a
-single file or a whole directory (one `# <relative path>` block per file). `--format pyi` is
-`analyze`-only.
+inline comment when a declared annotation contradicts the inferred type. It works over a
+single file or a whole directory (one `# <relative path>` block per file). With **`record`**
+(single file), dynamically observed types additionally fill in what static analysis left
+unresolved, marked with a trailing `# observed:` comment.
 
 `--format html` renders a self-contained, theme-aware `<!doctype html>` report (no external
 assets) for `analyze`, `record`, or `validate`, single-file or project — the same underlying data
@@ -213,13 +222,15 @@ defect (a true soundness bug); a gap where the signature already flagged
 ## Status
 
 The static analyzer, the import/dependency report, the `record` flow, guard-guided input
-generation, intra-file interprocedural effect propagation, declared-vs-inferred return type
-checking, multi-file/project mode with project-local import resolution, `.pyi`/HTML output, and
+generation, input minimization, intra-file interprocedural effect propagation,
+declared-vs-inferred type checking (returns and params), multi-file/project mode with
+project-local import resolution, `.pyi`/HTML output, and
 the `observed ⊆ static` self-validation harness (`pylens validate`) all work today (see
 [examples/](examples/) and `cargo test`). Execution is **always nsjail-jailed** — native on
 Linux, via WSL2 on Windows — with no unsandboxed path; `record_file` drives a persistent
 fork-server worker pool ([`src/exec.rs`](src/exec.rs)) that amortizes interpreter startup across
-the whole file while keeping per-call isolation. Imports are linked to the functions that use
+the whole file while keeping per-call isolation; in project mode, files are recorded in
+parallel across a small pool of such workers. Imports are linked to the functions that use
 them (`uses`), and calls through an import (`mod.fn(param)`) are flagged as `call_import` effects
 so such functions are never mistaken for pure; calls to functions/methods defined in the *same*
 file are resolved and their effects propagated onto the caller, and in project (directory) mode
@@ -231,6 +242,6 @@ propagation covers free functions (imported methods / deep dotted chains stay un
 
 ## Docs
 
-- [User guide](docs/USER_GUIDE.md) — walkthrough, signature schema, record semantics, limits
+- [User guide](docs/USER_GUIDE.md) — install, sandbox setup, commands, limits, troubleshooting
 - [DESIGN.md](DESIGN.md) — decisions, effect taxonomy, soundness invariant, phase plan
 - [examples/README.md](examples/README.md) — the example corpus
