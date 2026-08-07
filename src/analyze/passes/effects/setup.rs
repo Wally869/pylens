@@ -29,12 +29,13 @@ pub(super) fn collect_param_names(params: &ast::Parameters) -> Vec<String> {
 }
 
 pub(super) fn collect_param_defs(params: &ast::Parameters, skip: Option<&str>) -> Vec<ParamInfo> {
-    let mut raw: Vec<(String, bool, ParamKind)> = Vec::new();
+    let mut raw: Vec<(String, bool, ParamKind, Option<String>)> = Vec::new();
     for p in &params.posonlyargs {
         raw.push((
             p.parameter.name.as_str().to_string(),
             p.default.is_some(),
             ParamKind::Positional,
+            annotation_name(p.parameter.annotation.as_deref()),
         ));
     }
     for p in &params.args {
@@ -42,28 +43,41 @@ pub(super) fn collect_param_defs(params: &ast::Parameters, skip: Option<&str>) -
             p.parameter.name.as_str().to_string(),
             p.default.is_some(),
             ParamKind::Positional,
+            annotation_name(p.parameter.annotation.as_deref()),
         ));
     }
     if let Some(v) = &params.vararg {
-        raw.push((v.name.as_str().to_string(), false, ParamKind::VarPositional));
+        raw.push((
+            v.name.as_str().to_string(),
+            false,
+            ParamKind::VarPositional,
+            annotation_name(v.annotation.as_deref()),
+        ));
     }
     for p in &params.kwonlyargs {
         raw.push((
             p.parameter.name.as_str().to_string(),
             p.default.is_some(),
             ParamKind::KeywordOnly,
+            annotation_name(p.parameter.annotation.as_deref()),
         ));
     }
     if let Some(k) = &params.kwarg {
-        raw.push((k.name.as_str().to_string(), false, ParamKind::VarKeyword));
+        raw.push((
+            k.name.as_str().to_string(),
+            false,
+            ParamKind::VarKeyword,
+            annotation_name(k.annotation.as_deref()),
+        ));
     }
     raw.into_iter()
-        .filter(|(n, _, _)| Some(n.as_str()) != skip)
-        .map(|(name, has_default, kind)| ParamInfo {
+        .filter(|(n, _, _, _)| Some(n.as_str()) != skip)
+        .map(|(name, has_default, kind, declared)| ParamInfo {
             name,
             shape: Shape::Any,
             has_default,
             kind,
+            declared,
             guard_samples: Vec::new(),
         })
         .collect()

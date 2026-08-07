@@ -25,6 +25,11 @@ pub fn shape_to_string(shape: &Shape) -> String {
         Shape::Map(key, value) => {
             format!("map<{},{}>", shape_to_string(key), shape_to_string(value))
         }
+        Shape::Union(members) => members
+            .iter()
+            .map(shape_to_string)
+            .collect::<Vec<_>>()
+            .join("|"),
     }
 }
 
@@ -211,6 +216,7 @@ mod tests {
             shape: Shape::Seq(Box::new(Shape::Seq(Box::new(Shape::Float)))),
             has_default: false,
             kind: Default::default(),
+            declared: None,
             guard_samples: Vec::new(),
         });
         sig.mutations.push(Mutation {

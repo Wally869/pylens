@@ -15,6 +15,13 @@ pub(super) fn element_of(shape: &Shape) -> Shape {
         Shape::Seq(e) => (**e).clone(),
         Shape::Set(e) => (**e).clone(),
         Shape::Map(k, _) => (**k).clone(),
+        // Conservative: the element shape of a union is the join of each member's element
+        // shape (`Any` for non-iterable members), never narrower than treating the whole thing
+        // as unresolved.
+        Shape::Union(members) => members
+            .iter()
+            .map(element_of)
+            .fold(Shape::Any, Shape::join),
         _ => Shape::Any,
     }
 }

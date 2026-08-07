@@ -4,15 +4,35 @@
 //!
 //! Emitted stubs target Python 3.10+: built-in generics (`list[...]`, `dict[...]`) rather than
 //! `typing.List`/`typing.Dict`, and `|` union syntax rather than `typing.Union`/`typing.Optional`.
+//!
+//! [`observed`] extends this with an optional, `record`-fed enrichment layer: dynamically
+//! observed types folded in wherever the static side stayed `Any`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::model::{DefKind, EffectSignature, ParamInfo, ParamKind, ReturnKind, Shape};
+
+pub mod observed;
+
+/// Dynamically observed types to fold into one function's rendering, keyed by param name (plus
+/// the return type). Empty (`ObservedTypes::default()`) for the pure-static rendering path — see
+/// `observed::render_record_stub` for how these get populated from recorded cases.
+#[derive(Default)]
+pub(crate) struct ObservedTypes {
+    /// Param name -> observed Python type name. Only consulted for a param whose static `shape`
+    /// is `Shape::Any` (a static-known shape always wins — see `param_to_pytype_str`).
+    pub(crate) params: HashMap<String, String>,
+    /// Observed return type name. Only consulted when the static return rendering is `Any`
+    /// (`sig.returns` contains `ReturnKind::Opaque`, or is otherwise unresolved).
+    pub(crate) ret: Option<String>,
+}
 
 /// Map an inferred parameter [`Shape`] to a Python type expression.
 ///
 /// `Int`→`int`, `Float`→`float`, `Bool`→`bool`, `Str`→`str`, `Bytes`→`bytes`, `None`→`None`,
-/// `Seq(e)`→`list[<e>]`, `Set(e)`→`set[<e>]`, `Map(k,v)`→`dict[<k>, <v>]`, `Any`→`Any`.
+/// `Seq(e)`→`list[<e>]`, `Set(e)`→`set[<e>]`, `Map(k,v)`→`dict[<k>, <v>]`, `Any`→`Any`,
+/// `Union([..])`→PEP 604 `A | B | ...` (an `Optional[X]` is just `Union(X, None)`, so it renders
+/// as `X | None` with no separate case needed).
 pub fn shape_to_pytype(shape: &Shape) -> String {
     match shape {
         Shape::Int => "int".to_string(),
@@ -27,6 +47,11 @@ pub fn shape_to_pytype(shape: &Shape) -> String {
         Shape::Map(key, value) => {
             format!("dict[{}, {}]", shape_to_pytype(key), shape_to_pytype(value))
         }
+        Shape::Union(members) => members
+            .iter()
+            .map(shape_to_pytype)
+            .collect::<Vec<_>>()
+            .join(" | "),
     }
 }
 
@@ -80,8 +105,24 @@ fn mentions_any(s: &str) -> bool {
         .any(|word| word == "Any")
 }
 
-fn param_to_pytype_str(name: &str, shape: &Shape, has_default: bool) -> String {
-    let ty = shape_to_pytype(shape);
+/// Render one param's `name: type[ = ...]` fragment. A static `Shape::Any` may be overridden by
+/// an `observed` type for that param name — recorded (as `"name: type"`) into `notes` so the
+/// caller can surface it as a trailing `# observed` comment. A static shape more specific than
+/// `Any` always wins and is never overridden.
+fn param_to_pytype_str(
+    name: &str,
+    shape: &Shape,
+    has_default: bool,
+    observed: &ObservedTypes,
+    notes: &mut Vec<String>,
+) -> String {
+    let ty = match (shape, observed.params.get(name)) {
+        (Shape::Any, Some(obs)) => {
+            notes.push(format!("{name}: {obs}"));
+            obs.clone()
+        }
+        _ => shape_to_pytype(shape),
+    };
     if has_default {
         format!("{name}: {ty} = ...")
     } else {
@@ -91,7 +132,12 @@ fn param_to_pytype_str(name: &str, shape: &Shape, has_default: bool) -> String {
 
 /// Render one function's parameter list, in `.pyi` syntax: positional params first, a bare `*`
 /// separator before the first keyword-only param, `*args`/`**kwargs` rendered without a default.
-fn render_params(params: &[ParamInfo], receiver: Option<&str>) -> String {
+fn render_params(
+    params: &[ParamInfo],
+    receiver: Option<&str>,
+    observed: &ObservedTypes,
+    notes: &mut Vec<String>,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(recv) = receiver {
         parts.push(recv.to_string());
@@ -100,14 +146,14 @@ fn render_params(params: &[ParamInfo], receiver: Option<&str>) -> String {
     for p in params {
         match p.kind {
             ParamKind::Positional => {
-                parts.push(param_to_pytype_str(&p.name, &p.shape, p.has_default));
+                parts.push(param_to_pytype_str(&p.name, &p.shape, p.has_default, observed, notes));
             }
             ParamKind::KeywordOnly => {
                 if !emitted_star {
                     parts.push("*".to_string());
                     emitted_star = true;
                 }
-                parts.push(param_to_pytype_str(&p.name, &p.shape, p.has_default));
+                parts.push(param_to_pytype_str(&p.name, &p.shape, p.has_default, observed, notes));
             }
             ParamKind::VarPositional => {
                 emitted_star = true; // *args also satisfies the keyword-only separator.
@@ -125,36 +171,62 @@ fn render_params(params: &[ParamInfo], receiver: Option<&str>) -> String {
     parts.join(", ")
 }
 
-/// Render the return-type annotation for one function, folding in the generator special case.
-fn render_return(sig: &EffectSignature) -> String {
+/// Render the return-type annotation for one function, folding in the generator special case and
+/// (when the static side is `Any`) the observed return type — recorded into `notes` as
+/// `"-> type"` so the caller can surface it as a trailing `# observed` comment.
+fn render_return(sig: &EffectSignature, observed: &ObservedTypes, notes: &mut Vec<String>) -> String {
     if sig.is_generator {
-        "Iterator[Any]".to_string()
-    } else {
-        returns_to_pytype(&sig.returns)
+        return "Iterator[Any]".to_string();
+    }
+    let base = returns_to_pytype(&sig.returns);
+    match (&base[..], &observed.ret) {
+        ("Any", Some(obs)) => {
+            notes.push(format!("-> {obs}"));
+            obs.clone()
+        }
+        _ => base,
     }
 }
 
 /// A short trailing comment noting a declared-vs-inferred mismatch, if the analyzer flagged one
-/// on the return type. The stub's emitted type always reflects the INFERRED may-set, never the
-/// (untrusted) declaration — this comment is informational only.
+/// on the return type or a parameter. The stub's emitted type always reflects the INFERRED
+/// may-set, never the (untrusted) declaration — this comment is informational only.
 fn mismatch_comment(sig: &EffectSignature) -> Option<String> {
-    let mismatch = sig
+    if sig.type_mismatches.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = sig
         .type_mismatches
         .iter()
-        .find(|m| m.kind == "return")?;
-    let declared = &sig.declared_return;
-    let declared = declared.as_deref().unwrap_or(mismatch.declared.as_str());
-    Some(format!(
-        "  # note: declared {declared}, inferred {}",
-        returns_to_pytype(&mismatch.inferred)
-    ))
+        .map(|m| match m.kind.as_str() {
+            "param" => {
+                let name = m.param.as_deref().unwrap_or("?");
+                let inferred = m
+                    .inferred_shape
+                    .as_ref()
+                    .map(shape_to_pytype)
+                    .unwrap_or_else(|| "?".to_string());
+                format!("{name}: declared {}, inferred {inferred}", m.declared)
+            }
+            _ => format!(
+                "return: declared {}, inferred {}",
+                m.declared,
+                returns_to_pytype(&m.inferred)
+            ),
+        })
+        .collect();
+    Some(format!("  # note: {}", parts.join("; ")))
 }
 
 /// Render one `def` line (no trailing newline), at the given indent.
-fn render_def(sig: &EffectSignature, receiver: Option<&str>, indent: &str) -> String {
-    let params = render_params(&sig.params, receiver);
-    let ret = render_return(sig);
+fn render_def(sig: &EffectSignature, receiver: Option<&str>, indent: &str, observed: &ObservedTypes) -> String {
+    let mut notes = Vec::new();
+    let params = render_params(&sig.params, receiver, observed, &mut notes);
+    let ret = render_return(sig, observed, &mut notes);
     let mut line = format!("{indent}def {}({params}) -> {ret}: ...", sig.name);
+    if !notes.is_empty() {
+        line.push_str(&format!("  # observed: {}", notes.join(", ")));
+    }
     if let Some(comment) = mismatch_comment(sig) {
         line.push_str(&comment);
     }
@@ -164,11 +236,14 @@ fn render_def(sig: &EffectSignature, receiver: Option<&str>, indent: &str) -> St
 /// Render a full `.pyi` module from its effect signatures: free functions at top level, then
 /// one `class <owner>:` block per method-owning class, in stable first-seen order. Emits the
 /// `from typing import ...` header only for names actually used (`Any`, `Iterator`).
-pub fn render_stub(sigs: &[EffectSignature]) -> String {
-    let functions: Vec<&EffectSignature> = sigs
-        .iter()
-        .filter(|s| s.kind == DefKind::Function)
-        .collect();
+///
+/// `observed_for` supplies per-signature [`ObservedTypes`] (empty for the pure-static path —
+/// see [`render_stub`] — or fed from recorded cases — see [`observed::render_record_stub`]).
+pub(crate) fn render_stub_generic(
+    sigs: &[&EffectSignature],
+    observed_for: impl Fn(&EffectSignature) -> ObservedTypes,
+) -> String {
+    let functions: Vec<&&EffectSignature> = sigs.iter().filter(|s| s.kind == DefKind::Function).collect();
 
     let mut owners: Vec<&str> = Vec::new();
     for s in sigs {
@@ -182,7 +257,7 @@ pub fn render_stub(sigs: &[EffectSignature]) -> String {
 
     let mut body = String::new();
     for f in &functions {
-        body.push_str(&render_def(f, None, ""));
+        body.push_str(&render_def(f, None, "", &observed_for(f)));
         body.push('\n');
     }
     if !functions.is_empty() && !owners.is_empty() {
@@ -197,7 +272,7 @@ pub fn render_stub(sigs: &[EffectSignature]) -> String {
             .iter()
             .filter(|s| s.kind == DefKind::Method && s.owner.as_deref() == Some(*owner))
         {
-            body.push_str(&render_def(s, Some("self"), "    "));
+            body.push_str(&render_def(s, Some("self"), "    ", &observed_for(s)));
             body.push('\n');
         }
     }
@@ -219,6 +294,12 @@ pub fn render_stub(sigs: &[EffectSignature]) -> String {
     format!("{header}{body}")
 }
 
+/// Render a full `.pyi` module purely from static effect signatures (no observed enrichment).
+pub fn render_stub(sigs: &[EffectSignature]) -> String {
+    let refs: Vec<&EffectSignature> = sigs.iter().collect();
+    render_stub_generic(&refs, |_| ObservedTypes::default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +311,7 @@ mod tests {
             shape,
             has_default,
             kind: ParamKind::Positional,
+            declared: None,
             guard_samples: Vec::new(),
         }
     }
@@ -293,6 +375,7 @@ mod tests {
             shape: Shape::Any,
             has_default: false,
             kind: ParamKind::VarPositional,
+            declared: None,
             guard_samples: Vec::new(),
         });
         sig.params.push(ParamInfo {
@@ -300,6 +383,7 @@ mod tests {
             shape: Shape::Bool,
             has_default: true,
             kind: ParamKind::KeywordOnly,
+            declared: None,
             guard_samples: Vec::new(),
         });
         sig.params.push(ParamInfo {
@@ -307,6 +391,7 @@ mod tests {
             shape: Shape::Any,
             has_default: false,
             kind: ParamKind::VarKeyword,
+            declared: None,
             guard_samples: Vec::new(),
         });
         let out = render_stub(std::slice::from_ref(&sig));
@@ -331,5 +416,18 @@ mod tests {
         sig.returns = vec![ReturnKind::Int];
         let out = render_stub(std::slice::from_ref(&sig));
         assert!(!out.contains("from typing import"));
+    }
+
+    #[test]
+    fn union_shape_param_renders_pep604() {
+        let mut sig = EffectSignature::new("maybe_len", DefKind::Function);
+        sig.params.push(positional(
+            "x",
+            Shape::Union(vec![Shape::Int, Shape::None]),
+            false,
+        ));
+        sig.returns = vec![ReturnKind::Int, ReturnKind::None];
+        let out = render_stub(std::slice::from_ref(&sig));
+        assert!(out.contains("def maybe_len(x: int | None) -> int | None: ..."));
     }
 }

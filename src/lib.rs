@@ -15,7 +15,7 @@ pub mod validate;
 
 /// The version of the top-level JSON contract emitted by `analyze` / `record` / `validate`.
 /// Downstream adapters key off this to detect breaking schema changes.
-pub const SCHEMA_VERSION: &str = "1.0";
+pub const SCHEMA_VERSION: &str = "1.1";
 
 /// Parse Python source and return the effect signature of every top-level function and
 /// method.

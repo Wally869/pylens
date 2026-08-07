@@ -52,6 +52,10 @@ fn cap_depth(shape: Shape, remaining: usize) -> Shape {
                 )
             }
         }
+        // A union doesn't consume a nesting level itself; each member is capped at the same
+        // remaining depth, then re-normalized (`union_of`) since capping two members to `Any`
+        // should collapse the whole union, not leave duplicate `Any` entries.
+        Shape::Union(members) => Shape::union_of(members.into_iter().map(|m| cap_depth(m, remaining))),
         other => other,
     }
 }

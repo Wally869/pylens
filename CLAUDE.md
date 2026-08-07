@@ -43,7 +43,9 @@ separate pipelines.
   (fixpoint; handles recursion). Imports / unknown callees stay unresolved intra-file; in
   **project mode**, calls to `project_local`-imported free functions are propagated across files
   by `src/project/interproc.rs`.
-- **TypeCheck** — flags declared-vs-inferred return mismatches (`type_mismatches`).
+- **TypeCheck** — flags declared-vs-inferred mismatches, both return (`declared_return` vs.
+  `returns`) and param (`ParamInfo::declared` vs. `ParamInfo::shape`), into `type_mismatches`.
+  Advisory only — never affects the may-set or `Purity`.
 - **Purity** — derives `Purity` from the accumulated facts.
 
 Injection points (where to extend without a rewrite): the `Pass` trait (`pass.rs`) for new
@@ -56,9 +58,11 @@ strategy; the `Sandbox` trait (`exec.rs`) for launchers; `report`/`stub`/`html` 
 - `src/main.rs` — CLI. `analyze`/`record`/`validate`; `--format json|summary|pyi|html`;
   `--inputs N`; a **directory** arg triggers project mode, a file/stdin is single-file.
 - `src/parse.rs` — the ruff parser boundary. **All `ruff_*` usage is isolated here** (swappable).
-- `src/model.rs` — the data model: `EffectSignature`, recursive `Shape`, `ParamInfo`/`ParamKind`
-  (Positional/VarPositional/VarKeyword/KeywordOnly), `Mutation`/`MutationTarget`, `Raises`
-  (explicit/implicit), `ReturnKind`, `Import`/`ModuleRef`, `Purity`, `TypeMismatch`,
+- `src/model.rs` — the data model: `EffectSignature`, recursive `Shape` (incl. `Union` — sorted,
+  deduped, width-capped at `Shape::UNION_WIDTH_CAP`; `Optional[X]` is `Union(X, None)`),
+  `ParamInfo`/`ParamKind` (Positional/VarPositional/VarKeyword/KeywordOnly), `Mutation`/
+  `MutationTarget`, `Raises` (explicit/implicit), `ReturnKind`, `Import`/`ModuleRef`, `Purity`,
+  `TypeMismatch` (`kind` "return"|"param", carries `param`/`inferred_shape` for the latter),
   `UnresolvedEffect`.
 - `src/analyze/`
   - `mod.rs` — pipeline driver (`analyze_module`), `collect_imports`.
@@ -86,8 +90,10 @@ strategy; the `Sandbox` trait (`exec.rs`) for launchers; `report`/`stub`/`html` 
   jailed record/validate (`record_files_parallel`: fixed worker threads each owning their own
   `NsjailPool`, capped at `JAIL_WORKER_CAP`), aggregated project report (deterministic path order
   via `build_report`'s sort regardless of completion order), project-local import resolution.
-- `src/report.rs` (terminal summary), `src/stub.rs` (`.pyi` stubs), `src/html.rs`
-  (self-contained HTML) — output formatters.
+- `src/report.rs` (terminal summary), `src/stub/` (`.pyi` stubs — `mod.rs` static rendering
+  including `Shape::Union`→PEP 604 and `type_mismatches` comments; `observed.rs` folds
+  dynamically observed types from `record` cases into an unresolved static param/return, driving
+  `record --format pyi`), `src/html.rs` (self-contained HTML) — output formatters.
 - `python/worker.py` — the in-jail CPython harness: JSON-over-stdio; serialize-before/after for
   mutation diffs; `--serve` fork-server (per-request `fork()` isolation).
 - `nsjail/pylens.nsjail.cfg` — the jail policy (namespaces + seccomp denylist + rlimits).

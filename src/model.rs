@@ -43,13 +43,21 @@ pub enum ReturnKind {
 /// on full disjointness, never on a mere subset mismatch).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypeMismatch {
-    /// What was checked — `"return"` today; param-annotation mismatch is future work (params
-    /// aren't captured yet).
+    /// What was checked — `"return"` or `"param"`.
     pub kind: String,
+    /// The parameter name, when `kind == "param"`. `None` for a `"return"` mismatch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub param: Option<String>,
     /// The untrusted declared annotation name.
     pub declared: String,
-    /// The inferred may-set that contradicts it.
+    /// The inferred return may-set that contradicts it, when `kind == "return"`. Empty for a
+    /// `"param"` mismatch — see `inferred_shape`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inferred: Vec<ReturnKind>,
+    /// The inferred parameter shape that contradicts the declaration, when `kind == "param"`.
+    /// `None` for a `"return"` mismatch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inferred_shape: Option<Shape>,
 }
 
 /// The root object a mutation targets.
@@ -249,7 +257,7 @@ pub struct ImportUse {
 /// another container. Scalars serialize as a lowercase string (e.g. `"int"`, `"any"`);
 /// containers serialize as a tagged object (`{"seq": <elem>}`, `{"map": {"key": ..., "value":
 /// ...}}`, `{"set": <elem>}`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Shape {
     Int,
     Float,
@@ -266,6 +274,14 @@ pub enum Shape {
     Set(Box<Shape>),
     /// No discriminating usage observed.
     Any,
+    /// Two or more disjoint shapes observed on different paths (e.g. a param compared as `Int`
+    /// on one branch and `Str` on another; a return that's `Int` or `None`). Sorted and
+    /// deduplicated (canonical form, so `Shape` equality/hashing stays structural) and bounded to
+    /// [`Shape::UNION_WIDTH_CAP`] members — a union that would exceed the cap collapses to `Any`
+    /// instead, same as the pre-union behavior. `Optional` has no separate variant: it's a
+    /// `Union` containing `Shape::None`. Never nested — members are never themselves `Union` (see
+    /// `Shape::union_of`, which flattens on construction).
+    Union(Vec<Shape>),
 }
 
 impl Shape {
@@ -284,10 +300,14 @@ impl Shape {
         Shape::Set(Box::new(Shape::Any))
     }
 
+    /// Maximum number of distinct members a `Union` may carry; a wider union collapses to `Any`.
+    /// See the `Union` variant doc.
+    pub const UNION_WIDTH_CAP: usize = 4;
+
     /// Merge two pieces of shape evidence for the same root. Matching constructors recurse into
     /// their children; `Any` defers to the other side; conflicting constructors (e.g. `Int` vs
-    /// `Seq`) resolve to `Any` since the evidence disagrees and the analyzer must over-approximate
-    /// rather than pick arbitrarily.
+    /// `Seq`) combine into a `Union` (see [`Shape::union_of`]) rather than collapsing straight to
+    /// `Any`, preserving the disjoint evidence up to the width cap.
     pub fn join(a: Shape, b: Shape) -> Shape {
         match (a, b) {
             (Shape::Any, other) | (other, Shape::Any) => other,
@@ -298,9 +318,65 @@ impl Shape {
                 Box::new(Shape::join(*v1, *v2)),
             ),
             (a, b) if a == b => a,
-            _ => Shape::Any,
+            (a, b) => Shape::union_of([a, b]),
         }
     }
+
+    /// Build a (possibly single-member) shape out of a flat set of shape members: flattens any
+    /// nested `Union`s, merges members that share a top-level constructor (via [`Shape::join`],
+    /// which recurses structurally for matching constructors), sorts + dedups the rest into
+    /// canonical order, and collapses to `Any` if the result would exceed
+    /// [`Shape::UNION_WIDTH_CAP`] or contains `Any` itself (an unresolved member subsumes the
+    /// whole union — soundness requires the union be at least as broad as `Any`).
+    pub fn union_of(members: impl IntoIterator<Item = Shape>) -> Shape {
+        let mut flat = Vec::new();
+        for m in members {
+            match m {
+                Shape::Union(inner) => flat.extend(inner),
+                other => flat.push(other),
+            }
+        }
+        if flat.iter().any(|s| matches!(s, Shape::Any)) {
+            return Shape::Any;
+        }
+        let mut merged: Vec<Shape> = Vec::new();
+        'outer: for m in flat {
+            for existing in merged.iter_mut() {
+                if same_constructor(existing, &m) {
+                    *existing = Shape::join(existing.clone(), m);
+                    continue 'outer;
+                }
+            }
+            merged.push(m);
+        }
+        match merged.len() {
+            0 => Shape::Any,
+            1 => merged.into_iter().next().expect("len checked"),
+            _ if merged.len() > Shape::UNION_WIDTH_CAP => Shape::Any,
+            _ => {
+                merged.sort();
+                Shape::Union(merged)
+            }
+        }
+    }
+}
+
+/// Whether `a` and `b` share the same top-level shape constructor (used by [`Shape::union_of`]
+/// to decide whether two members should be merged via [`Shape::join`] instead of kept as
+/// separate union members).
+fn same_constructor(a: &Shape, b: &Shape) -> bool {
+    matches!(
+        (a, b),
+        (Shape::Int, Shape::Int)
+            | (Shape::Float, Shape::Float)
+            | (Shape::Bool, Shape::Bool)
+            | (Shape::Str, Shape::Str)
+            | (Shape::Bytes, Shape::Bytes)
+            | (Shape::None, Shape::None)
+            | (Shape::Seq(_), Shape::Seq(_))
+            | (Shape::Map(..), Shape::Map(..))
+            | (Shape::Set(_), Shape::Set(_))
+    )
 }
 
 /// Scalars serialize as a lowercase tag string; containers serialize as a single-key tagged
@@ -333,6 +409,11 @@ impl Serialize for Shape {
                 }
                 let mut map = serializer.serialize_map(Some(1))?;
                 map.serialize_entry("map", &MapFields { key, value })?;
+                map.end()
+            }
+            Shape::Union(members) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("union", members)?;
                 map.end()
             }
         }
@@ -382,7 +463,10 @@ impl<'de> Deserialize<'de> for Shape {
                         let fields: MapFields = map.next_value()?;
                         Ok(Shape::Map(Box::new(fields.key), Box::new(fields.value)))
                     }
-                    other => Err(de::Error::unknown_variant(other, &["seq", "set", "map"])),
+                    // Re-canonicalize: external JSON may carry a nested / unsorted /
+                    // over-cap union that `union_of` would never construct.
+                    "union" => Ok(Shape::union_of(map.next_value::<Vec<Shape>>()?)),
+                    other => Err(de::Error::unknown_variant(other, &["seq", "set", "map", "union"])),
                 }
             }
         }
@@ -420,6 +504,10 @@ pub struct ParamInfo {
     pub has_default: bool,
     #[serde(default, skip_serializing_if = "is_positional")]
     pub kind: ParamKind,
+    /// From annotation — UNTRUSTED. Kept only for declared-vs-inferred mismatch detection (see
+    /// `analyze::passes::type_check`), mirroring `EffectSignature::declared_return`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared: Option<String>,
     /// Literal values pulled from guard conditions (`if`/`while`/`assert` tests, ternary
     /// conditions) that compare, contain, or identity-test this parameter — e.g. `x == 42`
     /// records `42`. Feeds `generate::candidates_for` so generated inputs are more likely to

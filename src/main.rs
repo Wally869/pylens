@@ -1,7 +1,7 @@
 //! pylens CLI.
 //!
 //!   pylens analyze  <file.py|dir> [--format json|summary|pyi|html]      static effect signatures
-//!   pylens record   <file.py|dir> [--inputs N] [--format json|summary|html] signatures +
+//!   pylens record   <file.py|dir> [--inputs N] [--format json|summary|pyi|html] signatures +
 //!                                                                       observed cases (runs the
 //!                                                                       jail)
 //!   pylens validate <file.py|dir> [--inputs N] [--format json|summary|html] observed ⊆ static
@@ -15,9 +15,12 @@
 //! unchanged.
 //!
 //! `--format` defaults to `json`. `--format summary` renders a thin terminal summary instead
-//! (see `pylens::report`). `analyze --format pyi` renders inferred `.pyi` type-hint stubs
-//! instead (see `pylens::stub`); it is not available on `record`/`validate`. `--format html`
-//! renders a self-contained HTML report (see `pylens::html`), available on all three commands.
+//! (see `pylens::report`). `--format pyi` renders inferred `.pyi` type-hint stubs (see
+//! `pylens::stub`); not available on `validate`, and only on a single file (not a directory) for
+//! `record`. A `record --format pyi` stub additionally folds in dynamically **observed** types
+//! (marked `# observed`) wherever the static side stayed unresolved — see
+//! `pylens::stub::observed`. `--format html` renders a self-contained HTML report (see
+//! `pylens::html`), available on all three commands.
 
 use std::io::Read;
 
@@ -34,7 +37,7 @@ fn main() {
         _ => {
             eprintln!(
                 "usage:\n  pylens analyze <file.py|dir> [--format json|summary|pyi|html]\n  \
-                 pylens record <file.py|dir> [--inputs <N>] [--format json|summary|html]\n  \
+                 pylens record <file.py|dir> [--inputs <N>] [--format json|summary|pyi|html]\n  \
                  pylens validate <file.py|dir> [--inputs <N>] [--format json|summary|html]"
             );
             std::process::exit(2);
@@ -129,7 +132,6 @@ fn analyze_project_pyi(root: &std::path::Path) -> String {
 
 fn cmd_record(args: &[String]) {
     let format = format_of(args);
-    reject_pyi_format(&format);
     let path = positional(args)
         .cloned()
         .unwrap_or_else(|| fail("record needs a <file.py>"));
@@ -138,6 +140,9 @@ fn cmd_record(args: &[String]) {
         .unwrap_or(4);
 
     if std::path::Path::new(&path).is_dir() {
+        if format == Format::Pyi {
+            fail("--format pyi is not supported for a directory in record mode");
+        }
         match pylens::project::record_project(std::path::Path::new(&path), inputs) {
             Ok(report) => match format {
                 Format::Summary => print!("{}", report::project_summary(&report)),
@@ -152,6 +157,10 @@ fn cmd_record(args: &[String]) {
     let src = read_file(&path);
     match pylens::record::record_file(&src, inputs) {
         Ok(record) => {
+            if format == Format::Pyi {
+                print!("{}", stub::observed::render_record_stub(&record.functions));
+                return;
+            }
             if format == Format::Summary {
                 print!("{}", report::record_summary(&path, &record));
                 return;
@@ -302,7 +311,7 @@ fn format_of(args: &[String]) -> Format {
 
 fn reject_pyi_format(format: &Format) {
     if *format == Format::Pyi {
-        fail("--format pyi is only supported by 'analyze'");
+        fail("--format pyi is only supported by 'analyze' and single-file 'record'");
     }
 }
 

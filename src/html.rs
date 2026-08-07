@@ -481,6 +481,11 @@ fn function_card(command: &str, entry: &Value) -> String {
         render_list_row(&mut out, "type mismatches", Some(mismatches), |t| {
             let kind = t.get("kind").and_then(Value::as_str).unwrap_or("?");
             let declared = t.get("declared").and_then(Value::as_str).unwrap_or("?");
+            if kind == "param" {
+                let param = t.get("param").and_then(Value::as_str).unwrap_or("?");
+                let inferred_shape = t.get("inferred_shape").map(|v| v.to_string()).unwrap_or_default();
+                return format!("param {param}: declared {declared}, inferred {inferred_shape}");
+            }
             let inferred = t
                 .get("inferred")
                 .and_then(Value::as_array)

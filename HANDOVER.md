@@ -20,9 +20,16 @@ assert zero hard defects across the full corpus — keep it there.
   otherwise leaves. Wired into `analyze_project`, `record_project`, and `validate_project` (via
   `record::record_with_signatures`); single-file mode is unaffected. Keyword-argument -> param
   mapping is future work, same as the intra-file pass.
-- **`.pyi` / type model depth.** Stubs render from the recursive `Shape` + return may-set today.
-  Richer output (param-annotation mismatch, union/optional in the `Shape` model itself, observed
-  dynamic types folded in) is future work.
+- **`.pyi` / type model depth** is done: `Shape` gained a width-capped `Union` variant (join now
+  preserves disjoint evidence up to `Shape::UNION_WIDTH_CAP` instead of collapsing straight to
+  `Any`; `Optional[X]` is `Union(X, None)`, no separate variant) — see `SCHEMA_VERSION` bump.
+  TypeCheck flags param-annotation mismatches (`TypeMismatch::kind == "param"`, `param`/
+  `inferred_shape`) alongside the existing return check, both purely advisory (never touch the
+  may-set/purity). `stub.rs` (now `src/stub/`) renders `Union` as PEP 604 (`X | None`); `record
+  --format pyi` (single-file only) additionally folds in dynamically **observed** types (marked
+  `# observed`) wherever the static side stayed `Any`/`Opaque` — see `src/stub/observed.rs` for
+  which JSON encodings are faithfully distinguishable (per `python/worker.py`'s tagged
+  serialization) and which aren't (`bytes`/custom objects — never folded in).
 
 ## Minor / hygiene
 

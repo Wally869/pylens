@@ -307,7 +307,10 @@ impl<'a> FunctionFacts<'a> {
     /// runtime. An operand pinned to a concrete shape is confident enough to omit it — input
     /// generation respects that shape, so the runtime call site won't mistype it.
     pub(in crate::analyze) fn note_type_error_candidate(&mut self, expr: &ast::Expr) {
-        if self.env_shape(expr) == Some(Shape::Any) {
+        // A `Union` operand is just as "not confidently a single concrete type" as `Any` is —
+        // treating it as safe here would narrow the may-set below what `Any` gave before `Union`
+        // existed, which is unsound (see `Shape::Union`'s doc).
+        if matches!(self.env_shape(expr), Some(Shape::Any) | Some(Shape::Union(_))) {
             self.sig.raises.implicit.push("TypeError".to_string());
         }
     }

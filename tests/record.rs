@@ -247,6 +247,40 @@ fn guarded_branch_is_reached_via_guard_sample() {
 }
 
 #[test]
+fn record_pyi_folds_observed_return_type_when_static_is_opaque() {
+    if !ready("record_pyi_folds_observed_return_type_when_static_is_opaque") {
+        return;
+    }
+    // `abs(...)` isn't a recognized builtin in `classify_return`, so the static return type
+    // stays unresolved (`Opaque` -> renders `Any`). Every recorded case actually returns an
+    // `int`, so `record --format pyi` should fold that observed type in with a `# observed`
+    // marker — never claiming it as statically proven.
+    let src = "def f():\n    return abs(-5)\n";
+    let rec = record_file(src, 4).expect("record");
+    let f = rec
+        .functions
+        .iter()
+        .find(|r| r.signature.name == "f")
+        .expect("f record");
+    assert_eq!(
+        pylens::stub::returns_to_pytype(&f.signature.returns),
+        "Any",
+        "return type should be statically unresolved"
+    );
+    assert!(
+        f.cases.iter().any(|c| c.outcome == "returned" && c.ret == Some(serde_json::json!(5))),
+        "expected at least one case returning 5: {:?}",
+        f.cases.iter().map(|c| (&c.outcome, &c.ret)).collect::<Vec<_>>()
+    );
+
+    let out = pylens::stub::observed::render_record_stub(&rec.functions);
+    assert!(
+        out.contains("-> int") && out.contains("# observed"),
+        "expected an observed int return with a marker comment: {out}"
+    );
+}
+
+#[test]
 fn keyword_only_mutation_is_detected() {
     if !ready("keyword_only_mutation_is_detected") {
         return;

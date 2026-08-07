@@ -126,6 +126,9 @@ fn candidates(shape: &Shape) -> Vec<Value> {
             json!(-1),
             set_val(&[json!(1), json!(2)]),
         ],
+        // A union's candidates are the union of its members' candidates, so generation exercises
+        // every branch a disjoint-shape param/return can take.
+        Shape::Union(members) => members.iter().flat_map(candidates).collect(),
     }
 }
 

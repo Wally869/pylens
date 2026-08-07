@@ -497,6 +497,45 @@ fn equality_guard_records_literal_sample() {
 }
 
 #[test]
+fn conflicting_param_shapes_join_to_union_and_render_pep604() {
+    // `x` is pinned `Int` via the `> 0` comparison against a numeric literal, then rebound to
+    // `None` on the else branch — two disjoint pieces of evidence for the same param, so the
+    // fixpoint join must produce `Union([Int, None])` rather than collapsing to `Any`.
+    let s = analyze("def f(x):\n    if x > 0:\n        pass\n    else:\n        x = None\n    return x\n");
+    let f = sig(&s, "f");
+    let x = f.params.iter().find(|p| p.name == "x").unwrap();
+    assert_eq!(x.shape, Shape::Union(vec![Shape::Int, Shape::None]));
+
+    let stub = pylens::stub::render_stub(&s);
+    assert!(
+        stub.contains("x: int | None"),
+        "expected PEP 604 union rendering in stub: {stub}"
+    );
+}
+
+#[test]
+fn declared_str_param_but_inferred_int_is_flagged() {
+    // `x - 1` pins `x`'s shape to `Int`, fully disjoint from the declared `str` annotation.
+    let s = analyze("def f(x: str):\n    return x - 1\n");
+    let f = sig(&s, "f");
+    let m = f
+        .type_mismatches
+        .iter()
+        .find(|m| m.kind == "param")
+        .expect("expected a param type mismatch");
+    assert_eq!(m.param.as_deref(), Some("x"));
+    assert_eq!(m.declared, "str");
+    assert_eq!(m.inferred_shape, Some(Shape::Int));
+}
+
+#[test]
+fn compatible_declared_and_inferred_param_is_not_flagged() {
+    let s = analyze("def f(x: int):\n    return x - 1\n");
+    let f = sig(&s, "f");
+    assert!(f.type_mismatches.iter().all(|m| m.kind != "param"));
+}
+
+#[test]
 fn ordered_guard_records_boundary_neighbors() {
     let s = analyze("def f(x):\n    if x > 10:\n        return 1\n    return 0\n");
     let f = sig(&s, "f");
