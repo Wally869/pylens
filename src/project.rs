@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use ignore::WalkBuilder;
 use serde_json::Value;
 
 use crate::analyze::{analyze_module_with_call_sites, collect_imports};
@@ -20,57 +21,38 @@ pub mod resolve;
 use interproc::{FileUnit, propagate};
 use resolve::{ModuleIndex, annotate_with_resolution, resolve_import};
 
-/// Directory names skipped anywhere in the tree, plus any directory whose name starts with
-/// `.`. Honoring `.gitignore` is future work; this is a fixed list of well-known noise dirs.
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    "__pycache__",
-    ".venv",
-    "venv",
-    "env",
-    "node_modules",
-    "build",
-    "dist",
-    "target",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".tox",
-];
+/// Directory names skipped anywhere in the tree, on top of whatever `.gitignore`/`.ignore`
+/// already exclude. Covers well-known noise dirs that don't start with `.` (so aren't caught by
+/// the walker's hidden-file skipping) and that a project may not have gitignored at all.
+const SKIP_DIRS: &[&str] = &["__pycache__", "venv", "env", "node_modules", "build", "dist", "target"];
 
-fn is_skipped_dir(name: &str) -> bool {
-    name.starts_with('.') || SKIP_DIRS.contains(&name)
+fn is_skipped_dir(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|n| SKIP_DIRS.contains(&n))
 }
 
-/// Recursively collect every `*.py` file under `root`, skipping [`SKIP_DIRS`] and dotfile
-/// directories. Sorted by path for deterministic output. A directory that can't be read (e.g.
-/// a permissions error partway through the tree) is silently skipped rather than aborting the
-/// whole walk, consistent with "one bad file/dir must not abort the run".
+/// Recursively collect every `*.py` file under `root` using the `ignore` crate's walker: it
+/// honors `.gitignore`/`.ignore` hierarchically (even outside a git repository — `require_git`
+/// is disabled) and skips hidden files/dirs by default, on top of the explicit [`SKIP_DIRS`]
+/// list for common noise dirs a project may not have gitignored. Sorted by path for
+/// deterministic output. A directory that can't be read (e.g. a permissions error partway
+/// through the tree) is silently skipped rather than aborting the whole walk, consistent with
+/// "one bad file/dir must not abort the run".
 pub fn collect_py_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    walk(root, &mut out);
-    out.sort();
-    out
-}
-
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
+    let walker = WalkBuilder::new(root)
+        .require_git(false)
+        .filter_entry(|entry| !entry.file_type().is_some_and(|ft| ft.is_dir()) || !is_skipped_dir(entry.file_name()))
+        .build();
+    for entry in walker.flatten() {
         let path = entry.path();
-        if path.is_dir() {
-            let skip = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(is_skipped_dir);
-            if !skip {
-                walk(&path, out);
-            }
-        } else if path.extension().and_then(|e| e.to_str()) == Some("py") {
-            out.push(path);
+        if entry.file_type().is_some_and(|ft| ft.is_file())
+            && path.extension().and_then(|e| e.to_str()) == Some("py")
+        {
+            out.push(path.to_path_buf());
         }
     }
+    out.sort();
+    out
 }
 
 pub(crate) fn relative_path(root: &Path, path: &Path) -> String {

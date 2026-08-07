@@ -1,5 +1,6 @@
-//! Directory ("project") mode: walking, aggregation, partial-failure handling, and the
-//! skip-list. Pure (no jail) except the corpus-level validate check, which is jail-gated.
+//! Directory ("project") mode: walking (incl. `.gitignore` honoring), aggregation,
+//! partial-failure handling, and the skip-list. Pure (no jail) except the corpus-level validate
+//! check, which is jail-gated.
 
 use std::path::Path;
 
@@ -166,6 +167,14 @@ fn analyze_project_cross_file_recursion_terminates() {
 #[test]
 fn walk_skips_pycache_and_dotfile_directories() {
     let report = analyze_project(Path::new("tests/fixtures/project_skip"));
+    let files = report["files"].as_array().expect("files array");
+    let paths: Vec<&str> = files.iter().map(|f| f["path"].as_str().unwrap()).collect();
+    assert_eq!(paths, vec!["top.py"]);
+}
+
+#[test]
+fn walk_honors_gitignore_and_excludes_matched_paths() {
+    let report = analyze_project(Path::new("tests/fixtures/project_gitignore"));
     let files = report["files"].as_array().expect("files array");
     let paths: Vec<&str> = files.iter().map(|f| f["path"].as_str().unwrap()).collect();
     assert_eq!(paths, vec!["top.py"]);
