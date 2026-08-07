@@ -1,43 +1,28 @@
 # Handover — open follow-ups
 
 Current state: the analyzer, jailed recorder, `observed ⊆ static` validation harness, multi-file
-mode, `.pyi`/HTML output, and the CLI are in place. `cargo test` is green (jail-gated ones skip
-when the sandbox isn't provisioned) and `cargo clippy --all-targets -- -D warnings` is clean. See
-`CLAUDE.md` for the architecture and codemap. The whole `examples/` tree (not just
-`inventory.py`/`normalize.py`) is at zero hard defects — implicit-`TypeError` inference now
-consults the Shapes pass's full params+locals env (membership, subscript-base, and the existing
-ordered-compare/arithmetic/subscript-key rules all key off it), closing the `graph.py`
-`walk`/`merge_into` gap that used to be tracked here. `tests/validate.rs` and `tests/project.rs`
-assert zero hard defects across the full corpus — keep it there.
+mode (parallel analyze **and** parallel jailed record), cross-file effect propagation with
+keyword-argument mapping, `Shape` unions / param-annotation mismatch / observed-type-folding
+`.pyi` output, input minimization for raised cases, and the CLI are in place. `cargo test` is
+green (jail-gated ones skip when the sandbox isn't provisioned) and
+`cargo clippy --all-targets -- -D warnings` is clean. See `CLAUDE.md` for the architecture and
+codemap. The whole `examples/` corpus is at zero hard defects; `tests/validate.rs` and
+`tests/project.rs` assert that — keep it there. JSON contract is at `SCHEMA_VERSION = "1.2"`.
 
 ## Feature follow-ups
 
-- **Cross-file effect propagation** is done (`src/project/interproc.rs`): a project-wide symbol
-  table (free functions only) plus a per-file import-binding resolver map calls to project-local
-  imported functions onto their target, and a fixpoint (mirroring the intra-file
-  `Interprocedural` pass's mapping rules) propagates the callee's effects onto the caller across
-  file boundaries — resolving the `call_import` unresolved effect the intra-file Effects pass
-  otherwise leaves. Wired into `analyze_project`, `record_project`, and `validate_project` (via
-  `record::record_with_signatures`); single-file mode is unaffected. Keyword-argument -> param
-  mapping is future work, same as the intra-file pass.
-- **`.pyi` / type model depth** is done: `Shape` gained a width-capped `Union` variant (join now
-  preserves disjoint evidence up to `Shape::UNION_WIDTH_CAP` instead of collapsing straight to
-  `Any`; `Optional[X]` is `Union(X, None)`, no separate variant) — see `SCHEMA_VERSION` bump.
-  TypeCheck flags param-annotation mismatches (`TypeMismatch::kind == "param"`, `param`/
-  `inferred_shape`) alongside the existing return check, both purely advisory (never touch the
-  may-set/purity). `stub.rs` (now `src/stub/`) renders `Union` as PEP 604 (`X | None`); `record
-  --format pyi` (single-file only) additionally folds in dynamically **observed** types (marked
-  `# observed`) wherever the static side stayed `Any`/`Opaque` — see `src/stub/observed.rs` for
-  which JSON encodings are faithfully distinguishable (per `python/worker.py`'s tagged
-  serialization) and which aren't (`bytes`/custom objects — never folded in).
+- **`**kwargs`-unpacking call arguments** (`f(**extra)`) are not mapped by either
+  interprocedural propagator — no single name to key by, consistent with `*args`-unpacking
+  being unmapped on the positional side. Sound (nothing is claimed about a real root), just
+  imprecise.
+- **Opaque-call `may_affect` scanning** (`call_unknown_callee`/`call_import` on genuinely
+  unresolved callees) only scans positional args, not keywords. Sound today because those
+  unresolved effects acknowledge incompleteness; extending it would tighten the may-set.
+- **`bool` vs `int` advisory asymmetry**: the TypeCheck param/return mismatch checks treat a
+  declared `int` as excluding an inferred `bool` (Python's `bool` is an `int` subtype), which
+  can produce a noisy advisory `TypeMismatch`. Advisory-only, never touches the may-set.
 
 ## Minor / hygiene
 
-- A few files sit over the ~500-line soft budget after feature growth
-  (`src/analyze/passes/effects/mod.rs`, `src/html.rs`). Cohesive splits are fine when convenient;
-  do not mechanically fragment (no `part_N`).
-- Parallel jailed record across files is done: `project::record_files_parallel` runs a fixed set
-  of worker threads (each owning its own single-worker `NsjailPool`, capped at
-  `JAIL_WORKER_CAP = 4`) pulling files off a shared queue; `record_project`/`validate_project`
-  use it. Result order doesn't matter — `build_report` sorts by path before emitting, so the
-  aggregated report stays deterministic regardless of completion order.
+- `src/model.rs` sits just over the ~500-line soft budget (~547) after the `Union` growth. A
+  cohesive split (e.g. shape vs signature halves) is fine when convenient; no `part_N`.

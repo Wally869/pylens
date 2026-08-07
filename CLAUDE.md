@@ -71,8 +71,12 @@ strategy; the `Sandbox` trait (`exec.rs`) for launchers; `report`/`stub`/`html` 
     `passes/type_check.rs`, `passes/purity.rs`.
   - `passes/shapes/` — fixpoint shape inference: `mod.rs` (driver), `shape_of.rs`, `state.rs`,
     `pinning.rs`.
-  - `passes/effects/` — the effect walk: `mod.rs` (walker), `setup.rs` (params/decorators),
-    `dedup.rs`, `builtins.rs`.
+  - `passes/effects/` — the effect walk: `mod.rs` (walker + pass impl), `driver.rs` (pass entry),
+    `function_analysis.rs` (per-function), `finalization.rs` (signature completion),
+    `statements.rs` (statement walking), `targets.rs` (assignment/deletion targets),
+    `expressions.rs` (expression visiting), `calls.rs` (call sites), `argument_roots.rs`
+    (argument roots), `argument_targets.rs` (call argument targets), `helpers.rs` (guards/receivers),
+    plus sibling `setup.rs` (params/decorators), `dedup.rs`, `builtins.rs`.
   - `collect/` — per-walk collectors: `aliases`, `mutations`, `exceptions`, `shapes`, `returns`,
     `guards`.
 - `src/generate.rs` — shape-directed + **guard-guided** input generation (`gen_inputs`,
@@ -99,7 +103,9 @@ strategy; the `Sandbox` trait (`exec.rs`) for launchers; `report`/`stub`/`html` 
 - `src/report.rs` (terminal summary), `src/stub/` (`.pyi` stubs — `mod.rs` static rendering
   including `Shape::Union`→PEP 604 and `type_mismatches` comments; `observed.rs` folds
   dynamically observed types from `record` cases into an unresolved static param/return, driving
-  `record --format pyi`), `src/html.rs` (self-contained HTML) — output formatters.
+  `record --format pyi`), `src/html/` (self-contained HTML: `mod.rs` + `rendering.rs` (core),
+  `escaping.rs` (HTML escaping), `summary.rs` (panels), `purity.rs`, `file_section.rs`,
+  `formatting.rs` (shape/mutation rendering), `function_card.rs`, `tests.rs`) — output formatters.
 - `python/worker.py` — the in-jail CPython harness: JSON-over-stdio; serialize-before/after for
   mutation diffs; `--serve` fork-server (per-request `fork()` isolation).
 - `nsjail/pylens.nsjail.cfg` — the jail policy (namespaces + seccomp denylist + rlimits).
