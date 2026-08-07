@@ -55,11 +55,13 @@ impl Pass for TypeCheckPass {
 
 /// Maps a declared annotation name to the concrete [`Shape`] top-level constructors it permits.
 /// `None` means the annotation is a wildcard (`Any`, `Optional`/`Union` without a captured inner
-/// type, or anything we don't confidently recognize) — never flagged.
+/// type, or anything we don't confidently recognize) — never flagged. Numeric-tower subtyping
+/// applies: `bool` ⊆ `int` ⊆ `float` (PEP 484), so a wider declared numeric accepts the narrower
+/// inferred kinds.
 fn permitted_shape_kinds(declared: &str) -> Option<&'static [&'static str]> {
     match declared {
-        "int" => Some(&["int"]),
-        "float" => Some(&["float", "int"]),
+        "int" => Some(&["int", "bool"]),
+        "float" => Some(&["float", "int", "bool"]),
         "str" => Some(&["str"]),
         "bool" => Some(&["bool"]),
         "bytes" => Some(&["bytes"]),
@@ -116,8 +118,8 @@ fn member_disjoint(permitted: &[&str], shape: &Shape) -> bool {
 /// or anything we don't confidently recognize) — never flagged.
 fn permitted_kinds(declared: &str) -> Option<Vec<ReturnKind>> {
     match declared {
-        "int" => Some(vec![ReturnKind::Int]),
-        "float" => Some(vec![ReturnKind::Float, ReturnKind::Int]),
+        "int" => Some(vec![ReturnKind::Int, ReturnKind::Bool]),
+        "float" => Some(vec![ReturnKind::Float, ReturnKind::Int, ReturnKind::Bool]),
         "str" => Some(vec![ReturnKind::Str]),
         "bool" => Some(vec![ReturnKind::Bool]),
         "bytes" => Some(vec![ReturnKind::Bytes]),

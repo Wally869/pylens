@@ -155,6 +155,30 @@ fn analyze_project_propagates_cross_file_mutation_via_keyword_arg_onto_the_calle
 }
 
 #[test]
+fn analyze_project_keeps_call_import_acknowledgment_for_unpacked_cross_file_call() {
+    // `touch(*lst)` resolves cross-file, but the unpacked argument reaches a parameter the
+    // mapping can't attribute — the caller must keep its `call_import` acknowledgment (and its
+    // unpack-induced implicit TypeError) instead of claiming a complete may-set.
+    let report = analyze_project(Path::new("tests/fixtures/xfile_unpack"));
+    let files = report["files"].as_array().expect("files array");
+    let main = files.iter().find(|f| f["path"] == "main.py").expect("main.py entry");
+    let functions = main["functions"].as_array().expect("functions array");
+
+    let caller = functions.iter().find(|f| f["name"] == "caller").expect("caller function");
+    assert_ne!(caller["purity"], "pure");
+    let unresolved = caller["unresolved_effects"].as_array().expect("unresolved_effects array");
+    assert!(
+        unresolved.iter().any(|u| u["reason"] == "call_import" && u["callee"] == "touch"),
+        "expected the call_import unresolved effect to survive for touch, got {unresolved:?}"
+    );
+    let implicit = caller["raises"]["implicit"].as_array().expect("implicit raises array");
+    assert!(
+        implicit.iter().any(|r| r == "TypeError"),
+        "expected unpack-induced implicit TypeError, got {implicit:?}"
+    );
+}
+
+#[test]
 fn analyze_project_cross_file_recursion_terminates() {
     let report = analyze_project(Path::new("tests/fixtures/xfile_recursive"));
     let files = report["files"].as_array().expect("files array");

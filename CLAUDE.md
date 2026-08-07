@@ -75,7 +75,7 @@ strategy; the `Sandbox` trait (`exec.rs`) for launchers; `report`/`stub`/`html` 
     `function_analysis.rs` (per-function), `finalization.rs` (signature completion),
     `statements.rs` (statement walking), `targets.rs` (assignment/deletion targets),
     `expressions.rs` (expression visiting), `calls.rs` (call sites), `argument_roots.rs`
-    (argument roots), `argument_targets.rs` (call argument targets), `helpers.rs` (guards/receivers),
+    (argument mapping roots, unpack detection, opaque-call targets), `helpers.rs` (guards/receivers),
     plus sibling `setup.rs` (params/decorators), `dedup.rs`, `builtins.rs`.
   - `collect/` — per-walk collectors: `aliases`, `mutations`, `exceptions`, `shapes`, `returns`,
     `guards`.

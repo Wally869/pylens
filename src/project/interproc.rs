@@ -236,7 +236,16 @@ fn apply_call_site(
         .collect();
 
     let expected_callee = site.callee_string();
-    let expected_may_affect: Vec<MutationTarget> = site.arg_roots.iter().flatten().cloned().collect();
+    // Mirrors how the Effects walk built the `call_import` acknowledgment's `may_affect`
+    // (`args_targets`: positional roots, then keyword-argument roots) so a fully-mapped site
+    // matches its acknowledgment exactly.
+    let expected_may_affect: Vec<MutationTarget> = site
+        .arg_roots
+        .iter()
+        .flatten()
+        .chain(site.kwarg_roots.iter().filter_map(|(_, root)| root.as_ref()))
+        .cloned()
+        .collect();
 
     let caller_sig = &mut files[caller_file].signatures[caller_func];
     let mut changed = false;
@@ -260,13 +269,18 @@ fn apply_call_site(
         changed |= push_unique(&mut caller_sig.unresolved_effects, u);
     }
 
-    let before = caller_sig.unresolved_effects.len();
-    caller_sig.unresolved_effects.retain(|u| {
-        !(u.reason == "call_import"
-            && u.callee.as_deref() == Some(expected_callee.as_str())
-            && u.may_affect == expected_may_affect)
-    });
-    changed |= caller_sig.unresolved_effects.len() != before;
+    // An unpacked call site keeps its `call_import` acknowledgment even after resolution: the
+    // unpacked arguments reach callee parameters the argument->parameter mapping can't
+    // attribute, so the caller's may-set must not claim completeness over them.
+    if !site.has_unpack {
+        let before = caller_sig.unresolved_effects.len();
+        caller_sig.unresolved_effects.retain(|u| {
+            !(u.reason == "call_import"
+                && u.callee.as_deref() == Some(expected_callee.as_str())
+                && u.may_affect == expected_may_affect)
+        });
+        changed |= caller_sig.unresolved_effects.len() != before;
+    }
 
     changed
 }

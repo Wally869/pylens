@@ -385,6 +385,71 @@ fn local_helper_mutation_via_keyword_arg_propagates_to_caller() {
 }
 
 #[test]
+fn star_unpacked_call_to_local_callee_is_acknowledged_not_pure() {
+    // `helper(*lst)` hands helper an element of `lst` the positional mapping can't attribute,
+    // and the unpack operation itself can raise TypeError — neither may be silently dropped.
+    let s = analyze(
+        "def helper(xs):\n\
+         \x20   xs.append(1)\n\
+         def caller(lst):\n\
+         \x20   helper(*lst)\n",
+    );
+    let caller = sig(&s, "caller");
+    let u = caller
+        .unresolved_effects
+        .iter()
+        .find(|u| u.reason == "call_unpacked_args")
+        .expect("expected a call_unpacked_args acknowledgment");
+    assert_eq!(u.callee.as_deref(), Some("helper"));
+    assert!(u.may_affect.contains(&MutationTarget::Param { name: "lst".into() }));
+    assert!(caller.raises.implicit.iter().any(|r| r == "TypeError"));
+    assert_ne!(caller.purity, Purity::Pure);
+}
+
+#[test]
+fn double_star_unpacked_call_to_local_callee_is_acknowledged_not_pure() {
+    let s = analyze(
+        "def helper(xs):\n\
+         \x20   xs.append(1)\n\
+         def caller(d):\n\
+         \x20   helper(**d)\n",
+    );
+    let caller = sig(&s, "caller");
+    let u = caller
+        .unresolved_effects
+        .iter()
+        .find(|u| u.reason == "call_unpacked_args")
+        .expect("expected a call_unpacked_args acknowledgment");
+    assert!(u.may_affect.contains(&MutationTarget::Param { name: "d".into() }));
+    assert!(caller.raises.implicit.iter().any(|r| r == "TypeError"));
+    assert_ne!(caller.purity, Purity::Pure);
+}
+
+#[test]
+fn opaque_call_may_affect_includes_keyword_and_unpacked_roots() {
+    // An imported callee is opaque: everything handed to it — positionally, by keyword, or
+    // unpacked — may be mutated, so all trackable roots belong in the acknowledgment.
+    let s = analyze(
+        "from ext import sink\n\
+         def caller(a, b, c):\n\
+         \x20   sink(a, key=b, **c)\n",
+    );
+    let caller = sig(&s, "caller");
+    let u = caller
+        .unresolved_effects
+        .iter()
+        .find(|u| u.reason == "call_import")
+        .expect("expected a call_import acknowledgment");
+    for name in ["a", "b", "c"] {
+        assert!(
+            u.may_affect.contains(&MutationTarget::Param { name: name.into() }),
+            "expected {name} in may_affect: {:?}",
+            u.may_affect
+        );
+    }
+}
+
+#[test]
 fn pure_local_helper_call_keeps_caller_pure() {
     let s = analyze(
         "def add_one(x):\n\
@@ -533,6 +598,15 @@ fn compatible_declared_and_inferred_param_is_not_flagged() {
     let s = analyze("def f(x: int):\n    return x - 1\n");
     let f = sig(&s, "f");
     assert!(f.type_mismatches.iter().all(|m| m.kind != "param"));
+}
+
+#[test]
+fn bool_inferred_against_declared_int_is_not_flagged() {
+    // `bool` is an `int` subtype (PEP 484 numeric tower): rebinding an `int` param to a
+    // comparison result, or returning a `bool` from an `-> int` function, is not a mismatch.
+    let s = analyze("def f(n: int) -> int:\n    n = n > 0\n    return n\n");
+    let f = sig(&s, "f");
+    assert!(f.type_mismatches.is_empty());
 }
 
 #[test]

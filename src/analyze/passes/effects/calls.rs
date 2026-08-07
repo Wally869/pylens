@@ -10,6 +10,13 @@ use super::Walker;
 
 impl Walker < '_ , '_ > {
         pub fn visit_call(&mut self, call: &ast::ExprCall) {
+            // Argument unpacking (`f(*xs)` / `f(**kw)`) can itself raise `TypeError` (non-iterable
+            // splat, non-mapping `**`, arity/duplicate-keyword mismatch) before any callee code
+            // runs — a call-operation effect, independent of what the callee is.
+            let has_unpack = Self::call_has_unpack(&call.arguments);
+            if has_unpack {
+                self.facts.sig.raises.implicit.push("TypeError".to_string());
+            }
             match call.func.as_ref() {
                 // Method call: `base.method(...)`.
                 ast::Expr::Attribute(attr) => {
@@ -35,6 +42,7 @@ impl Walker < '_ , '_ > {
                                 attr: Some(attr.attr.to_string()),
                                 arg_roots,
                                 kwarg_roots,
+                                has_unpack,
                             });
                         }
                     } else if self.is_self_receiver(&attr.value)
@@ -54,6 +62,9 @@ impl Walker < '_ , '_ > {
                             arg_roots,
                             kwarg_roots,
                         });
+                        if has_unpack {
+                            self.acknowledge_unpacked_call(attr.attr.as_str(), &call.arguments);
+                        }
                     } else {
                         let method = attr.attr.as_str();
                         if is_mutating_method(method) {
@@ -90,6 +101,7 @@ impl Walker < '_ , '_ > {
                             attr: None,
                             arg_roots,
                             kwarg_roots,
+                            has_unpack,
                         });
                     } else if let Some(callee) = resolve_unique(self.facts.declarations, None, n) {
                         // A call to a module-level function defined in this same module — a
@@ -102,6 +114,9 @@ impl Walker < '_ , '_ > {
                             arg_roots,
                             kwarg_roots,
                         });
+                        if has_unpack {
+                            self.acknowledge_unpacked_call(n, &call.arguments);
+                        }
                     } else {
                         if let Some(exc) = call_implicit_exception(n) {
                             self.facts.sig.raises.implicit.push(exc.to_string());
@@ -145,6 +160,18 @@ impl Walker < '_ , '_ > {
             for kw in call.arguments.keywords.iter() {
                 self.visit_expr(&kw.value);
             }
+        }
+
+        /// A resolved (local/self-method) call that unpacks arguments hands the callee tracked
+        /// objects the argument->parameter mapping can't attribute — acknowledge that blind spot
+        /// so the may-set never silently claims completeness over them.
+        fn acknowledge_unpacked_call(&mut self, callee: &str, arguments: &ast::Arguments) {
+            let may_affect = self.unpacked_arg_roots(arguments);
+            self.facts.sig.unresolved_effects.push(UnresolvedEffect {
+                reason: "call_unpacked_args".to_string(),
+                callee: Some(callee.to_string()),
+                may_affect,
+            });
         }
 
 }

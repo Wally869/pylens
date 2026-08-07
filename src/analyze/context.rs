@@ -31,11 +31,14 @@ fn attr_off_receiver<'e>(expr: &'e ast::Expr, self_param: &str) -> Option<&'e st
 /// Argument -> parameter mapping covers both positional and keyword call arguments: positional
 /// arguments map onto the callee's declared parameters by position (`arg_roots`), keyword
 /// arguments map by name (`kwarg_roots`), matched against the callee's `Positional` or
-/// `KeywordOnly` parameters. A call the analyzer can't line up with a callee parameter (extra
-/// positional args, `*args`/`**kwargs` at the call site, or a keyword that names no declared
-/// parameter — swallowed by the callee's own `**kwargs`) simply yields no root for that
-/// position/name — sound, since an unmapped root means the caller didn't hand the callee a
-/// trackable object there, so nothing to (mis)attribute.
+/// `KeywordOnly` parameters. A keyword that names no declared parameter (swallowed by the
+/// callee's own `**kwargs`) simply yields no root for that name — sound, since an unmapped
+/// root means the caller didn't hand the callee a trackable object there. Unpacking at the
+/// call site (`f(*xs)` / `f(**kw)`) is different: it DOES hand the callee trackable objects
+/// the mapping can't attribute, so the Effects pass records a `call_unpacked_args`
+/// [`UnresolvedEffect`] alongside the site (and `arg_roots` stops at the first `*`-unpack,
+/// whose position makes every later positional index unreliable) — the acknowledgment, not
+/// the mapping, carries those roots.
 #[derive(Debug, Clone)]
 pub(in crate::analyze) struct CallSite {
     /// Index into `ModuleAnalysis::declarations` / `ModuleAnalysis::signatures` (the two are
@@ -76,6 +79,10 @@ pub struct ImportCallSite {
     /// The caller-side root each keyword call argument resolves to, paired with its name — same
     /// shape as [`CallSite::kwarg_roots`].
     pub kwarg_roots: Vec<(String, Option<MutationTarget>)>,
+    /// The call unpacks arguments (`f(*xs)` / `f(**kw)`). Cross-file resolution still propagates
+    /// what it can map, but must keep the caller's `call_import` acknowledgment: unpacked
+    /// arguments reach callee parameters the mapping can't attribute.
+    pub has_unpack: bool,
 }
 
 impl ImportCallSite {

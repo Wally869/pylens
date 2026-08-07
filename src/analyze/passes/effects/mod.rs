@@ -38,11 +38,9 @@ mod expressions;
 /// Call site analysis and argument resolution.
 mod calls;
 
-/// Argument root extraction (positional and keyword).
+/// Argument root extraction: positional/keyword mapping roots, unpack detection, and
+/// opaque-call targets.
 mod argument_roots;
-
-/// Call target resolution for arguments.
-mod argument_targets;
 
 /// Guard test tracking and receiver context helpers.
 mod helpers;
