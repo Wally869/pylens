@@ -249,6 +249,7 @@ mod tests {
             stdout: None,
             stderr: None,
             error: None,
+            minimized: None,
         }
     }
 
@@ -265,6 +266,7 @@ mod tests {
             stdout: None,
             stderr: None,
             error: None,
+            minimized: None,
         }
     }
 
@@ -281,6 +283,7 @@ mod tests {
             stdout: None,
             stderr: None,
             error: None,
+            minimized: None,
         }
     }
 

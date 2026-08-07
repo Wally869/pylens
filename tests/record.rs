@@ -281,6 +281,55 @@ fn record_pyi_folds_observed_return_type_when_static_is_opaque() {
 }
 
 #[test]
+fn raised_case_carries_a_smaller_minimized_input() {
+    if !ready("raised_case_carries_a_smaller_minimized_input") {
+        return;
+    }
+    // The `for` loop pins `xs`'s shape to a sequence, so every generated case is a list; `xs[10]`
+    // raises IndexError whenever the list has fewer than 11 elements. Shrinking should find a
+    // smaller (or equal, for already-minimal) list that still raises IndexError.
+    let src = "def f(xs):\n    for _ in xs:\n        pass\n    return xs[10]\n";
+    let rec = record_file(src, 6).expect("record");
+    let f = rec
+        .functions
+        .iter()
+        .find(|r| r.signature.name == "f")
+        .expect("f record");
+    let index_errors: Vec<_> = f
+        .cases
+        .iter()
+        .filter(|c| c.outcome == "raised" && c.raises.as_deref() == Some("IndexError"))
+        .collect();
+    assert!(!index_errors.is_empty(), "expected at least one IndexError case: {:?}",
+        f.cases.iter().map(|c| (&c.outcome, &c.raises)).collect::<Vec<_>>());
+
+    let shrunk = index_errors
+        .iter()
+        .find(|c| c.minimized.is_some())
+        .expect("expected at least one IndexError case with a minimized input");
+    let minimized = shrunk.minimized.as_ref().expect("minimized present");
+    let original_len = shrunk.input[0].as_array().expect("xs input is a list").len();
+    let minimized_len = minimized.input[0].as_array().expect("xs minimized is a list").len();
+    assert!(
+        minimized_len < original_len,
+        "expected the minimized input to be strictly smaller: original {original_len}, minimized {minimized_len}"
+    );
+
+    // Re-raising the minimized input must independently reproduce the same exception type.
+    use pylens::exec::Sandbox;
+    let sandbox = pylens::exec::Nsjail::new();
+    let result = sandbox
+        .call(src, "f", &minimized.input, &[])
+        .expect("re-raise minimized input");
+    assert!(!result.ok, "minimized input should still raise");
+    assert_eq!(
+        result.exception.map(|e| e.ty),
+        Some("IndexError".to_string()),
+        "minimized input must reproduce the same exception type"
+    );
+}
+
+#[test]
 fn keyword_only_mutation_is_detected() {
     if !ready("keyword_only_mutation_is_detected") {
         return;

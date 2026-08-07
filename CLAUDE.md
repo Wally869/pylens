@@ -76,12 +76,18 @@ strategy; the `Sandbox` trait (`exec.rs`) for launchers; `report`/`stub`/`html` 
   - `collect/` — per-walk collectors: `aliases`, `mutations`, `exceptions`, `shapes`, `returns`,
     `guards`.
 - `src/generate.rs` — shape-directed + **guard-guided** input generation (`gen_inputs`,
-  `GenInput`, recursive breadth-capped `candidates`).
+  `GenInput`, recursive breadth-capped `candidates`); also `shrink_candidates` — strictly-smaller,
+  same-kind variants of one generated value, used by `shrink.rs` to minimize failing cases.
 - `src/exec.rs` — jailed execution: `Sandbox` trait, `Nsjail` (one process/call), `NsjailPool`
   (fork-server), `probe()`, `CallResult`, `HarnessError` (`is_resource()` distinguishes resource
   kills). **No unsandboxed launcher exists.**
 - `src/record.rs` — `record_file`/`record_with`: static sig + jailed cases; `ModuleRecord`,
-  `Case`, before/after mutation diffing (incl. `self` and kwargs).
+  `Case` (incl. `minimized: Option<MinimizedInput>`), before/after mutation diffing (incl. `self`
+  and kwargs). A `raised`-outcome case is re-executed via `shrink::shrink_case` on the same
+  `Sandbox` to attach a smaller same-exception-type input.
+- `src/shrink.rs` — `shrink_case`: greedy per-argument shrink loop over `generate::
+  shrink_candidates`, bounded by `SHRINK_BUDGET` extra jailed calls per case; a resource kill or
+  differing exception type rejects the candidate. Reporting aid only — never feeds `validate`.
 - `src/validate.rs` — the `observed ⊆ static` harness: `validate_function`, `Defect`, `Severity`
   (Hard = the may-set claimed completeness yet missed an effect; Soft = explained by an
   acknowledged unresolved).

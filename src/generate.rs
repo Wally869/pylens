@@ -190,6 +190,140 @@ fn set_val(items: &[Value]) -> Value {
     json!({ "__t__": "set", "items": items })
 }
 
+/// Strictly-smaller candidate variants of `value`, for shrinking a failing case's input while
+/// preserving its JSON kind (and, for tagged set/dict encodings, its `__t__` tag) — the worker
+/// must be able to deserialize a shrink candidate exactly like any other generated value. Each
+/// candidate is a *distinct* value considered strictly smaller than `value` by an obvious
+/// per-kind measure (length, magnitude, member count); `value` itself is never returned.
+/// Containers additionally propose one candidate per element that is itself shrunk (holding
+/// container size fixed), so nested structure can shrink without dropping outer elements.
+pub fn shrink_candidates(value: &Value) -> Vec<Value> {
+    match value {
+        Value::Null => Vec::new(),
+        Value::Bool(_) => Vec::new(),
+        Value::Number(n) => shrink_number(n),
+        Value::String(s) => shrink_string(s),
+        Value::Array(items) => shrink_array(items),
+        Value::Object(map) => shrink_object(map),
+    }
+}
+
+fn shrink_number(n: &serde_json::Number) -> Vec<Value> {
+    let mut out = Vec::new();
+    if let Some(i) = n.as_i64() {
+        if i != 0 {
+            out.push(json!(0));
+        }
+        if i.abs() > 1 {
+            out.push(json!(i / 2));
+        }
+        if i > 0 {
+            out.push(json!(i - 1));
+        } else if i < 0 {
+            out.push(json!(i + 1));
+        }
+    } else if let Some(f) = n.as_f64() {
+        if f != 0.0 {
+            out.push(json!(0.0));
+        }
+        if f.abs() > f64::EPSILON {
+            out.push(json!(f / 2.0));
+        }
+    }
+    out
+}
+
+fn shrink_string(s: &str) -> Vec<Value> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![json!("")];
+    if chars.len() > 1 {
+        out.push(json!(chars[..chars.len() / 2].iter().collect::<String>()));
+        out.push(json!(chars[..chars.len() - 1].iter().collect::<String>()));
+    }
+    out
+}
+
+/// Whether `map` is a plain string-keyed JSON object (a dict candidate) rather than a tagged
+/// `{"__t__": ..., "items": [...]}` encoding — see [`is_string_like_key`]/[`set_val`].
+fn tag_of(map: &Map<String, Value>) -> Option<&str> {
+    map.get("__t__").and_then(Value::as_str)
+}
+
+fn shrink_array(items: &[Value]) -> Vec<Value> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![json!([])];
+    if items.len() > 1 {
+        out.push(Value::Array(items[..items.len() / 2].to_vec()));
+        out.push(Value::Array(items[..items.len() - 1].to_vec()));
+    }
+    for (i, item) in items.iter().enumerate() {
+        for shrunk in shrink_candidates(item) {
+            let mut variant = items.to_vec();
+            variant[i] = shrunk;
+            out.push(Value::Array(variant));
+        }
+    }
+    out
+}
+
+fn shrink_object(map: &Map<String, Value>) -> Vec<Value> {
+    match tag_of(map) {
+        Some("dict") | Some("set") => shrink_tagged_items(map),
+        Some(_) => Vec::new(),
+        None => shrink_plain_dict(map),
+    }
+}
+
+/// Shrink a tagged `{"__t__": "dict"|"set", "items": [...]}` encoding by shrinking its `items`
+/// array (dropping/halving entries), preserving the tag.
+fn shrink_tagged_items(map: &Map<String, Value>) -> Vec<Value> {
+    let Some(Value::Array(items)) = map.get("items") else {
+        return Vec::new();
+    };
+    let tag = map.get("__t__").cloned().unwrap_or(Value::Null);
+    shrink_array(items)
+        .into_iter()
+        .map(|shrunk_items| {
+            let mut m = Map::new();
+            m.insert("__t__".to_string(), tag.clone());
+            m.insert("items".to_string(), shrunk_items);
+            Value::Object(m)
+        })
+        .collect()
+}
+
+fn shrink_plain_dict(map: &Map<String, Value>) -> Vec<Value> {
+    if map.is_empty() {
+        return Vec::new();
+    }
+    let entries: Vec<(&String, &Value)> = map.iter().collect();
+    let mut out = vec![Value::Object(Map::new())];
+    if entries.len() > 1 {
+        let build = |n: usize| -> Value {
+            let mut m = Map::new();
+            for (k, v) in entries.iter().take(n) {
+                m.insert((*k).clone(), (*v).clone());
+            }
+            Value::Object(m)
+        };
+        out.push(build(entries.len() / 2));
+        out.push(build(entries.len() - 1));
+    }
+    for (k, v) in &entries {
+        for shrunk in shrink_candidates(v) {
+            let mut variant = map.clone();
+            variant.insert((*k).to_string(), shrunk);
+            out.push(Value::Object(variant));
+        }
+    }
+    out
+}
+
 /// The parameters that actually receive a positional slot in a generated call: everything
 /// except `*args`/`**kwargs`, in declaration order. Callers that need to line up a generated
 /// input vector against `sig.params` positionally (e.g. mutation diffing) must filter the same

@@ -11,6 +11,7 @@ use serde_json::{Map, Value};
 use crate::exec::{CallResult, HarnessError, NsjailPool, Sandbox};
 use crate::generate::{GenInput, gen_inputs, keyword_only_params, positional_params};
 use crate::model::{DefKind, EffectSignature, Import};
+use crate::shrink::shrink_case;
 use crate::{analyze_source, imports_of};
 
 /// One long-lived jailed worker, reused for the whole file (load probe + dependency probes +
@@ -25,6 +26,16 @@ pub struct ObservedMutation {
     pub target: String,
     pub before: Value,
     pub after: Value,
+}
+
+/// A shrunk variant of a raised case's input that still raises the same exception type — see
+/// [`crate::shrink::shrink_case`]. Present on a `Case` only when at least one argument was
+/// successfully shrunk; this is a reporting aid and is never fed back into `validate`.
+#[derive(Serialize)]
+pub struct MinimizedInput {
+    pub input: Vec<Value>,
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub kwargs: Map<String, Value>,
 }
 
 /// One executed case: an input vector and what the function did with it.
@@ -62,6 +73,10 @@ pub struct Case {
     pub stderr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<HarnessError>,
+    /// Present only for `outcome == "raised"` cases where shrinking found a smaller input that
+    /// still raises the same exception type. See [`crate::shrink::shrink_case`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimized: Option<MinimizedInput>,
 }
 
 /// Why a function couldn't be executed at all — recorded once, instead of as N identical
@@ -246,9 +261,33 @@ fn function_cases(
     let mut cases = Vec::new();
     for input in gen_inputs(sig, max_inputs) {
         let result = sandbox.call(src, &sig.name, &input.positional, &input.kwargs)?;
-        cases.push(build_case(sig, &input, None, &result));
+        let mut case = build_case(sig, &input, None, &result);
+        if case.outcome == "raised" {
+            case.minimized = minimize_raised(&case, &input, |pos, kw| {
+                sandbox.call(src, &sig.name, pos, kw)
+            })?;
+        }
+        cases.push(case);
     }
     Ok(cases)
+}
+
+/// Shrink a `raised` case's input, re-executing via `call` (the same call shape — free function
+/// or method — the case itself ran on). Returns `None` when nothing shrank.
+fn minimize_raised(
+    case: &Case,
+    input: &GenInput,
+    call: impl FnMut(&[Value], &[(String, Value)]) -> Result<CallResult, String>,
+) -> Result<Option<MinimizedInput>, String> {
+    let exc = case
+        .raises
+        .as_deref()
+        .expect("a raised case always carries an exception type");
+    let shrunk = shrink_case(exc, &input.positional, &input.kwargs, call)?;
+    Ok(shrunk.map(|(pos, kw)| MinimizedInput {
+        input: pos,
+        kwargs: kw.into_iter().collect(),
+    }))
 }
 
 /// Record a method: probe its constructor once per class (cached), and only generate cases if
@@ -287,7 +326,13 @@ fn method_record(
     for input in gen_inputs(sig, max_inputs) {
         let result =
             sandbox.call_method(src, class, &ctor_args, &sig.name, &input.positional, &input.kwargs)?;
-        cases.push(build_case(sig, &input, Some(ctor_args.clone()), &result));
+        let mut case = build_case(sig, &input, Some(ctor_args.clone()), &result);
+        if case.outcome == "raised" {
+            case.minimized = minimize_raised(&case, &input, |pos, kw| {
+                sandbox.call_method(src, class, &ctor_args, &sig.name, pos, kw)
+            })?;
+        }
+        cases.push(case);
     }
     Ok((None, cases))
 }
@@ -378,6 +423,7 @@ fn build_case(
             stdout,
             stderr,
             error: Some(err.clone()),
+            minimized: None,
         };
     }
     if r.ok {
@@ -393,6 +439,7 @@ fn build_case(
             stdout,
             stderr,
             error: None,
+            minimized: None,
         }
     } else {
         Case {
@@ -407,6 +454,7 @@ fn build_case(
             stdout,
             stderr,
             error: None,
+            minimized: None,
         }
     }
 }
