@@ -4,6 +4,7 @@
 //! aborting the whole run — see `main.rs` for the CLI dispatch that picks this path over the
 //! single-file one.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -164,6 +165,62 @@ where
     results.into_inner().unwrap()
 }
 
+/// Cap on jailed worker threads for project-mode `record`/`validate`. Each worker owns its own
+/// `NsjailPool`, i.e. its own WSL/nsjail fork-server process — unlike `parallel_map`'s CPU-bound
+/// workers, spawning one per available core is wasteful (and on Windows, one `wsl` process per
+/// thread is real overhead), so this is capped independently of `available_parallelism`.
+const JAIL_WORKER_CAP: usize = 4;
+
+/// Run `process` over every item in `items` using a fixed set of worker threads, each owning its
+/// own single-worker [`NsjailPool`] (files are independent, so no pool is ever shared across
+/// threads — each stays a private request/response channel). Worker count is
+/// `available_parallelism` capped at [`JAIL_WORKER_CAP`] and at `items.len()`. If any worker
+/// fails to start its pool (e.g. the sandbox isn't provisioned), that failure is propagated as
+/// the whole run's error, same as today's single-pool startup failure. Result order does not
+/// need to match `items`' order — callers (`build_report`) sort by path before emitting.
+fn record_files_parallel<T, F>(items: Vec<T>, process: F) -> Result<Vec<FileEntry>, String>
+where
+    T: Send,
+    F: Fn(&NsjailPool, T) -> FileEntry + Sync,
+{
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let workers = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(JAIL_WORKER_CAP)
+        .min(items.len());
+
+    let queue: Mutex<VecDeque<T>> = Mutex::new(items.into_iter().collect());
+    let results: Mutex<Vec<FileEntry>> = Mutex::new(Vec::new());
+    let process = &process;
+    let queue = &queue;
+    let results_ref = &results;
+
+    std::thread::scope(|scope| -> Result<(), String> {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            handles.push(scope.spawn(move || -> Result<(), String> {
+                let pool = NsjailPool::new(1)?;
+                loop {
+                    let item = queue.lock().unwrap().pop_front();
+                    let Some(item) = item else { break };
+                    let entry = process(&pool, item);
+                    results_ref.lock().unwrap().push(entry);
+                }
+                Ok(())
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap()?;
+        }
+        Ok(())
+    })?;
+
+    Ok(results.into_inner().unwrap())
+}
+
 /// One file's raw (not yet cross-file-propagated) static analysis: its imports, the Effects
 /// pass's signatures, and the imported call sites cross-file propagation needs — see
 /// `interproc::FileUnit`.
@@ -306,21 +363,17 @@ fn record_file_entry(sandbox: &dyn Sandbox, index: &ModuleIndex, ef: EnrichedFil
     }
 }
 
-/// Record every `*.py` file under `root` against one shared jailed pool (created once, reused
-/// for the whole run — spawning a pool per file would pay nsjail startup repeatedly). Sequential
-/// across files for v1; parallelizing jailed record across a multi-worker pool is future work.
-/// Fails the whole run only if the sandbox can't be provisioned at all; a per-file record
-/// failure becomes a `{path, error}` entry instead. Records against cross-file-propagated
-/// signatures, same as `analyze_project`.
+/// Record every `*.py` file under `root`, spread across a fixed pool of worker threads (each
+/// owning its own jailed [`NsjailPool`]) via [`record_files_parallel`] — files are independent,
+/// so this parallelizes cleanly. Fails the whole run only if a worker's sandbox can't be
+/// provisioned at all; a per-file record failure becomes a `{path, error}` entry instead.
+/// Records against cross-file-propagated signatures, same as `analyze_project`.
 pub fn record_project(root: &Path, max_inputs: usize) -> Result<Value, String> {
     let files = collect_py_files(root);
-    let index = ModuleIndex::build(root, &files);
-    let sandbox = NsjailPool::new(1)?;
+    let index = &ModuleIndex::build(root, &files);
     let (enriched, error_entries) = analyze_and_propagate(root, &files);
-    let mut entries: Vec<FileEntry> = enriched
-        .into_iter()
-        .map(|ef| record_file_entry(&sandbox, &index, ef, max_inputs))
-        .collect();
+    let mut entries =
+        record_files_parallel(enriched, |pool, ef| record_file_entry(pool, index, ef, max_inputs))?;
     entries.extend(error_entries);
     Ok(build_report(root, entries, false))
 }
@@ -380,10 +433,8 @@ fn validate_file_entry(sandbox: &dyn Sandbox, ef: EnrichedFile, max_inputs: usiz
 /// against cross-file-propagated signatures, same as `analyze_project`.
 pub fn validate_project(root: &Path, max_inputs: usize) -> Result<(Value, usize), String> {
     let files = collect_py_files(root);
-    let sandbox = NsjailPool::new(1)?;
     let (enriched, error_entries) = analyze_and_propagate(root, &files);
-    let mut entries: Vec<FileEntry> =
-        enriched.into_iter().map(|ef| validate_file_entry(&sandbox, ef, max_inputs)).collect();
+    let mut entries = record_files_parallel(enriched, |pool, ef| validate_file_entry(pool, ef, max_inputs))?;
     entries.extend(error_entries);
     let hard_total: usize = entries.iter().map(|e| e.hard_defects).sum();
     Ok((build_report(root, entries, true), hard_total))

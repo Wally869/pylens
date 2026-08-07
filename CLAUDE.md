@@ -82,8 +82,10 @@ strategy; the `Sandbox` trait (`exec.rs`) for launchers; `report`/`stub`/`html` 
   (Hard = the may-set claimed completeness yet missed an effect; Soft = explained by an
   acknowledged unresolved).
 - `src/project.rs` + `src/project/resolve.rs` — multi-file mode: directory walk (via the `ignore`
-  crate — honors `.gitignore`/`.ignore` + a small explicit skip-list), parallel analyze,
-  aggregated project report, project-local import resolution.
+  crate — honors `.gitignore`/`.ignore` + a small explicit skip-list), parallel analyze, parallel
+  jailed record/validate (`record_files_parallel`: fixed worker threads each owning their own
+  `NsjailPool`, capped at `JAIL_WORKER_CAP`), aggregated project report (deterministic path order
+  via `build_report`'s sort regardless of completion order), project-local import resolution.
 - `src/report.rs` (terminal summary), `src/stub.rs` (`.pyi` stubs), `src/html.rs`
   (self-contained HTML) — output formatters.
 - `python/worker.py` — the in-jail CPython harness: JSON-over-stdio; serialize-before/after for

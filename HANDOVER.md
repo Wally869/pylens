@@ -29,5 +29,8 @@ assert zero hard defects across the full corpus — keep it there.
 - A few files sit over the ~500-line soft budget after feature growth
   (`src/analyze/passes/effects/mod.rs`, `src/html.rs`). Cohesive splits are fine when convenient;
   do not mechanically fragment (no `part_N`).
-- Parallel *jailed* record across files is future work (analyze is parallel; record reuses one
-  pool sequentially across a project's files).
+- Parallel jailed record across files is done: `project::record_files_parallel` runs a fixed set
+  of worker threads (each owning its own single-worker `NsjailPool`, capped at
+  `JAIL_WORKER_CAP = 4`) pulling files off a shared queue; `record_project`/`validate_project`
+  use it. Result order doesn't matter — `build_report` sorts by path before emitting, so the
+  aggregated report stays deterministic regardless of completion order.

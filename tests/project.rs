@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use pylens::exec::probe;
-use pylens::project::{analyze_project, validate_project};
+use pylens::project::{analyze_project, record_project, validate_project};
 
 fn ready(test: &str) -> bool {
     match probe() {
@@ -178,6 +178,37 @@ fn walk_honors_gitignore_and_excludes_matched_paths() {
     let files = report["files"].as_array().expect("files array");
     let paths: Vec<&str> = files.iter().map(|f| f["path"].as_str().unwrap()).collect();
     assert_eq!(paths, vec!["top.py"]);
+}
+
+#[test]
+fn record_project_parallelizes_across_files_with_stable_output_order() {
+    if !ready("record_project_parallelizes_across_files_with_stable_output_order") {
+        return;
+    }
+    let report = record_project(Path::new("tests/fixtures/project"), 4).expect("record_project");
+
+    let files = report["files"].as_array().expect("files array");
+    let paths: Vec<&str> = files.iter().map(|f| f["path"].as_str().unwrap()).collect();
+    assert_eq!(paths, vec!["a.py", "b.py"], "report must list files in stable walk order");
+
+    for f in files {
+        assert!(f.get("error").is_none(), "unexpected per-file error: {f:?}");
+        assert!(f.get("functions").is_some());
+    }
+
+    let a = files.iter().find(|f| f["path"] == "a.py").expect("a.py entry");
+    let add_fn = a["functions"].as_array().unwrap().iter().find(|f| f["name"] == "add").expect("add fn");
+    assert_eq!(add_fn["purity"], "pure");
+
+    let b = files.iter().find(|f| f["path"] == "b.py").expect("b.py entry");
+    let mutate_fn = b["functions"].as_array().unwrap().iter().find(|f| f["name"] == "mutate").expect("mutate fn");
+    assert_eq!(mutate_fn["purity"], "impure");
+
+    let summary = &report["summary"];
+    assert_eq!(summary["files"], 2);
+    assert_eq!(summary["ok"], 2);
+    assert_eq!(summary["errors"], 0);
+    assert_eq!(summary["functions"], 2);
 }
 
 #[test]
