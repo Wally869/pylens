@@ -2,119 +2,78 @@
 
 Static **effect + shape analysis** of Python functions (in Rust, via the ruff parser), plus
 **jailed execution** to record what a function *actually* does on generated inputs. Consumers
-(type-hint suggestion, refactoring, ML dataset building) build on the records through a
-documented JSON contract. pylens itself is domain-agnostic.
+build on the JSON output; pylens itself is domain-agnostic.
 
 ## The one invariant that governs everything
 
 > **`observed_effects ⊆ static_may_set`**
 
 The static analysis over-approximates (**may-sets**). It must **never** report an effect
-(`pure`, a missing mutation, an unlisted raise) that a real execution can contradict. A function
-is `pure` only when nothing statically unresolved remains; anything the analyzer can't see
-through degrades to `unresolved`/`Unknown`, never silently to `pure`. `pylens validate` measures
-this invariant — see below. When you change the analyzer, run it and keep the corpus sound.
+(`pure`, a missing mutation, an unlisted raise) that a real execution can contradict. Anything
+the analyzer can't see through degrades to `unresolved`/`Unknown`, never silently to `pure`.
+`pylens validate` measures this invariant — when you change the analyzer, run it and keep the
+corpus sound.
 
 ## Two engines, one core
 
-- **`analyze` (static, pure Rust, no sandbox)** — the scale path: instant, parallel, no setup.
-- **`record` (dynamic, nsjail-jailed)** — the ground-truth path: expensive, proves the static
-  engine honest and supplies observed behavior.
+- **`analyze`** (static, pure Rust, no sandbox) — the scale path: instant, parallel, no setup.
+- **`record`** (dynamic, nsjail-jailed) — the ground-truth path: proves the static engine
+  honest and supplies observed behavior.
 
-`record` = `analyze` + the dynamic layer. There is one static core; the commands are not
-separate pipelines.
+`record` = `analyze` + the dynamic layer. One static core; the commands are not separate
+pipelines.
 
 ## The analyzer is a pass pipeline
 
-`analyze_module` (in `src/analyze/mod.rs`) runs an ordered list of passes over a shared
-`ModuleAnalysis` context, in this order:
+`analyze_module` (`src/analyze/mod.rs`) runs ordered passes over a shared `ModuleAnalysis`:
 
 **Imports → Declarations → Shapes → Effects → Interprocedural → TypeCheck → Purity**
 
 - **Imports** — import binding table.
-- **Declarations** — function/method symbol table (`DeclInfo`/`ReceiverKind`); the enabler for
-  interprocedural resolution.
-- **Shapes** — fixpoint inference of a recursive `Shape` for every param **and local**
-  (e.g. `matrix : Seq(Seq(Float))`), depth-capped. Runs before Effects so Effects reads final
-  shapes.
-- **Effects** — the single AST walk that builds each `EffectSignature`, delegating to the
+- **Declarations** — function/method symbol table; the enabler for call resolution.
+- **Shapes** — fixpoint inference of a recursive `Shape` (incl. unions) for every param and
+  local; runs before Effects so Effects reads final shapes.
+- **Effects** — the single AST walk building each `EffectSignature`, delegating to the
   `collect/` collectors (one traversal, not N).
-- **Interprocedural** — propagates effects of **locally-defined** callees to their callers
-  (fixpoint; handles recursion). Imports / unknown callees stay unresolved intra-file; in
-  **project mode**, calls to `project_local`-imported free functions are propagated across files
-  by `src/project/interproc.rs`.
-- **TypeCheck** — flags declared-vs-inferred mismatches, both return (`declared_return` vs.
-  `returns`) and param (`ParamInfo::declared` vs. `ParamInfo::shape`), into `type_mismatches`.
-  Advisory only — never affects the may-set or `Purity`.
+- **Interprocedural** — propagates locally-defined callees' effects to callers (fixpoint,
+  positional + keyword mapping; unpacked calls keep an acknowledged blind spot). Project mode
+  extends this across files (`src/project/interproc.rs`).
+- **TypeCheck** — flags declared-vs-inferred mismatches (return and param); advisory only.
 - **Purity** — derives `Purity` from the accumulated facts.
 
-Injection points (where to extend without a rewrite): the `Pass` trait (`pass.rs`) for new
-pipeline stages; the `collect/` collectors for the effect walk; `generate.rs` for input
-strategy; the `Sandbox` trait (`exec.rs`) for launchers; `report`/`stub`/`html` for output.
+Injection points: the `Pass` trait for pipeline stages; `collect/` for the effect walk;
+`generate.rs` for input strategy; the `Sandbox` trait for launchers; `report`/`stub`/`html`
+for output.
 
 ## Codemap
 
-- `src/lib.rs` — crate root: `analyze_source`, `imports_of`, `SCHEMA_VERSION`.
-- `src/main.rs` — CLI. `analyze`/`record`/`validate`; `--format json|summary|pyi|html`;
-  `--inputs N`; a **directory** arg triggers project mode, a file/stdin is single-file.
-- `src/parse.rs` — the ruff parser boundary. **All `ruff_*` usage is isolated here** (swappable).
-- `src/model/` — the data model split by responsibility:
-  - `shape.rs` — the recursive shape lattice: `Shape` enum, `is_zero`/`is_false` predicates,
-    `join`, `union_of`, `any_seq/any_map/any_set`, `same_constructor`, and custom Serialize/Deserialize impls. ~150 lines.
-  - `mod.rs` — all other types with their impls: `EffectSignature` (incl. `::new`), `ParamInfo`/
-    `ParamKind` (incl. `is_positional`), `Mutation`/`MutationTarget`, `Raises`, `ReturnKind`,
-    `Import` (incl. `::bindings`), `ModuleRef` (incl. `::parse`, `::is_empty`, `::dotted`),
-    `Purity`, `TypeMismatch`, `UnresolvedEffect`, `DefKind`, `ImportScope`, `ImportedName`,
-    `ImportUse`. Re-exports `Shape` and helpers. ~350 lines.
-- `src/analyze/`
-  - `mod.rs` — pipeline driver (`analyze_module`), `collect_imports`.
-  - `pass.rs` — the `Pass` trait. `context.rs` — `ModuleAnalysis` + `FunctionFacts`.
-  - `passes/imports.rs`, `passes/declarations.rs`, `passes/interprocedural.rs`,
-    `passes/type_check.rs`, `passes/purity.rs`.
-  - `passes/shapes/` — fixpoint shape inference: `mod.rs` (driver), `shape_of.rs`, `state.rs`,
-    `pinning.rs`.
-  - `passes/effects/` — the effect walk: `mod.rs` (walker + pass impl), `driver.rs` (pass entry),
-    `function_analysis.rs` (per-function), `finalization.rs` (signature completion),
-    `statements.rs` (statement walking), `targets.rs` (assignment/deletion targets),
-    `expressions.rs` (expression visiting), `calls.rs` (call sites), `argument_roots.rs`
-    (argument mapping roots, unpack detection, opaque-call targets), `helpers.rs` (guards/receivers),
-    plus sibling `setup.rs` (params/decorators), `dedup.rs`, `builtins.rs`.
-  - `collect/` — per-walk collectors: `aliases`, `mutations`, `exceptions`, `shapes`, `returns`,
-    `guards`.
-- `src/generate.rs` — shape-directed + **guard-guided** input generation (`gen_inputs`,
-  `GenInput`, recursive breadth-capped `candidates`); also `shrink_candidates` — strictly-smaller,
-  same-kind variants of one generated value, used by `shrink.rs` to minimize failing cases.
-- `src/exec.rs` — jailed execution: `Sandbox` trait, `Nsjail` (one process/call), `NsjailPool`
-  (fork-server), `probe()`, `CallResult`, `HarnessError` (`is_resource()` distinguishes resource
-  kills). **No unsandboxed launcher exists.**
-- `src/record.rs` — `record_file`/`record_with`: static sig + jailed cases; `ModuleRecord`,
-  `Case` (incl. `minimized: Option<MinimizedInput>`), before/after mutation diffing (incl. `self`
-  and kwargs). A `raised`-outcome case is re-executed via `shrink::shrink_case` on the same
-  `Sandbox` to attach a smaller same-exception-type input.
-- `src/shrink.rs` — `shrink_case`: greedy per-argument shrink loop over `generate::
-  shrink_candidates`, bounded by `SHRINK_BUDGET` extra jailed calls per case; a resource kill or
-  differing exception type rejects the candidate. Reporting aid only — never feeds `validate`.
-- `src/validate.rs` — the `observed ⊆ static` harness: `validate_function`, `Defect`, `Severity`
-  (Hard = the may-set claimed completeness yet missed an effect; Soft = explained by an
-  acknowledged unresolved).
-- `src/project.rs` + `src/project/resolve.rs` — multi-file mode: directory walk (via the `ignore`
-  crate — honors `.gitignore`/`.ignore` + a small explicit skip-list), parallel analyze, parallel
-  jailed record/validate (`record_files_parallel`: fixed worker threads each owning their own
-  `NsjailPool`, capped at `JAIL_WORKER_CAP`), aggregated project report (deterministic path order
-  via `build_report`'s sort regardless of completion order), project-local import resolution.
-- `src/report.rs` (terminal summary), `src/stub/` (`.pyi` stubs — `mod.rs` static rendering
-  including `Shape::Union`→PEP 604 and `type_mismatches` comments; `observed.rs` folds
-  dynamically observed types from `record` cases into an unresolved static param/return, driving
-  `record --format pyi`), `src/html/` (self-contained HTML: `mod.rs` + `rendering.rs` (core),
-  `escaping.rs` (HTML escaping), `summary.rs` (panels), `purity.rs`, `file_section.rs`,
-  `formatting.rs` (shape/mutation rendering), `function_card.rs`, `tests.rs`) — output formatters.
-- `python/worker.py` — the in-jail CPython harness: JSON-over-stdio; serialize-before/after for
-  mutation diffs; `--serve` fork-server (per-request `fork()` isolation).
-- `nsjail/pylens.nsjail.cfg` — the jail policy (namespaces + seccomp denylist + rlimits).
-- `scripts/provision-sandbox.sh` — builds nsjail and **deploys** `worker.py` + policy to
-  `$HOME/.local/share/pylens/`.
-- `tests/` — `analyze`/`imports`/`generate` are pure (always run); `pool`/`record`/`validate`/
-  `project` are **jail-gated** (skip when the sandbox isn't provisioned). `tests/fixtures/`.
+- `src/lib.rs` — crate root: `analyze_source`, `imports_of`, `SCHEMA_VERSION`, `strip_bom`.
+- `src/main.rs` — CLI; a directory arg triggers project mode, file/stdin is single-file.
+- `src/parse.rs` — the ruff parser boundary; all `ruff_*` usage is isolated here.
+- `src/model/` — the data model: `shape.rs` (the recursive `Shape` lattice: join, unions,
+  serde), `mod.rs` (everything else: `EffectSignature`, params, mutations, raises, imports,
+  `TypeMismatch`, `Purity`, …).
+- `src/analyze/` — `mod.rs` (pipeline driver), `pass.rs` (`Pass` trait), `context.rs` (shared
+  state), `passes/` (one file per pass; `shapes/` and `effects/` are split into submodules),
+  `collect/` (per-walk collectors: aliases, mutations, exceptions, shapes, returns, guards).
+- `src/generate.rs` — shape-directed, guard-guided input generation; shrink candidates.
+- `src/exec.rs` — jailed execution: `Sandbox` trait, `Nsjail`, `NsjailPool` fork-server.
+  **No unsandboxed launcher exists.**
+- `src/record.rs` — static signature + jailed cases (`ModuleRecord`/`Case`), before/after
+  mutation diffing.
+- `src/shrink.rs` — greedy input minimization for raised cases (reporting aid only).
+- `src/validate.rs` — the `observed ⊆ static` harness; `Defect` severity: Hard = may-set
+  claimed completeness yet missed an effect, Soft = covered by an acknowledged unresolved.
+- `src/project.rs` + `src/project/` — multi-file mode: `.gitignore`-honoring walk, parallel
+  analyze and jailed record, cross-file propagation (`interproc.rs`), import resolution
+  (`resolve.rs`).
+- `src/report.rs`, `src/stub/`, `src/html/` — output formatters: terminal summary, `.pyi`
+  stubs (incl. observed-type folding for `record --format pyi`), self-contained HTML.
+- `python/worker.py` — the in-jail CPython harness: JSON-over-stdio; `--serve` fork-server.
+- `nsjail/pylens.nsjail.cfg` — the jail policy. `scripts/provision-sandbox.sh` — builds
+  nsjail and **deploys** worker + policy to `$HOME/.local/share/pylens/`.
+- `tests/` — `analyze`/`imports`/`generate` are pure (always run); `pool`/`record`/
+  `validate`/`project` are jail-gated (skip when the sandbox isn't provisioned).
 
 ## Commands
 
@@ -124,40 +83,37 @@ cargo test                          # jail-gated tests skip if sandbox absent
 cargo clippy --all-targets -- -D warnings
 
 pylens analyze  <file.py|dir> [--format json|summary|pyi|html]
-pylens record   <file.py|dir> [--inputs N] [--format json|summary|html]   # runs the jail
-pylens validate <file.py|dir> [--inputs N] [--format json|summary|html]   # exits non-zero on hard defects
+pylens record   <file.py|dir> [--inputs N] [--format json|summary|pyi|html]  # runs the jail; pyi single-file only
+pylens validate <file.py|dir> [--inputs N] [--format json|summary|html]      # exits non-zero on hard defects
 ```
 
 ## Sandbox (read before touching `record`/`worker.py`)
 
 Every Python execution is nsjail-jailed on a Linux kernel — native on Linux, **via WSL2 on
-Windows** (`wsl -d <distro> -- nsjail …`). One-time setup:
-`bash scripts/provision-sandbox.sh` (on Windows, run it inside WSL).
+Windows**. One-time setup: `bash scripts/provision-sandbox.sh` (on Windows, inside WSL).
 
-**Gotcha that bites everyone:** the jail runs a **deployed copy** of `python/worker.py` at
-`$HOME/.local/share/pylens/worker.py` inside the distro. Editing the repo copy does **not**
-update the jail — re-run the provision script, or redeploy:
-`wsl -d Ubuntu -- install -m 0644 /mnt/c/Projects/ai/pylens/python/worker.py "$HOME/.local/share/pylens/worker.py"`.
-Otherwise jail-gated tests run against the stale worker.
+**Gotcha that bites everyone:** the jail runs the **deployed copy** of `python/worker.py`, not
+the repo file. After editing it, re-run the provision script (or redeploy with
+`wsl -d Ubuntu -- install -m 0644 /mnt/c/Projects/ai/pylens/python/worker.py "$HOME/.local/share/pylens/worker.py"`),
+or jail-gated tests run against the stale worker.
 
 ## Conventions
 
-- **May-set semantics, soundness first.** Over-approximation (predicted-but-never-observed) is
-  tolerated and kept low; under-approximation (observed-but-not-predicted) is a bug — a **hard
-  defect** in `pylens validate`. The full example corpus (`examples/*.py`) is kept at zero hard
-  defects; `tests/validate.rs` and `tests/project.rs` enforce it — don't weaken either to hide
-  new findings; report them.
+- **May-set semantics, soundness first.** Over-approximation is tolerated and kept low;
+  under-approximation is a bug — a **hard defect** in `pylens validate`. The `examples/`
+  corpus stays at zero hard defects, enforced by `tests/validate.rs` and `tests/project.rs` —
+  don't weaken them to hide new findings; report them.
 - **Greenfield.** No backwards-compat baggage, no dead code, no "previous approach" comments.
 - Considering a `SCHEMA_VERSION` bump? Read the schema-versioning note in `DESIGN.md` first.
-- **Rust edition 2024.** ruff is pinned to a fixed rev in `Cargo.toml` (reproducible builds).
+- **Rust edition 2024.** ruff is pinned to a fixed rev in `Cargo.toml`.
 - Doc-comment each pass/collector/module with its single responsibility.
-- Resource kills (`MemoryError`/`RecursionError`/timeout) are `outcome:"error"`,
-  `error.stage:"resource"` — never conflated with a semantic `raised`.
+- Resource kills (OOM/recursion/timeout) are `outcome:"error"`, `error.stage:"resource"` —
+  never conflated with a semantic `raised`.
 
 ## Extending
 
-- **New analysis** → a collector under `collect/` invoked from the Effects walk, or a new `Pass`
-  in the pipeline (insert in `analyze/mod.rs`). Keep the single-traversal design.
+- **New analysis** → a collector under `collect/`, or a new `Pass` (insert in
+  `analyze/mod.rs`). Keep the single-traversal design.
 - **New output** → a formatter module (mirror `report`/`stub`/`html`) + a `--format` value.
 - **New implicit exception / shape rule** → the relevant collector; then run `pylens validate`
-  over the corpus to confirm you didn't open (or that you closed) a soundness gap.
+  over the corpus to confirm the soundness gap is closed, not opened.
