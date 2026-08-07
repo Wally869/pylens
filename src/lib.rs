@@ -18,6 +18,15 @@ pub mod validate;
 /// Downstream adapters key off this to detect breaking schema changes.
 pub const SCHEMA_VERSION: &str = "1.2";
 
+/// Strip a leading UTF-8 byte-order mark from Python source. CPython accepts BOM-prefixed
+/// source files, so pylens must too — but a U+FEFF reaching `compile()` as text (in the jailed
+/// worker) is a `SyntaxError`, and it is invisible noise to the parser besides. Applied at
+/// every source-ingestion point (file read, stdin) so the analyzer and the jail always see
+/// identical, BOM-less source.
+pub fn strip_bom(src: &str) -> &str {
+    src.strip_prefix('\u{feff}').unwrap_or(src)
+}
+
 /// Parse Python source and return the effect signature of every top-level function and
 /// method.
 pub fn analyze_source(

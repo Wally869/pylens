@@ -179,6 +179,21 @@ fn analyze_project_keeps_call_import_acknowledgment_for_unpacked_cross_file_call
 }
 
 #[test]
+fn analyze_project_strips_utf8_bom_and_analyzes_the_file() {
+    // CPython accepts BOM-prefixed source; pylens must too. Before the strip, a BOM'd file
+    // reached the jail as text with a leading U+FEFF and silently produced zero observations.
+    let report = analyze_project(Path::new("tests/fixtures/bom"));
+    assert_eq!(report["summary"]["errors"], 0, "BOM'd file must not be an error entry");
+    let files = report["files"].as_array().expect("files array");
+    let f = files.iter().find(|f| f["path"] == "bommed.py").expect("bommed.py entry");
+    let functions = f["functions"].as_array().expect("functions array");
+    assert!(
+        functions.iter().any(|f| f["name"] == "touch"),
+        "expected touch to be analyzed, got {functions:?}"
+    );
+}
+
+#[test]
 fn analyze_project_cross_file_recursion_terminates() {
     let report = analyze_project(Path::new("tests/fixtures/xfile_recursive"));
     let files = report["files"].as_array().expect("files array");

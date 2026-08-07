@@ -72,6 +72,9 @@ struct FileEntry {
     hard_defects: usize,
     soft_defects: usize,
     functions_checked: usize,
+    /// Functions that never executed (`uncallable`: module didn't load, constructor failed) —
+    /// validate observed nothing for them, so their zero defects must not read as "validated".
+    uncallable: usize,
     ok: bool,
 }
 
@@ -83,6 +86,7 @@ fn error_entry(path: String, message: String) -> FileEntry {
         hard_defects: 0,
         soft_defects: 0,
         functions_checked: 0,
+        uncallable: 0,
         ok: false,
     }
 }
@@ -98,6 +102,7 @@ fn build_report(root: &Path, mut entries: Vec<FileEntry>, include_defects: bool)
     let mut hard_total = 0usize;
     let mut soft_total = 0usize;
     let mut checked_total = 0usize;
+    let mut uncallable_total = 0usize;
     for e in &entries {
         functions += e.purities.len();
         for p in &e.purities {
@@ -110,6 +115,7 @@ fn build_report(root: &Path, mut entries: Vec<FileEntry>, include_defects: bool)
         hard_total += e.hard_defects;
         soft_total += e.soft_defects;
         checked_total += e.functions_checked;
+        uncallable_total += e.uncallable;
     }
 
     let mut summary = serde_json::json!({
@@ -123,6 +129,7 @@ fn build_report(root: &Path, mut entries: Vec<FileEntry>, include_defects: bool)
         summary["hard_defects"] = serde_json::json!(hard_total);
         summary["soft_defects"] = serde_json::json!(soft_total);
         summary["functions_checked"] = serde_json::json!(checked_total);
+        summary["uncallable"] = serde_json::json!(uncallable_total);
     }
 
     let files_json: Vec<Value> = entries.into_iter().map(|e| e.json).collect();
@@ -235,7 +242,7 @@ struct AnalyzedFile {
 fn analyze_file_raw(root: &Path, path: &Path) -> Result<AnalyzedFile, FileEntry> {
     let rel = relative_path(root, path);
     let src = match std::fs::read_to_string(path) {
-        Ok(s) => s,
+        Ok(s) => crate::strip_bom(&s).to_string(),
         Err(e) => return Err(error_entry(rel, format!("read error: {e}"))),
     };
     let parsed = match crate::parse::parse_source(&src) {
@@ -316,6 +323,7 @@ fn build_analyze_entry(ef: EnrichedFile, index: &ModuleIndex) -> FileEntry {
         hard_defects: 0,
         soft_defects: 0,
         functions_checked: 0,
+        uncallable: 0,
         ok: true,
     }
 }
@@ -356,6 +364,7 @@ fn record_file_entry(sandbox: &dyn Sandbox, index: &ModuleIndex, ef: EnrichedFil
                 hard_defects: 0,
                 soft_defects: 0,
                 functions_checked: 0,
+                uncallable: 0,
                 ok: true,
             }
         }
@@ -407,6 +416,7 @@ fn validate_file_entry(sandbox: &dyn Sandbox, ef: EnrichedFile, max_inputs: usiz
         .collect();
     let purities = record.functions.iter().map(|f| f.signature.purity).collect();
     let functions_checked = record.functions.len();
+    let uncallable = record.functions.iter().filter(|f| f.uncallable.is_some()).count();
     let json = serde_json::json!({
         "path": path,
         "functions": functions_json,
@@ -414,6 +424,7 @@ fn validate_file_entry(sandbox: &dyn Sandbox, ef: EnrichedFile, max_inputs: usiz
             "hard_defects": hard_total,
             "soft_defects": soft_total,
             "functions_checked": functions_checked,
+            "uncallable": uncallable,
         }
     });
     FileEntry {
@@ -423,6 +434,7 @@ fn validate_file_entry(sandbox: &dyn Sandbox, ef: EnrichedFile, max_inputs: usiz
         hard_defects: hard_total,
         soft_defects: soft_total,
         functions_checked,
+        uncallable,
         ok: true,
     }
 }

@@ -115,7 +115,7 @@ fn analyze_project_pyi(root: &std::path::Path) -> String {
             .replace('\\', "/");
         out.push_str(&format!("# {rel}\n"));
         let src = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
+            Ok(s) => pylens::strip_bom(&s).to_string(),
             Err(e) => {
                 out.push_str(&format!("# read error: {e}\n\n"));
                 continue;
@@ -242,9 +242,17 @@ fn cmd_validate(args: &[String]) {
                 defects,
             })
             .collect();
+        let uncallable = record.functions.iter().filter(|f| f.uncallable.is_some()).count();
         print!(
             "{}",
-            report::validate_summary(&path, record.functions.len(), hard_total, soft_total, &results)
+            report::validate_summary(
+                &path,
+                record.functions.len(),
+                uncallable,
+                hard_total,
+                soft_total,
+                &results
+            )
         );
     } else {
         let functions: Vec<serde_json::Value> = per_function
@@ -343,7 +351,9 @@ fn positional(args: &[String]) -> Option<&String> {
 }
 
 fn read_file(path: &str) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|e| fail(&format!("error reading {path}: {e}")))
+    let src =
+        std::fs::read_to_string(path).unwrap_or_else(|e| fail(&format!("error reading {path}: {e}")));
+    pylens::strip_bom(&src).to_string()
 }
 
 fn read_stdin() -> String {
@@ -351,7 +361,7 @@ fn read_stdin() -> String {
     if let Err(e) = std::io::stdin().read_to_string(&mut s) {
         fail(&format!("error reading stdin: {e}"));
     }
-    s
+    pylens::strip_bom(&s).to_string()
 }
 
 fn fail(msg: &str) -> ! {

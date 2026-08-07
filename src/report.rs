@@ -131,10 +131,13 @@ pub struct FunctionValidation<'a> {
 }
 
 /// Render the `validate` result: per function with any defects, hard/soft counts and one line
-/// per defect, then the overall summary with the hard-defect total made prominent.
+/// per defect, then the overall summary with the hard-defect total made prominent. Uncallable
+/// functions (module didn't load, constructor failed) produced no observations at all — their
+/// "0 defects" is vacuous, so the count is surfaced rather than letting them pass silently.
 pub fn validate_summary(
     file: &str,
     functions_checked: usize,
+    uncallable: usize,
     hard_total: usize,
     soft_total: usize,
     results: &[FunctionValidation],
@@ -143,6 +146,11 @@ pub fn validate_summary(
         "{file}: HARD DEFECTS: {hard_total} — {functions_checked} function(s) checked, \
          {soft_total} soft defect(s)\n"
     );
+    if uncallable > 0 {
+        out.push_str(&format!(
+            "  WARNING: {uncallable} function(s) uncallable — never executed, nothing validated\n"
+        ));
+    }
     for r in results {
         if r.defects.is_empty() {
             continue;
@@ -191,6 +199,12 @@ pub fn project_summary(report: &Value) -> String {
         out.push_str(&format!(
             "  HARD DEFECTS: {hard} — {checked} function(s) checked, {soft} soft defect(s)\n"
         ));
+        let uncallable = summary["uncallable"].as_u64().unwrap_or(0);
+        if uncallable > 0 {
+            out.push_str(&format!(
+                "  WARNING: {uncallable} function(s) uncallable — never executed, nothing validated\n"
+            ));
+        }
     }
     if let Some(files) = report["files"].as_array() {
         for f in files {
