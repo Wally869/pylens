@@ -3,26 +3,26 @@
 Current state: the analyzer, jailed recorder, `observed ⊆ static` validation harness, multi-file
 mode (parallel analyze **and** parallel jailed record), cross-file effect propagation with
 keyword-argument mapping, `Shape` unions / param-annotation mismatch / observed-type-folding
-`.pyi` output, input minimization for raised cases, and the CLI are in place. `cargo test` is
-green (jail-gated ones skip when the sandbox isn't provisioned) and
+`.pyi` output, and input minimization for raised cases are in place. `cargo test` is green
+(jail-gated ones skip when the sandbox isn't provisioned) and
 `cargo clippy --all-targets -- -D warnings` is clean. See `CLAUDE.md` for the architecture and
 codemap. The whole `examples/` corpus is at zero hard defects; `tests/validate.rs` and
 `tests/project.rs` assert that — keep it there. JSON contract is at `SCHEMA_VERSION = "1.2"`.
 
+Recently closed (kept here one handover-cycle for context):
+
+- **Unpacked call arguments** (`f(*xs)` / `f(**kw)`) at resolved call sites were a real
+  soundness hole (a resolved callee's effect through an unpacked arg was silently dropped —
+  reproducible hard defects). Now: positional mapping stops at the first `*`-unpack, every
+  unpacked call gets an implicit `TypeError` (the unpack operation itself can raise it) plus a
+  `call_unpacked_args` acknowledgment carrying the unpacked roots, and cross-file resolution
+  keeps the `call_import` acknowledgment for unpacked sites (`ImportCallSite::has_unpack`).
+- Opaque-call `may_affect` now scans keyword arguments and unpacked roots, not just positional.
+- `bool` ⊆ `int` ⊆ `float` (PEP 484 numeric tower) accepted by the TypeCheck advisory checks.
+- UTF-8 BOM is stripped at every source-ingestion point (a BOM'd file used to reach the jailed
+  worker's `compile()` as text and silently record zero cases); `validate` summaries now also
+  surface uncallable-function counts instead of letting vacuous passes read as validated.
+
 ## Feature follow-ups
 
-- **`**kwargs`-unpacking call arguments** (`f(**extra)`) are not mapped by either
-  interprocedural propagator — no single name to key by, consistent with `*args`-unpacking
-  being unmapped on the positional side. Sound (nothing is claimed about a real root), just
-  imprecise.
-- **Opaque-call `may_affect` scanning** (`call_unknown_callee`/`call_import` on genuinely
-  unresolved callees) only scans positional args, not keywords. Sound today because those
-  unresolved effects acknowledge incompleteness; extending it would tighten the may-set.
-- **`bool` vs `int` advisory asymmetry**: the TypeCheck param/return mismatch checks treat a
-  declared `int` as excluding an inferred `bool` (Python's `bool` is an `int` subtype), which
-  can produce a noisy advisory `TypeMismatch`. Advisory-only, never touches the may-set.
-
-## Minor / hygiene
-
-- `src/model.rs` sits just over the ~500-line soft budget (~547) after the `Union` growth. A
-  cohesive split (e.g. shape vs signature halves) is fine when convenient; no `part_N`.
+None currently tracked.

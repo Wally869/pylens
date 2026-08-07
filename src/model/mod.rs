@@ -1,12 +1,9 @@
-//! Effect-signature data model. Parser-independent and serde-serializable.
-//!
-//! Uses **may-set** (over-approximation) semantics: the static sets should be a superset of
-//! whatever any execution actually does, so the soundness invariant `observed ⊆ static`
-//! holds. See DESIGN.md.
+use serde::{Deserialize, Serialize};
 
-use serde::de::{self, MapAccess, Visitor};
-use serde::ser::SerializeMap;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+/// The recursive shape lattice: usage-inferred shapes for parameter generation.
+/// All type definitions, impl blocks, and serialization logic are in [`shape`].
+pub mod shape;
+pub use shape::{Shape, is_zero, is_false, same_constructor};
 
 /// Whether the analyzed definition is a free function or a method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,13 +129,6 @@ pub enum Purity {
     Unknown,
 }
 
-fn is_zero(n: &u32) -> bool {
-    *n == 0
-}
-fn is_false(b: &bool) -> bool {
-    !*b
-}
-
 /// A name pulled in by `from module import name [as alias]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportedName {
@@ -157,35 +147,6 @@ pub struct ModuleRef {
     pub package: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
-}
-
-impl ModuleRef {
-    /// Split a dotted module string at its first component.
-    pub fn parse(dotted: &str) -> Self {
-        match dotted.split_once('.') {
-            Some((package, path)) => ModuleRef {
-                package: package.to_string(),
-                path: path.to_string(),
-            },
-            None => ModuleRef {
-                package: dotted.to_string(),
-                path: String::new(),
-            },
-        }
-    }
-
-    /// Reconstruct the dotted module string (for probing/display; not serialized).
-    pub fn dotted(&self) -> String {
-        if self.path.is_empty() {
-            self.package.clone()
-        } else {
-            format!("{}.{}", self.package, self.path)
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.package.is_empty() && self.path.is_empty()
-    }
 }
 
 /// Where an import statement lives — which decides *when* it executes.
@@ -223,26 +184,6 @@ pub struct Import {
     pub scope: ImportScope,
 }
 
-impl Import {
-    /// The names this import introduces into the enclosing namespace. Empty for
-    /// `from m import *` (a wildcard — any free name might come from it; see `star`).
-    pub fn bindings(&self) -> Vec<String> {
-        if self.star {
-            Vec::new()
-        } else if self.from {
-            self.names
-                .iter()
-                .map(|n| n.alias.clone().unwrap_or_else(|| n.name.clone()))
-                .collect()
-        } else if let Some(alias) = &self.alias {
-            vec![alias.clone()]
-        } else {
-            // `import a.b.c` binds the top-level package name `a`.
-            vec![self.module.package.clone()]
-        }
-    }
-}
-
 /// A reference from a function to an import it uses: the bound name as referenced in the body,
 /// plus the module that name resolves to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,229 +192,6 @@ pub struct ImportUse {
     pub module: ModuleRef,
 }
 
-/// A usage-inferred shape for a parameter, used to direct input generation. Inferred from how
-/// the parameter is used in the body (not from annotations). Recursive: a container shape
-/// carries the shape of its elements/keys/values, which in turn may be `Any` (unknown) or
-/// another container. Scalars serialize as a lowercase string (e.g. `"int"`, `"any"`);
-/// containers serialize as a tagged object (`{"seq": <elem>}`, `{"map": {"key": ..., "value":
-/// ...}}`, `{"set": <elem>}`).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Shape {
-    Int,
-    Float,
-    Bool,
-    Str,
-    Bytes,
-    None,
-    /// list/tuple-like: indexed, iterated, `len()`-ed, or list-mutated. Carries the element
-    /// shape.
-    Seq(Box<Shape>),
-    /// dict-like: `.keys`/`.get`/`.items`/`.update`. Carries the key and value shapes.
-    Map(Box<Shape>, Box<Shape>),
-    /// Carries the element shape.
-    Set(Box<Shape>),
-    /// No discriminating usage observed.
-    Any,
-    /// Two or more disjoint shapes observed on different paths (e.g. a param compared as `Int`
-    /// on one branch and `Str` on another; a return that's `Int` or `None`). Sorted and
-    /// deduplicated (canonical form, so `Shape` equality/hashing stays structural) and bounded to
-    /// [`Shape::UNION_WIDTH_CAP`] members — a union that would exceed the cap collapses to `Any`
-    /// instead, same as the pre-union behavior. `Optional` has no separate variant: it's a
-    /// `Union` containing `Shape::None`. Never nested — members are never themselves `Union` (see
-    /// `Shape::union_of`, which flattens on construction).
-    Union(Vec<Shape>),
-}
-
-impl Shape {
-    /// `Seq(Any)` — a sequence with no discriminating element usage observed.
-    pub fn any_seq() -> Self {
-        Shape::Seq(Box::new(Shape::Any))
-    }
-
-    /// `Map(Any, Any)` — a mapping with no discriminating key/value usage observed.
-    pub fn any_map() -> Self {
-        Shape::Map(Box::new(Shape::Any), Box::new(Shape::Any))
-    }
-
-    /// `Set(Any)` — a set with no discriminating element usage observed.
-    pub fn any_set() -> Self {
-        Shape::Set(Box::new(Shape::Any))
-    }
-
-    /// Maximum number of distinct members a `Union` may carry; a wider union collapses to `Any`.
-    /// See the `Union` variant doc.
-    pub const UNION_WIDTH_CAP: usize = 4;
-
-    /// Merge two pieces of shape evidence for the same root. Matching constructors recurse into
-    /// their children; `Any` defers to the other side; conflicting constructors (e.g. `Int` vs
-    /// `Seq`) combine into a `Union` (see [`Shape::union_of`]) rather than collapsing straight to
-    /// `Any`, preserving the disjoint evidence up to the width cap.
-    pub fn join(a: Shape, b: Shape) -> Shape {
-        match (a, b) {
-            (Shape::Any, other) | (other, Shape::Any) => other,
-            (Shape::Seq(e1), Shape::Seq(e2)) => Shape::Seq(Box::new(Shape::join(*e1, *e2))),
-            (Shape::Set(e1), Shape::Set(e2)) => Shape::Set(Box::new(Shape::join(*e1, *e2))),
-            (Shape::Map(k1, v1), Shape::Map(k2, v2)) => Shape::Map(
-                Box::new(Shape::join(*k1, *k2)),
-                Box::new(Shape::join(*v1, *v2)),
-            ),
-            (a, b) if a == b => a,
-            (a, b) => Shape::union_of([a, b]),
-        }
-    }
-
-    /// Build a (possibly single-member) shape out of a flat set of shape members: flattens any
-    /// nested `Union`s, merges members that share a top-level constructor (via [`Shape::join`],
-    /// which recurses structurally for matching constructors), sorts + dedups the rest into
-    /// canonical order, and collapses to `Any` if the result would exceed
-    /// [`Shape::UNION_WIDTH_CAP`] or contains `Any` itself (an unresolved member subsumes the
-    /// whole union — soundness requires the union be at least as broad as `Any`).
-    pub fn union_of(members: impl IntoIterator<Item = Shape>) -> Shape {
-        let mut flat = Vec::new();
-        for m in members {
-            match m {
-                Shape::Union(inner) => flat.extend(inner),
-                other => flat.push(other),
-            }
-        }
-        if flat.iter().any(|s| matches!(s, Shape::Any)) {
-            return Shape::Any;
-        }
-        let mut merged: Vec<Shape> = Vec::new();
-        'outer: for m in flat {
-            for existing in merged.iter_mut() {
-                if same_constructor(existing, &m) {
-                    *existing = Shape::join(existing.clone(), m);
-                    continue 'outer;
-                }
-            }
-            merged.push(m);
-        }
-        match merged.len() {
-            0 => Shape::Any,
-            1 => merged.into_iter().next().expect("len checked"),
-            _ if merged.len() > Shape::UNION_WIDTH_CAP => Shape::Any,
-            _ => {
-                merged.sort();
-                Shape::Union(merged)
-            }
-        }
-    }
-}
-
-/// Whether `a` and `b` share the same top-level shape constructor (used by [`Shape::union_of`]
-/// to decide whether two members should be merged via [`Shape::join`] instead of kept as
-/// separate union members).
-fn same_constructor(a: &Shape, b: &Shape) -> bool {
-    matches!(
-        (a, b),
-        (Shape::Int, Shape::Int)
-            | (Shape::Float, Shape::Float)
-            | (Shape::Bool, Shape::Bool)
-            | (Shape::Str, Shape::Str)
-            | (Shape::Bytes, Shape::Bytes)
-            | (Shape::None, Shape::None)
-            | (Shape::Seq(_), Shape::Seq(_))
-            | (Shape::Map(..), Shape::Map(..))
-            | (Shape::Set(_), Shape::Set(_))
-    )
-}
-
-/// Scalars serialize as a lowercase tag string; containers serialize as a single-key tagged
-/// object (`{"seq": <elem>}`, `{"set": <elem>}`, `{"map": {"key": ..., "value": ...}}`).
-impl Serialize for Shape {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Shape::Int => serializer.serialize_str("int"),
-            Shape::Float => serializer.serialize_str("float"),
-            Shape::Bool => serializer.serialize_str("bool"),
-            Shape::Str => serializer.serialize_str("str"),
-            Shape::Bytes => serializer.serialize_str("bytes"),
-            Shape::None => serializer.serialize_str("none"),
-            Shape::Any => serializer.serialize_str("any"),
-            Shape::Seq(elem) => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("seq", elem)?;
-                map.end()
-            }
-            Shape::Set(elem) => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("set", elem)?;
-                map.end()
-            }
-            Shape::Map(key, value) => {
-                #[derive(Serialize)]
-                struct MapFields<'a> {
-                    key: &'a Shape,
-                    value: &'a Shape,
-                }
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("map", &MapFields { key, value })?;
-                map.end()
-            }
-            Shape::Union(members) => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("union", members)?;
-                map.end()
-            }
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for Shape {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct ShapeVisitor;
-
-        impl<'de> Visitor<'de> for ShapeVisitor {
-            type Value = Shape;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a shape tag string or a tagged shape object")
-            }
-
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<Shape, E> {
-                match v {
-                    "int" => Ok(Shape::Int),
-                    "float" => Ok(Shape::Float),
-                    "bool" => Ok(Shape::Bool),
-                    "str" => Ok(Shape::Str),
-                    "bytes" => Ok(Shape::Bytes),
-                    "none" => Ok(Shape::None),
-                    "any" => Ok(Shape::Any),
-                    other => Err(de::Error::unknown_variant(
-                        other,
-                        &["int", "float", "bool", "str", "bytes", "none", "any"],
-                    )),
-                }
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Shape, A::Error> {
-                let tag: String = map
-                    .next_key()?
-                    .ok_or_else(|| de::Error::custom("expected a shape tag key"))?;
-                match tag.as_str() {
-                    "seq" => Ok(Shape::Seq(Box::new(map.next_value()?))),
-                    "set" => Ok(Shape::Set(Box::new(map.next_value()?))),
-                    "map" => {
-                        #[derive(Deserialize)]
-                        struct MapFields {
-                            key: Shape,
-                            value: Shape,
-                        }
-                        let fields: MapFields = map.next_value()?;
-                        Ok(Shape::Map(Box::new(fields.key), Box::new(fields.value)))
-                    }
-                    // Re-canonicalize: external JSON may carry a nested / unsorted /
-                    // over-cap union that `union_of` would never construct.
-                    "union" => Ok(Shape::union_of(map.next_value::<Vec<Shape>>()?)),
-                    other => Err(de::Error::unknown_variant(other, &["seq", "set", "map", "union"])),
-                }
-            }
-        }
-
-        deserializer.deserialize_any(ShapeVisitor)
-    }
-}
 
 /// Whether a parameter binds one positional/keyword argument, or collects a variable number of
 /// them (`*args` / `**kwargs`). A var-positional/var-keyword parameter never receives a single
@@ -490,10 +208,6 @@ pub enum ParamKind {
     VarPositional,
     /// `**kwargs`.
     VarKeyword,
-}
-
-fn is_positional(k: &ParamKind) -> bool {
-    matches!(k, ParamKind::Positional)
 }
 
 /// A parameter and its inferred shape.
@@ -559,6 +273,62 @@ pub struct EffectSignature {
     /// declared annotation and the inferred may-set are fully disjoint.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub type_mismatches: Vec<TypeMismatch>,
+}
+
+
+/// Serde helper: checks if a ParamKind is Positional.
+fn is_positional(k: &ParamKind) -> bool {
+    matches!(k, ParamKind::Positional)
+}
+
+impl ModuleRef {
+    /// Split a dotted module string at its first component.
+    pub fn parse(dotted: &str) -> Self {
+        match dotted.split_once('.') {
+            Some((package, path)) => ModuleRef {
+                package: package.to_string(),
+                path: path.to_string(),
+            },
+            None => ModuleRef {
+                package: dotted.to_string(),
+                path: String::new(),
+            },
+        }
+    }
+
+    /// Whether both package and path are empty.
+    pub fn is_empty(&self) -> bool {
+        self.package.is_empty() && self.path.is_empty()
+    }
+
+    /// Reconstruct the dotted module string (for probing/display; not serialized).
+    pub fn dotted(&self) -> String {
+        if self.path.is_empty() {
+            self.package.clone()
+        } else {
+            format!("{}.{}", self.package, self.path)
+        }
+    }
+}
+
+impl Import {
+    /// The names this import introduces into the enclosing namespace. Empty for
+    /// `from m import *` (a wildcard — any free name might come from it; see `star`).
+    pub fn bindings(&self) -> Vec<String> {
+        if self.star {
+            Vec::new()
+        } else if self.from {
+            self.names
+                .iter()
+                .map(|n| n.alias.clone().unwrap_or_else(|| n.name.clone()))
+                .collect()
+        } else if let Some(alias) = &self.alias {
+            vec![alias.clone()]
+        } else {
+            // `import a.b.c` binds the top-level package name `a`.
+            vec![self.module.package.clone()]
+        }
+    }
 }
 
 impl EffectSignature {

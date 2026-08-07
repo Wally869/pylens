@@ -58,12 +58,14 @@ strategy; the `Sandbox` trait (`exec.rs`) for launchers; `report`/`stub`/`html` 
 - `src/main.rs` — CLI. `analyze`/`record`/`validate`; `--format json|summary|pyi|html`;
   `--inputs N`; a **directory** arg triggers project mode, a file/stdin is single-file.
 - `src/parse.rs` — the ruff parser boundary. **All `ruff_*` usage is isolated here** (swappable).
-- `src/model.rs` — the data model: `EffectSignature`, recursive `Shape` (incl. `Union` — sorted,
-  deduped, width-capped at `Shape::UNION_WIDTH_CAP`; `Optional[X]` is `Union(X, None)`),
-  `ParamInfo`/`ParamKind` (Positional/VarPositional/VarKeyword/KeywordOnly), `Mutation`/
-  `MutationTarget`, `Raises` (explicit/implicit), `ReturnKind`, `Import`/`ModuleRef`, `Purity`,
-  `TypeMismatch` (`kind` "return"|"param", carries `param`/`inferred_shape` for the latter),
-  `UnresolvedEffect`.
+- `src/model/` — the data model split by responsibility:
+  - `shape.rs` — the recursive shape lattice: `Shape` enum, `is_zero`/`is_false` predicates,
+    `join`, `union_of`, `any_seq/any_map/any_set`, `same_constructor`, and custom Serialize/Deserialize impls. ~150 lines.
+  - `mod.rs` — all other types with their impls: `EffectSignature` (incl. `::new`), `ParamInfo`/
+    `ParamKind` (incl. `is_positional`), `Mutation`/`MutationTarget`, `Raises`, `ReturnKind`,
+    `Import` (incl. `::bindings`), `ModuleRef` (incl. `::parse`, `::is_empty`, `::dotted`),
+    `Purity`, `TypeMismatch`, `UnresolvedEffect`, `DefKind`, `ImportScope`, `ImportedName`,
+    `ImportUse`. Re-exports `Shape` and helpers. ~350 lines.
 - `src/analyze/`
   - `mod.rs` — pipeline driver (`analyze_module`), `collect_imports`.
   - `pass.rs` — the `Pass` trait. `context.rs` — `ModuleAnalysis` + `FunctionFacts`.
