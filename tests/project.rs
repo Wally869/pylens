@@ -133,6 +133,27 @@ fn analyze_project_propagates_cross_file_mutation_onto_the_caller() {
 }
 
 #[test]
+fn analyze_project_propagates_cross_file_mutation_via_keyword_arg_onto_the_caller() {
+    let report = analyze_project(Path::new("tests/fixtures/xfile_kwargs"));
+    let files = report["files"].as_array().expect("files array");
+    let main = files.iter().find(|f| f["path"] == "main.py").expect("main.py entry");
+    let functions = main["functions"].as_array().expect("functions array");
+
+    let caller = functions.iter().find(|f| f["name"] == "caller").expect("caller function");
+    assert_ne!(caller["purity"], "unknown");
+    let mutations = caller["mutations"].as_array().expect("mutations array");
+    assert!(
+        mutations.iter().any(|m| m["target"]["root"] == "param" && m["target"]["name"] == "data"),
+        "expected caller to show a propagated mutation on `data`, got {mutations:?}"
+    );
+    let unresolved = caller["unresolved_effects"].as_array().expect("unresolved_effects array");
+    assert!(
+        !unresolved.iter().any(|u| u["reason"] == "call_import" && u["callee"] == "touch"),
+        "expected no call_import unresolved effect for touch, got {unresolved:?}"
+    );
+}
+
+#[test]
 fn analyze_project_cross_file_recursion_terminates() {
     let report = analyze_project(Path::new("tests/fixtures/xfile_recursive"));
     let files = report["files"].as_array().expect("files array");

@@ -6,10 +6,14 @@
 //!
 //! ## Mapping rules
 //!
-//! - A callee mutation on a positional parameter maps onto the caller-side root passed at the
-//!   same position (dropped — not attributed to any caller root — if the caller didn't pass a
-//!   trackable root there, or the callee parameter isn't positional; sound, since the may-set
-//!   only grows and an unmapped root has nothing to over-approximate onto).
+//! - A callee mutation on a parameter maps onto the caller-side root passed for that parameter:
+//!   by position if the caller passed it positionally (matched against the callee's `Positional`
+//!   parameters only), by name if the caller passed it as a keyword (matched against the
+//!   callee's `Positional` or `KeywordOnly` parameters by name). Dropped — not attributed to any
+//!   caller root — if the caller didn't pass a trackable root there, the parameter isn't
+//!   `Positional`/`KeywordOnly`, or the keyword names no declared parameter (swallowed by the
+//!   callee's own `**kwargs`); sound, since the may-set only grows and an unmapped root has
+//!   nothing to over-approximate onto.
 //! - A callee `SelfAttr` mutation propagates unchanged when the call was `self.method(...)` /
 //!   `cls.method(...)` on the caller's own receiver — same underlying object.
 //! - A callee `Global` mutation propagates unchanged (a module-global name is absolute, not
@@ -77,7 +81,13 @@ fn apply_call_site(ctx: &mut ModuleAnalysis, caller: usize, site: &CallSite) -> 
         .mutations
         .iter()
         .filter_map(|m| {
-            let target = remap_target(&m.target, &callee_positional, &site.arg_roots, site.via_self)?;
+            let target = remap_target(
+                &m.target,
+                &callee_positional,
+                &site.arg_roots,
+                &site.kwarg_roots,
+                site.via_self,
+            )?;
             Some(Mutation { target, via: m.via, name: m.name.clone() })
         })
         .collect();
@@ -99,7 +109,7 @@ fn apply_call_site(ctx: &mut ModuleAnalysis, caller: usize, site: &CallSite) -> 
                 .may_affect
                 .iter()
                 .map(|t| {
-                    remap_target(t, &callee_positional, &site.arg_roots, site.via_self)
+                    remap_target(t, &callee_positional, &site.arg_roots, &site.kwarg_roots, site.via_self)
                         .unwrap_or_else(|| t.clone())
                 })
                 .collect();
@@ -137,12 +147,16 @@ fn remap_target(
     target: &MutationTarget,
     callee_positional: &[String],
     arg_roots: &[Option<MutationTarget>],
+    kwarg_roots: &[(String, Option<MutationTarget>)],
     via_self: bool,
 ) -> Option<MutationTarget> {
     match target {
         MutationTarget::SelfAttr { .. } if via_self => Some(target.clone()),
         MutationTarget::SelfAttr { .. } => None,
         MutationTarget::Param { name } => {
+            if let Some((_, root)) = kwarg_roots.iter().find(|(kw, _)| kw == name) {
+                return root.clone();
+            }
             let idx = callee_positional.iter().position(|p| p == name)?;
             arg_roots.get(idx).cloned().flatten()
         }

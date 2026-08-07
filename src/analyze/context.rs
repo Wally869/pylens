@@ -28,11 +28,14 @@ fn attr_off_receiver<'e>(expr: &'e ast::Expr, self_param: &str) -> Option<&'e st
 /// Effects pass determined (via the Declarations symbol table) is a function/method defined in
 /// this same module. Consumed by the Interprocedural pass.
 ///
-/// Argument -> parameter mapping is **positional only** (v1); keyword-argument mapping is a
-/// future refinement. A call the analyzer can't line up 1:1 with the callee's declared
-/// positional parameters (keywords, `*args`/`**kwargs` at the call site) simply yields `None`
-/// roots for the unmapped positions — sound, since an unmapped root means the caller didn't hand
-/// the callee a trackable object there, so nothing to (mis)attribute.
+/// Argument -> parameter mapping covers both positional and keyword call arguments: positional
+/// arguments map onto the callee's declared parameters by position (`arg_roots`), keyword
+/// arguments map by name (`kwarg_roots`), matched against the callee's `Positional` or
+/// `KeywordOnly` parameters. A call the analyzer can't line up with a callee parameter (extra
+/// positional args, `*args`/`**kwargs` at the call site, or a keyword that names no declared
+/// parameter — swallowed by the callee's own `**kwargs`) simply yields no root for that
+/// position/name — sound, since an unmapped root means the caller didn't hand the callee a
+/// trackable object there, so nothing to (mis)attribute.
 #[derive(Debug, Clone)]
 pub(in crate::analyze) struct CallSite {
     /// Index into `ModuleAnalysis::declarations` / `ModuleAnalysis::signatures` (the two are
@@ -45,6 +48,11 @@ pub(in crate::analyze) struct CallSite {
     /// The caller-side root each positional call argument resolves to (`None` where it doesn't
     /// root to a tracked target), parallel in order to the call's positional arguments.
     pub(in crate::analyze) arg_roots: Vec<Option<MutationTarget>>,
+    /// The caller-side root each keyword call argument resolves to (`None` where it doesn't root
+    /// to a tracked target), paired with the keyword's name as written at the call site
+    /// (`f(x, key=y)` records `("key", root_of(y))`). `**kwargs`-unpacking keywords (no name)
+    /// aren't recorded — they can't be matched to a single callee parameter.
+    pub(in crate::analyze) kwarg_roots: Vec<(String, Option<MutationTarget>)>,
 }
 
 /// One call site, inside some caller function, whose callee is an IMPORTED binding (not a
@@ -63,10 +71,11 @@ pub struct ImportCallSite {
     pub attr: Option<String>,
     /// The caller-side root each positional call argument resolves to (`None` where it doesn't
     /// root to a tracked target), parallel in order to the call's positional arguments — same
-    /// shape, and same **positional-only** limitation, as [`CallSite::arg_roots`]: keyword
-    /// arguments at the call site aren't mapped onto the callee's parameters (future work, as in
-    /// the intra-file pass).
+    /// shape as [`CallSite::arg_roots`].
     pub arg_roots: Vec<Option<MutationTarget>>,
+    /// The caller-side root each keyword call argument resolves to, paired with its name — same
+    /// shape as [`CallSite::kwarg_roots`].
+    pub kwarg_roots: Vec<(String, Option<MutationTarget>)>,
 }
 
 impl ImportCallSite {

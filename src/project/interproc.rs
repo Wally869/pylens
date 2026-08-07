@@ -33,13 +33,14 @@
 //! ## Mapping and fixpoint
 //!
 //! Mapping a resolved callee's summary onto its caller follows the exact same rules as the
-//! intra-file pass (positional param -> caller arg root, `Global` unchanged, raises fold into
-//! `implicit`, io/global_writes/is_generator union, unresolved effects inherited with `may_affect`
-//! remapped) with one simplification: a project-symbol-table callee is always a free function, so
-//! it never has a `SelfAttr` mutation to propagate. The corresponding `call_import` unresolved
-//! effect is removed from the caller once its call site resolves. Iterated to a fixpoint (bounded
-//! by the total function count across the project, +1) for the same soundness/termination reasons
-//! as the intra-file pass: cross-file (mutual) recursion only ever adds facts from a bounded
+//! intra-file pass (positional/keyword param -> caller arg root, `Global` unchanged, raises fold
+//! into `implicit`, io/global_writes/is_generator union, unresolved effects inherited with
+//! `may_affect` remapped) with one simplification: a project-symbol-table callee is always a free
+//! function, so it never has a `SelfAttr` mutation to propagate. The corresponding `call_import`
+//! unresolved effect is removed from the caller once its call site resolves. Iterated to a
+//! fixpoint (bounded by the total function count across the project, +1) for the same
+//! soundness/termination reasons as the intra-file pass: cross-file (mutual) recursion only ever
+//! adds facts from a bounded
 //! universe, so a fixpoint is guaranteed, not an infinite loop.
 //!
 //! Purity is recomputed after propagation settles: an inherited unresolved effect still leaves
@@ -203,7 +204,8 @@ fn apply_call_site(
         .mutations
         .iter()
         .filter_map(|m| {
-            let target = remap_target(&m.target, &callee_positional, &site.arg_roots)?;
+            let target =
+                remap_target(&m.target, &callee_positional, &site.arg_roots, &site.kwarg_roots)?;
             Some(Mutation { target, via: m.via, name: m.name.clone() })
         })
         .collect();
@@ -225,7 +227,8 @@ fn apply_call_site(
                 .may_affect
                 .iter()
                 .map(|t| {
-                    remap_target(t, &callee_positional, &site.arg_roots).unwrap_or_else(|| t.clone())
+                    remap_target(t, &callee_positional, &site.arg_roots, &site.kwarg_roots)
+                        .unwrap_or_else(|| t.clone())
                 })
                 .collect();
             UnresolvedEffect { reason: u.reason.clone(), callee: u.callee.clone(), may_affect }
@@ -275,9 +278,13 @@ fn remap_target(
     target: &MutationTarget,
     callee_positional: &[String],
     arg_roots: &[Option<MutationTarget>],
+    kwarg_roots: &[(String, Option<MutationTarget>)],
 ) -> Option<MutationTarget> {
     match target {
         MutationTarget::Param { name } => {
+            if let Some((_, root)) = kwarg_roots.iter().find(|(kw, _)| kw == name) {
+                return root.clone();
+            }
             let idx = callee_positional.iter().position(|p| p == name)?;
             arg_roots.get(idx).cloned().flatten()
         }

@@ -550,10 +550,12 @@ impl Walker<'_, '_> {
                     // `binding.attr` symbol — see `ImportCallSite` doc.
                     if matches!(attr.value.as_ref(), ast::Expr::Name(_)) {
                         let arg_roots = self.positional_arg_roots(&call.arguments);
+                        let kwarg_roots = self.keyword_arg_roots(&call.arguments);
                         self.facts.import_call_sites.push(ImportCallSite {
                             binding: base.to_string(),
                             attr: Some(attr.attr.to_string()),
                             arg_roots,
+                            kwarg_roots,
                         });
                     }
                 } else if self.is_self_receiver(&attr.value)
@@ -566,7 +568,13 @@ impl Walker<'_, '_> {
                     // `self.method(...)` / `cls.method(...)` resolving to a method defined in
                     // this same class — a structured call site, not an opaque one.
                     let arg_roots = self.positional_arg_roots(&call.arguments);
-                    self.facts.call_sites.push(CallSite { callee, via_self: true, arg_roots });
+                    let kwarg_roots = self.keyword_arg_roots(&call.arguments);
+                    self.facts.call_sites.push(CallSite {
+                        callee,
+                        via_self: true,
+                        arg_roots,
+                        kwarg_roots,
+                    });
                 } else {
                     let method = attr.attr.as_str();
                     if is_mutating_method(method) {
@@ -597,16 +605,24 @@ impl Walker<'_, '_> {
                         may_affect: self.args_targets(&call.arguments),
                     });
                     let arg_roots = self.positional_arg_roots(&call.arguments);
+                    let kwarg_roots = self.keyword_arg_roots(&call.arguments);
                     self.facts.import_call_sites.push(ImportCallSite {
                         binding: n.to_string(),
                         attr: None,
                         arg_roots,
+                        kwarg_roots,
                     });
                 } else if let Some(callee) = resolve_unique(self.facts.declarations, None, n) {
                     // A call to a module-level function defined in this same module — a
                     // structured call site, not an opaque one.
                     let arg_roots = self.positional_arg_roots(&call.arguments);
-                    self.facts.call_sites.push(CallSite { callee, via_self: false, arg_roots });
+                    let kwarg_roots = self.keyword_arg_roots(&call.arguments);
+                    self.facts.call_sites.push(CallSite {
+                        callee,
+                        via_self: false,
+                        arg_roots,
+                        kwarg_roots,
+                    });
                 } else {
                     if let Some(exc) = call_implicit_exception(n) {
                         self.facts.sig.raises.implicit.push(exc.to_string());
@@ -663,6 +679,20 @@ impl Walker<'_, '_> {
     /// to a tracked target — parallel in order to `arguments.args`, for a [`CallSite`].
     fn positional_arg_roots(&self, arguments: &ast::Arguments) -> Vec<Option<MutationTarget>> {
         arguments.args.iter().map(|arg| self.facts.resolve_target(arg, None)).collect()
+    }
+
+    /// The caller-side root each keyword argument resolves to, paired with its name — for a
+    /// [`CallSite`]/[`ImportCallSite`]. A `**kwargs`-unpacking keyword (no name) is skipped: it
+    /// can't be matched to a single callee parameter.
+    fn keyword_arg_roots(&self, arguments: &ast::Arguments) -> Vec<(String, Option<MutationTarget>)> {
+        arguments
+            .keywords
+            .iter()
+            .filter_map(|kw| {
+                let name = kw.arg.as_ref()?.id.to_string();
+                Some((name, self.facts.resolve_target(&kw.value, None)))
+            })
+            .collect()
     }
 
     /// Targets among `arguments` that resolve to a tracked root (params passed into a call

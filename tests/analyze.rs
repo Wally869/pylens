@@ -367,6 +367,24 @@ fn local_helper_mutation_propagates_to_caller() {
 }
 
 #[test]
+fn local_helper_mutation_via_keyword_arg_propagates_to_caller() {
+    let s = analyze(
+        "def helper(xs):\n\
+         \x20   xs.append(1)\n\
+         def caller(data):\n\
+         \x20   helper(xs=data)\n",
+    );
+    let caller = sig(&s, "caller");
+    assert!(has_mutation(
+        caller,
+        &MutationTarget::Param { name: "data".into() },
+        MutationKind::Method
+    ));
+    assert_eq!(caller.purity, Purity::Impure);
+    assert!(caller.unresolved_effects.is_empty());
+}
+
+#[test]
 fn pure_local_helper_call_keeps_caller_pure() {
     let s = analyze(
         "def add_one(x):\n\
