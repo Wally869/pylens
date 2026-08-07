@@ -65,6 +65,9 @@ unioned over all exits; mutations are may-sets.
   "name": "normalize",
   "kind": "method",                  // function | method
   "owner": "Normalizer",             // class (methods only) — needed to build a receiver
+  "params": [
+    { "name": "items", "shape": {"seq": "any"}, "has_default": false, "kind": "positional" }
+  ],
   "declared_return": "list",         // from annotation — UNTRUSTED
   "is_generator": false,
   "returns": ["sequence"],           // union over all return exits (incl. "none"); else "opaque"
@@ -73,17 +76,18 @@ unioned over all exits; mutations are may-sets.
     "implicit": ["TypeError"]        // operator-induced — statically-inferred may-set
   },
   "mutations": [
-    { "target": {"param": "self"},   "via": "attr_set",   "name": "cache" },
-    { "target": {"param": "items"},  "via": "method",     "name": "append" }
+    { "target": {"root": "self_attr", "name": "cache"}, "via": "attr_set",   "name": "cache" },
+    { "target": {"root": "param", "name": "items"},      "via": "method",     "name": "append" }
   ],
   "global_writes": ["COUNTER"],
   "io": ["stdout"],
   "unresolved_effects": [
-    { "reason": "call_import", "callee": "np.sort", "may_affect": [{"param": "items"}] }
+    { "reason": "call_import", "callee": "np.sort", "may_affect": [{"root": "param", "name": "items"}] }
   ],
   "uses": [ { "binding": "np", "module": { "package": "numpy" } } ],
   "decorators": [],                  // dotted decorator names; unrecognized ⇒ purity downgrade
-  "type_mismatches": [],             // declared_return contradicts the inferred `returns` set
+  "type_mismatches": [],             // declared_return / a param's declared annotation contradicts
+                                      // the inferred may-set (see below)
   "purity": "unknown"                // any unresolved effect ⇒ unknown, never "pure"
 }
 ```
@@ -94,9 +98,49 @@ shells out to a library is never mistaken for pure. The companion **import catal
 style, package/path-split, with module/function `scope`) is emitted alongside, and the `record`
 flow probes each for resolution; see the README/USER_GUIDE for the `dependencies` shape.
 
-Mutation **targets** (roots): `param(name)` · `self_attr(name)` · `global(name)` ·
-`nonlocal(name)` · `unknown`. Mutation **kinds** (`via`): `subscript_set` · `subscript_del`
-· `attr_set` · `attr_del` · `method(name)` · `aug_subscript` · `aug_attr`.
+Mutation **targets** (roots — internally serialized with `serde(tag = "root")`): `param(name)` ·
+`self_attr(name)` · `global(name)` · `nonlocal(name)` · `unknown`. Mutation **kinds** (`via`):
+`subscript_set` · `subscript_del` · `attr_set` · `attr_del` · `method(name)` · `aug_subscript` ·
+`aug_attr` · `aug_name` (`+=`/`-=`/… on a plain name — a may-mutation, since the operator's
+effect on the underlying object depends on its runtime type).
+
+### Shapes
+
+`ParamInfo::shape` (and every local's inferred shape) is the recursive `Shape` lattice:
+`Int`/`Float`/`Bool`/`Str`/`Bytes`/`None`/`Seq`/`Map`/`Set`/`Any`/`Union`. Scalars and `Any`
+serialize as a bare tag string (`"int"`, `"any"`, …); containers as a single-key tagged object
+(`{"seq": <Shape>}`, `{"set": <Shape>}`, `{"map": {"key": <Shape>, "value": <Shape>}}`).
+
+`Union` serializes as `{"union": [<Shape>, ...]}` and is **canonical**: members are built by
+`Shape::join`/`Shape::union_of`, which flatten nested unions, merge same-constructor members
+recursively (so two `Seq` members join their element shapes instead of sitting side by side),
+collapse to plain `Any` if any member is `Any` or if the merged member count exceeds
+`Shape::UNION_WIDTH_CAP` (8), and collapse to the single member itself if only one remains.
+`Optional[X]` is not a distinct shape — it is `Union([X, None])`, rendered by `stub/` as PEP 604
+`X | None`. Where earlier versions of the shape lattice collapsed any join conflict straight to
+`Any`, a join between different constructors now preserves both as **disjoint evidence** in a
+`Union` instead of discarding one side; only a genuinely wide or already-`Any` join gives up and
+returns `Any`. Deserializing a `{"union": [...]}` value re-runs it through `union_of`, so a
+hand-written or previously-serialized union is always re-canonicalized on read, never trusted
+as-is.
+
+### Declared-vs-inferred mismatches (`type_mismatches`)
+
+The TypeCheck pass flags contradictions between an untrusted declared annotation and the
+statically inferred may-set, for **both** the return type and each parameter. Each entry has a
+`kind` of `"return"` or `"param"`:
+
+- `"return"` — `declared` is `declared_return`; `inferred` is the (possibly multi-member)
+  `returns` may-set the declaration contradicts; `param`/`inferred_shape` are absent.
+- `"param"` — `declared` is that parameter's own annotation; `param` names it; `inferred_shape`
+  is its inferred `Shape`; `inferred` is empty.
+
+Flagged **only** on full disjointness (a declared type with at least one permitted kind present
+in the inferred side is never flagged), and never for a wildcard annotation (`Any`, an
+unrecognized `Optional`/`Union`). Numeric-tower subtyping is accepted on both sides: `bool` ⊆
+`int` ⊆ `float` (PEP 484), so a declared `float` does not conflict with an inferred `int` or
+`bool`. Advisory only — `type_mismatches` is a report field, never consulted by the may-set or
+the Purity pass.
 
 ## Soundness invariant
 
@@ -113,10 +157,16 @@ not prove it.
 
 - `parse/` — ruff wrapper. **All `ruff_*` imports are isolated here**; parses source into
   function/method defs. Swapping parsers means rewriting `parse/` + `analyze/`, not consumers.
-- `model/` — `EffectSignature` types + serde JSON, including the recursive `Shape` type
-  (`Int`/`Float`/`Bool`/`Str`/`Bytes`/`None`/`Seq`/`Map`/`Set`/`Any`, serializing scalars as a
-  tag string and containers as a tagged object) and `ParamKind`
-  (`Positional`/`VarPositional`/`VarKeyword`/`KeywordOnly`). Pure, parser-independent.
+  Every source-ingestion point (file read, stdin, per-project-file read) strips a leading UTF-8
+  byte-order mark (`lib::strip_bom`) before the source reaches `parse/` or the jail: CPython
+  accepts a BOM-prefixed file, but a stray U+FEFF reaching the jailed worker's `compile()` as
+  text is a `SyntaxError`, and it's invisible noise to the ruff parser besides — so the analyzer
+  and the jail must always see identical, BOM-less source.
+- `model/` — split into `mod.rs` (`EffectSignature` and the rest of the JSON-facing types:
+  `Mutation`/`MutationTarget`, `Raises`, `UnresolvedEffect`, `TypeMismatch`, `Import`/`ModuleRef`,
+  `Purity`, `ParamInfo`/`ParamKind` (`Positional`/`VarPositional`/`VarKeyword`/`KeywordOnly`)) and
+  `shape.rs` (the recursive `Shape` lattice — see "Shapes" above — plus its serde `Serialize`/
+  `Deserialize` impls and `join`/`union_of`). Pure, parser-independent.
 - `analyze/` — an ordered **pass pipeline** (**Imports → Declarations → Shapes → Effects →
   Interprocedural → TypeCheck → Purity**) over a shared `ModuleAnalysis` context, driven by a
   single AST walk with per-concern **collectors** (aliases, mutations, exceptions, shapes,
@@ -136,19 +186,37 @@ not prove it.
   - **Interprocedural** (`passes/interprocedural.rs`) — resolves calls to functions/methods
     defined in this *same file* (via the call sites Effects recorded) and propagates the
     callee's mutations/raises/I/O/global-writes/`is_generator`/`unresolved_effects` onto the
-    caller, remapping mutation targets positionally (or unchanged for `self`/global roots).
-    Iterates to a fixpoint (bounded by `signatures.len() + 1` sweeps) so multi-hop chains and
-    recursion (direct or mutual) settle without an infinite loop. Calls through imports or to
-    otherwise-unresolved callees are left as opaque `unresolved_effects` here — this pass is
-    **intra-file only**. Cross-file propagation (following a `project_local`-resolved import into
-    another project file's free-function signatures, with a project-wide fixpoint) runs at the
-    project level in `project::interproc`, in directory/project mode only.
+    caller. A callee mutation on a parameter remaps onto the caller-side root passed for that
+    parameter **by position** if the caller passed it positionally (matched against the callee's
+    `Positional` params only), **by name** if the caller passed it as a keyword (matched against
+    the callee's `Positional` or `KeywordOnly` params by name); it's dropped (not attributed to
+    any caller root, never mis-attributed) if the callee param is `*args`/`**kwargs` or the
+    keyword names nothing declared. `SelfAttr` mutations propagate unchanged only through a
+    `self.`/`cls.`-qualified call on the caller's own receiver; `Global` mutations propagate
+    unchanged unconditionally. An unpacked call site (`f(*xs)` / `f(**kw)`) is handled for
+    soundness even when the callee resolves: positional-root mapping truncates at the first
+    `*`-unpack (arguments after it can't be attributed positionally), the unpacking operation
+    itself gets an implicit `TypeError` (a non-iterable splat, non-mapping `**`, or an
+    arity/duplicate-keyword mismatch can raise before the callee ever runs), and a
+    `call_unpacked_args` unresolved effect acknowledges the roots reaching the callee through the
+    unpack that the mapping couldn't attribute. Iterates to a fixpoint (bounded by
+    `signatures.len() + 1` sweeps) so multi-hop chains and recursion (direct or mutual) settle
+    without an infinite loop. Calls through imports or to otherwise-unresolved callees are left
+    as opaque `unresolved_effects` here — this pass is **intra-file only**. Cross-file
+    propagation (following a `project_local`-resolved import into another project file's
+    free-function signatures, with a project-wide fixpoint, including the same keyword-argument
+    mapping) runs at the project level in `project::interproc`, in directory/project mode only;
+    an unpacked cross-file call site keeps its `call_import` acknowledgment even after the
+    import resolves, for the same reason.
   - **TypeCheck** (`passes/type_check.rs`) — compares each function's final `returns` may-set
-    against its untrusted `declared_return` annotation, appending a `type_mismatches` entry only
-    when the two are fully disjoint (never on a mere subset mismatch, and never for a wildcard
-    annotation like `Any`/`Optional`). Runs after Effects/Interprocedural since it needs the
-    final `returns` set; interprocedural propagation never touches `returns`, so the ordering
-    relative to Interprocedural doesn't matter in practice.
+    against its untrusted `declared_return` annotation, and separately compares each parameter's
+    final inferred `Shape` against its own declared annotation, appending a `type_mismatches`
+    entry (`kind: "return"` or `"param"`) only when the two sides are fully disjoint (never on a
+    mere subset mismatch, and never for a wildcard annotation like `Any`/`Optional`); numeric-tower
+    subtyping (`bool` ⊆ `int` ⊆ `float`) is accepted on both checks. See "Declared-vs-inferred
+    mismatches" above for the field shape. Runs after Effects/Interprocedural since it needs the
+    final `returns`/param shapes; interprocedural propagation never touches either, so the
+    ordering relative to Interprocedural doesn't matter in practice.
   - **Purity** — derived classification from collected facts (runs last, after propagation so it
     sees a caller's *complete* effect set); any unresolved effect or unrecognized decorator ⇒
     `unknown`, never `pure`.
@@ -166,6 +234,17 @@ not prove it.
   `error.stage: "resource"` — OOM/recursion-limit/timeout, an artifact of the sandbox) from a
   **semantic raise** (`outcome: "raised"` — part of the function's own behavior). No comparison,
   no score — that's the consumer's.
+  - **Input minimization** (`shrink.rs`) — for every `outcome: "raised"` case, greedily shrinks
+    its input toward a smaller one that still raises the *same exception type*: one argument
+    (positional, then keyword-only) at a time, trying that argument's `generate::shrink_candidates`
+    in order and accepting the first candidate whose re-execution still raises the same exception
+    type; accepting one restarts that argument's scan at the new, smaller value, and a full pass
+    with no acceptance ends the search. Bounded by a 32-jailed-call budget
+    (`shrink::SHRINK_BUDGET`) total per case. A resource-killed or different-exception
+    re-execution just rejects that candidate — it is never folded in as a new observation. The
+    result (only present when at least one argument actually shrank) is `Case::minimized`
+    (`MinimizedInput { input, kwargs }`), a reporting aid attached to the `record` output; it is
+    never fed back into `validate`, which checks only the original observation.
 - `exec/` — dynamic effect observer. A `Sandbox` trait with launcher-pluggable backends
   (`nsjail` native / `wsl`-wrapped); **no unsandboxed launcher**. Owns the JSON-over-stdio
   worker protocol (including `kwargs`), the structured `HarnessError` (with `is_resource()`),
@@ -178,13 +257,20 @@ not prove it.
   flagged `unresolved_effects`). Pure, no jail, no I/O — driven by `pylens validate`.
 - `report/` — output formatting: versioned JSON (top-level `schema_version`) and a thin
   terminal `--format summary` for `analyze`/`record`/`validate`.
-- `project/` — multi-file ("directory") mode: walks a directory for `*.py` files (skipping
-  VCS/venv/build noise dirs), runs `analyze`/`record`/`validate` over each, and aggregates into
-  one project report (`{ schema_version, root, files: [...], summary }`); a file that fails to
-  read/parse/record becomes a `{ path, error }` entry rather than aborting the whole run. The
-  CPU-bound, jail-free `analyze` path fans files out across a small worker-thread pool;
-  `record`/`validate` stay sequential over one shared jailed pool (spawning a pool per file would
-  repay nsjail startup cost per file).
+- `project/` — multi-file ("directory") mode: walks a directory for `*.py` files using the
+  `ignore` crate (honors `.gitignore`/`.ignore` hierarchically, even outside a git repo, plus an
+  explicit skip-list — `__pycache__`/`venv`/`env`/`node_modules`/`build`/`dist`/`target` — for
+  common noise dirs a project may not have gitignored), runs `analyze`/`record`/`validate` over
+  each, and aggregates into one project report (`{ schema_version, root, files: [...], summary }`);
+  a file that fails to read/parse/record becomes a `{ path, error }` entry rather than aborting
+  the whole run. The CPU-bound, jail-free `analyze` path fans files out across a small
+  worker-thread pool. `record`/`validate` also run in **parallel**: a fixed pool of worker
+  threads (`available_parallelism`, capped at 4 — `JAIL_WORKER_CAP` — and at the file count),
+  each owning its own private single-worker `NsjailPool` (one `wsl`/nsjail fork-server process
+  per worker; files are independent, so no pool is ever shared across threads) pulls files off a
+  shared work queue. `validate`'s aggregate `summary` also carries `uncallable` — the count of
+  functions across the project that never executed (module didn't load, constructor failed), so
+  a run with zero defects but many uncallable functions doesn't read as "fully validated".
   - `project::resolve` — static, jail-free **project-local import resolution**: builds a
     `ModuleIndex` (dotted importable path → project file) once per project, then resolves each
     file's imports (absolute *and* relative, including `__init__.py` package semantics and
@@ -195,9 +281,20 @@ not prove it.
     jailed dependency probing in `record/` (which answers "does this module *load*", not "is it
     a project file").
 - `stub/` — pure string rendering of inferred `.pyi` type-hint stubs (Python 3.10+ syntax:
-  `list[...]`/`dict[...]` builtin generics, `X | Y` unions, `Iterator[Any]` for generators) from
-  the same `EffectSignature`s `analyze` produces; no jail, no I/O. Consumed by `analyze --format
-  pyi` only.
+  `list[...]`/`dict[...]` builtin generics, PEP 604 `X | Y` unions — including a `Shape::Union`
+  param rendering straight to `A | B`, and `Optional[X]` (`Union([X, None])`) rendering as
+  `X | None` with no special case needed — `Iterator[Any]` for generators) from the same
+  `EffectSignature`s `analyze` produces; no jail, no I/O. Consumed by `analyze --format pyi`.
+  `stub::observed` (consumed by single-file `record --format pyi` only, not directory mode) is
+  an additive enrichment layer on top: for every param/return the static side left unresolved
+  (`Shape::Any` / `ReturnKind::Opaque`), it folds in the type observed across that function's
+  recorded `record` cases — but only when every observation *agrees* (no majority vote, no
+  partial credit) and only for encodings the worker's tagged JSON makes faithfully
+  distinguishable (a bare JSON array is `list`; `{"__t__": "tuple"/"set"/"dict"}` distinguish
+  those from a plain object; `bytes` and arbitrary objects share the same generic `{"__t__":
+  "obj", ...}` shape and are never folded in). A folded-in type is marked with a trailing
+  `# observed: ...` comment on the `def` line — a sample from generated cases, never a proof — and
+  a static-known shape always wins over an observed one.
 - `html/` — renders an already-assembled `analyze`/`record`/`validate` JSON body (the same
   `serde_json::Value` the JSON output emits) into one self-contained `<!doctype html>` document
   (inline `<style>` only, no external assets); one renderer handles both the single-file shape
@@ -287,18 +384,17 @@ consumes.
    *(Done — `pylens validate` and `src/validate.rs`; the example corpus validates with zero
    hard defects.)*
 5. **Guided generation** — guard-directed inputs (literals/boundaries pulled from `if`/`assert`/
-   `while`/ternary guards on parameters) to reach guarded branches. *(Done — see `collect/guards.rs`
-   and `generate/`; minimization is not implemented.)*
+   `while`/ternary guards on parameters) to reach guarded branches, plus greedy input
+   minimization for raised cases. *(Done — see `collect/guards.rs`, `generate/`, and `shrink.rs`
+   for minimization.)*
 
 **Out of scope:** comparing a candidate to a reference and scoring it (an RL *reward*). pylens
 produces records; how a consumer turns records into a training signal is theirs to decide.
 
 ## Open questions
 
-- **Cross-file propagation depth** — cross-file call resolution is done for free functions in
-  project mode (`project::interproc`); imported *methods*, deeper dotted call chains, and
-  keyword-argument mappings across files are still treated as `unresolved`.
-- **Return aliasing** — a function returning an argument it also mutated.
-- **Mutation readback** — exact mechanism in the chosen executor.
+- **Cross-file propagation depth** — cross-file call resolution, including keyword-argument
+  mapping, is done for free functions in project mode (`project::interproc`); imported *methods*
+  and deeper dotted call chains are still treated as `unresolved`.
 - **Equality semantics** for return/exception comparison — float tolerance, set/dict ordering,
   NaN, exception type-only vs message.
