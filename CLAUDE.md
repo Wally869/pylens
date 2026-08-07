@@ -148,6 +148,9 @@ Otherwise jail-gated tests run against the stale worker.
   defects; `tests/validate.rs` and `tests/project.rs` enforce it — don't weaken either to hide
   new findings; report them.
 - **Greenfield.** No backwards-compat baggage, no dead code, no "previous approach" comments.
+- **`SCHEMA_VERSION` stays `"0.1"` — never bump it.** pylens has no release and no consumers;
+  contract changes fold into `0.1` silently. Versioning starts at the first shipped release
+  (see the schema-versioning note in `DESIGN.md`). Bumping it during development is an error.
 - **Rust edition 2024.** ruff is pinned to a fixed rev in `Cargo.toml` (reproducible builds).
 - Doc-comment each pass/collector/module with its single responsibility.
 - Resource kills (`MemoryError`/`RecursionError`/timeout) are `outcome:"error"`,

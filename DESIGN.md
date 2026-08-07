@@ -257,6 +257,15 @@ not prove it.
   flagged `unresolved_effects`). Pure, no jail, no I/O — driven by `pylens validate`.
 - `report/` — output formatting: versioned JSON (top-level `schema_version`) and a thin
   terminal `--format summary` for `analyze`/`record`/`validate`.
+
+  **Schema versioning.** `schema_version` (the `SCHEMA_VERSION` const in `lib.rs`) names the
+  version of the JSON contract, so a downstream consumer can detect that the shape of the data
+  it parses has changed. pylens has never shipped a release, so the contract has no consumers
+  yet and the version is pinned at **`0.1`**: every contract change — additive or breaking —
+  folds into `0.1` without a bump. Do not bump it during development. The policy switches at
+  the first release: the shipped contract becomes `1.0`, and from then on any change to what
+  the JSON contains bumps the version — major for changes that can break an existing parser
+  (removed/renamed fields, changed tags or value shapes), minor for purely additive fields.
 - `project/` — multi-file ("directory") mode: walks a directory for `*.py` files using the
   `ignore` crate (honors `.gitignore`/`.ignore` hierarchically, even outside a git repo, plus an
   explicit skip-list — `__pycache__`/`venv`/`env`/`node_modules`/`build`/`dist`/`target` — for
