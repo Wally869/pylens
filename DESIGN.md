@@ -260,12 +260,22 @@ not prove it.
 
   **Schema versioning.** `schema_version` (the `SCHEMA_VERSION` const in `lib.rs`) names the
   version of the JSON contract, so a downstream consumer can detect that the shape of the data
-  it parses has changed. pylens has never shipped a release, so the contract has no consumers
-  yet and the version is pinned at **`0.1`**: every contract change — additive or breaking —
-  folds into `0.1` without a bump. Do not bump it during development. The policy switches at
-  the first release: the shipped contract becomes `1.0`, and from then on any change to what
-  the JSON contains bumps the version — major for changes that can break an existing parser
-  (removed/renamed fields, changed tags or value shapes), minor for purely additive fields.
+  it parses has changed.
+
+  *When to bump:* only when a **release has shipped** and a change alters the emitted JSON
+  contract. Pre-release (now — no release has ever shipped, the contract has no consumers) the
+  version is pinned at **`0.1`** and every contract change, additive or breaking, folds into it
+  without a bump. The first shipped release freezes the contract as `1.0`.
+
+  *How to bump (post-release):* **major** for anything that can break an existing parser —
+  removing or renaming a field, changing a field's type, tag, or value shape, changing enum
+  string sets; **minor** for purely additive changes — new optional fields, new enum values in
+  fields documented as open sets.
+
+  *Backward-compatibility restrictions (post-release):* within a major version, existing fields
+  keep their name, type, and meaning; consumers must be able to ignore unknown fields, so
+  additions are always safe; never reuse a removed field name for a different meaning. There is
+  no compatibility guarantee across major versions — that's what the number is for.
 - `project/` — multi-file ("directory") mode: walks a directory for `*.py` files using the
   `ignore` crate (honors `.gitignore`/`.ignore` hierarchically, even outside a git repo, plus an
   explicit skip-list — `__pycache__`/`venv`/`env`/`node_modules`/`build`/`dist`/`target` — for

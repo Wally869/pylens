@@ -148,7 +148,7 @@ Otherwise jail-gated tests run against the stale worker.
   defects; `tests/validate.rs` and `tests/project.rs` enforce it — don't weaken either to hide
   new findings; report them.
 - **Greenfield.** No backwards-compat baggage, no dead code, no "previous approach" comments.
-- **Never bump `SCHEMA_VERSION`** — read the schema-versioning note in `DESIGN.md` first.
+- Considering a `SCHEMA_VERSION` bump? Read the schema-versioning note in `DESIGN.md` first.
 - **Rust edition 2024.** ruff is pinned to a fixed rev in `Cargo.toml` (reproducible builds).
 - Doc-comment each pass/collector/module with its single responsibility.
 - Resource kills (`MemoryError`/`RecursionError`/timeout) are `outcome:"error"`,
