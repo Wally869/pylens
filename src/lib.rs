@@ -1,5 +1,5 @@
 //! pylens — static effect analysis of Python functions, plus jailed execution to record the
-//! effects a function actually has on generated inputs. See DESIGN.md.
+//! effects a function actually has on generated inputs. See docs/DESIGN.md.
 
 pub mod analyze;
 pub mod exec;

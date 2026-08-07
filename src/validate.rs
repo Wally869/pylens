@@ -1,7 +1,8 @@
 //! The `observed ⊆ static` self-validation harness: measures analyzer honesty by checking
 //! that every effect a function was **observed** to have (in its recorded [`Case`]s) is
 //! predicted by its **static** may-set ([`EffectSignature`]). Anything observed but not
-//! statically predicted is a soundness defect — see DESIGN.md "Soundness invariant".
+//! statically predicted is a soundness defect — see docs/DESIGN.md "Principles and the
+//! soundness invariant".
 //!
 //! Pure: no jail, no I/O. Given a signature and its cases, [`validate_signature`] returns the
 //! list of defects found.

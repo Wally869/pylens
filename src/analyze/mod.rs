@@ -1,6 +1,6 @@
 //! Static effect analysis: an ordered pass pipeline over a module AST, producing an
 //! [`EffectSignature`] per function/method using may-set (over-approximating) semantics. See
-//! DESIGN.md.
+//! docs/DESIGN.md.
 
 mod collect;
 mod context;

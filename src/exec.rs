@@ -17,7 +17,7 @@
 //! * [`Nsjail`] — one fresh jailed process per call (maximum isolation).
 //! * [`NsjailPool`] — a pool of long-lived `--serve` fork-server jails (amortizes interpreter
 //!   startup; each request still runs in a forked child, so untrusted state never leaks
-//!   between calls). See DESIGN.md "Execution layer".
+//!   between calls). See docs/DESIGN.md "Execution layer".
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};

@@ -104,7 +104,7 @@ or jail-gated tests run against the stale worker.
   corpus stays at zero hard defects, enforced by `tests/validate.rs` and `tests/project.rs` —
   don't weaken them to hide new findings; report them.
 - **Greenfield.** No backwards-compat baggage, no dead code, no "previous approach" comments.
-- Considering a `SCHEMA_VERSION` bump? Read the schema-versioning note in `DESIGN.md` first.
+- Considering a `SCHEMA_VERSION` bump? Read the versioning section in `docs/SCHEMA.md` first.
 - **Rust edition 2024.** ruff is pinned to a fixed rev in `Cargo.toml`.
 - Doc-comment each pass/collector/module with its single responsibility.
 - Resource kills (OOM/recursion/timeout) are `outcome:"error"`, `error.stage:"resource"` —

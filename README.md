@@ -238,10 +238,11 @@ calls to `project_local`-imported free functions are propagated **across files**
 output carries a top-level `schema_version`. Not yet done: pylens still doesn't model *what* an
 external library call does (whether it mutates its argument, what it returns); cross-file
 propagation covers free functions (imported methods / deep dotted chains stay unresolved). See
-[DESIGN.md](DESIGN.md).
+[DESIGN.md](docs/DESIGN.md).
 
 ## Docs
 
 - [User guide](docs/USER_GUIDE.md) — install, sandbox setup, commands, limits, troubleshooting
-- [DESIGN.md](DESIGN.md) — decisions, effect taxonomy, soundness invariant, phase plan
+- [SCHEMA.md](docs/SCHEMA.md) — the JSON output contract, field by field, and versioning policy
+- [DESIGN.md](docs/DESIGN.md) — effect taxonomy, soundness invariant, architecture, sandbox rationale
 - [examples/README.md](examples/README.md) — the example corpus

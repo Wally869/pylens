@@ -10,8 +10,8 @@
 - [Limitations](#limitations)
 - [Troubleshooting](#troubleshooting)
 
-For the full JSON schema and the reasoning behind the analysis, see
-[DESIGN.md](../DESIGN.md). This guide covers installing and using the tool.
+For the full JSON schema see [SCHEMA.md](SCHEMA.md); for the reasoning behind the analysis see
+[DESIGN.md](DESIGN.md). This guide covers installing and using the tool.
 
 ## What pylens does
 
@@ -81,7 +81,7 @@ Things to know when reading a report:
 - `type_mismatches` flags annotations that contradict the inferred behavior. Advisory
   only.
 
-Field-by-field reference: [DESIGN.md](../DESIGN.md).
+Field-by-field reference: [SCHEMA.md](SCHEMA.md).
 
 ## record
 
