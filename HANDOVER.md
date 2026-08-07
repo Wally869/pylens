@@ -7,7 +7,8 @@ keyword-argument mapping, `Shape` unions / param-annotation mismatch / observed-
 (jail-gated ones skip when the sandbox isn't provisioned) and
 `cargo clippy --all-targets -- -D warnings` is clean. See `CLAUDE.md` for the architecture and
 codemap. The whole `examples/` corpus is at zero hard defects; `tests/validate.rs` and
-`tests/project.rs` assert that — keep it there. JSON contract is at `SCHEMA_VERSION = "1.2"`.
+`tests/project.rs` assert that — keep it there. JSON contract is at `SCHEMA_VERSION = "0.1"`
+(pre-release: it absorbs all contract changes until a first release ships).
 
 Recently closed (kept here one handover-cycle for context):
 

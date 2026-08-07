@@ -15,8 +15,9 @@ pub mod stub;
 pub mod validate;
 
 /// The version of the top-level JSON contract emitted by `analyze` / `record` / `validate`.
-/// Downstream adapters key off this to detect breaking schema changes.
-pub const SCHEMA_VERSION: &str = "1.2";
+/// Downstream adapters key off this to detect breaking schema changes. Pre-release: stays at
+/// `0.1` and absorbs all contract changes until a first release ships.
+pub const SCHEMA_VERSION: &str = "0.1";
 
 /// Strip a leading UTF-8 byte-order mark from Python source. CPython accepts BOM-prefixed
 /// source files, so pylens must too — but a U+FEFF reaching `compile()` as text (in the jailed
