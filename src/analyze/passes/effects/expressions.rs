@@ -28,7 +28,8 @@ impl Walker < '_ , '_ > {
                     // raise, over-approximated by the base's shape known so far in this forward
                     // walk: mapping ⇒ `KeyError`, sequence/str ⇒ `IndexError`, else both.
                     if let Some(shape) = self.facts.env_shape(&s.value) {
-                        for exc in subscript_read_exceptions(&shape) {
+                        let is_param_root = self.facts.param_root(&s.value).is_some();
+                        for exc in subscript_read_exceptions(&shape, is_param_root) {
                             self.facts.sig.raises.implicit.push((*exc).to_string());
                         }
                     }

@@ -249,26 +249,33 @@ fn ordered_compare_on_any_param_yields_implicit_type_error() {
 }
 
 #[test]
-fn ordered_compare_on_pinned_shape_param_yields_no_type_error() {
+fn ordered_compare_on_pinned_shape_param_still_yields_type_error() {
+    // `a`'s shape gets pinned to `int` by this very comparison — the analyzer must not use that
+    // self-derived pin to prove the comparison safe. A caller owes the parameter's declared
+    // shape nothing, so the may-set still carries `TypeError`.
     let s = analyze("def f(a):\n    if a > 0:\n        return 1\n    return 0\n");
     let f = sig(&s, "f");
-    assert!(!f.raises.implicit.contains(&"TypeError".to_string()));
+    assert!(f.raises.implicit.contains(&"TypeError".to_string()));
 }
 
 #[test]
-fn mapping_shaped_subscript_read_yields_key_error() {
+fn mapping_shaped_subscript_read_on_param_yields_both_key_and_index_error() {
+    // `d` is a parameter pinned to `Map` by its own `.get(k)` usage; a caller can still pass a
+    // sequence, so the may-set must not narrow to `KeyError` alone.
     let s = analyze("def f(d, k):\n    d.get(k)\n    return d[k]\n");
     let f = sig(&s, "f");
     assert!(f.raises.implicit.contains(&"KeyError".to_string()));
-    assert!(!f.raises.implicit.contains(&"IndexError".to_string()));
+    assert!(f.raises.implicit.contains(&"IndexError".to_string()));
 }
 
 #[test]
-fn sequence_shaped_subscript_read_yields_index_error() {
+fn sequence_shaped_subscript_read_on_param_yields_both_key_and_index_error() {
+    // `xs` is a parameter pinned to `Seq` by its own `.append(1)` usage; a caller can still pass
+    // a mapping, so the may-set must not narrow to `IndexError` alone.
     let s = analyze("def f(xs, i):\n    xs.append(1)\n    return xs[i]\n");
     let f = sig(&s, "f");
     assert!(f.raises.implicit.contains(&"IndexError".to_string()));
-    assert!(!f.raises.implicit.contains(&"KeyError".to_string()));
+    assert!(f.raises.implicit.contains(&"KeyError".to_string()));
 }
 
 #[test]
@@ -289,10 +296,33 @@ fn subscript_with_any_base_yields_implicit_type_error() {
 }
 
 #[test]
-fn subscript_with_literal_index_on_pinned_base_yields_no_type_error() {
+fn subscript_with_literal_index_on_pinned_param_base_still_yields_type_error() {
+    // `xs` is a parameter, and a parameter's pinned shape (here, from its own `.append(1)`
+    // usage) constrains no caller — a caller can still pass a non-subscriptable value, so the
+    // BASE remains a `TypeError` candidate even though the literal index itself is not.
     let s = analyze("def g(xs):\n    xs.append(1)\n    return xs[0]\n");
     let g = sig(&s, "g");
-    assert!(!g.raises.implicit.contains(&"TypeError".to_string()));
+    assert!(g.raises.implicit.contains(&"TypeError".to_string()));
+}
+
+#[test]
+fn subscript_on_local_list_literal_does_not_gain_key_error() {
+    // `xs` is a LOCAL built from a list literal, never a parameter — a caller cannot substitute
+    // a mapping into it, so its pinned `Seq` shape may still narrow the may-set to `IndexError`
+    // alone.
+    let s = analyze("def f(i):\n    xs = [1, 2, 3]\n    return xs[i]\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"IndexError".to_string()));
+    assert!(!f.raises.implicit.contains(&"KeyError".to_string()));
+}
+
+#[test]
+fn local_aliasing_a_parameter_is_treated_as_a_parameter_for_type_error() {
+    // `y = x` makes `y` alias the parameter `x`; comparing `y` must be treated exactly like
+    // comparing `x` directly — the pinned shape still cannot suppress the may-raise.
+    let s = analyze("def f(x):\n    y = x\n    if y > 0:\n        return 1\n    return 0\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"TypeError".to_string()));
 }
 
 #[test]

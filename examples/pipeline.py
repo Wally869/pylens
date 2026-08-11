@@ -29,7 +29,7 @@ class Basket:
 
 def open_and_fund(amount):
     account = Account()
-    if amount != 0:
+    if amount < 0:
         account.deposit(amount)
     return account.balance
 

@@ -358,15 +358,21 @@ impl<'a> FunctionFacts<'a> {
 
     /// `expr` sits in a position that mistypes at runtime when its type is unknown (an ordered
     /// comparison/arithmetic operand, a subscript key or base, a membership test's left
-    /// operand, ...): if `expr`'s rooted [`env_shape`](Self::env_shape) is still `Shape::Any`,
-    /// its type genuinely is unknown to the analyzer and the operation may raise `TypeError` at
-    /// runtime. An operand pinned to a concrete shape is confident enough to omit it — input
-    /// generation respects that shape, so the runtime call site won't mistype it.
+    /// operand, ...): the operation may raise `TypeError` if either (a) `expr`'s rooted
+    /// [`env_shape`](Self::env_shape) is still `Shape::Any`/`Shape::Union` — its type genuinely
+    /// is unknown to the analyzer — or (b) `expr` roots to a *parameter* ([`param_root`]). A
+    /// parameter's shape is only a hypothesis inferred from how the function uses it internally;
+    /// Python enforces no such contract on callers, so a pinned parameter shape constrains no
+    /// caller and cannot narrow this may-set. A *local* built from a literal (`xs = []`) has no
+    /// such caller, so its pinned shape can still narrow — hence the two-part check below rather
+    /// than folding this into `env_shape` itself.
     pub(in crate::analyze) fn note_type_error_candidate(&mut self, expr: &ast::Expr) {
         // A `Union` operand is just as "not confidently a single concrete type" as `Any` is —
         // treating it as safe here would narrow the may-set below what `Any` gave before `Union`
         // existed, which is unsound (see `Shape::Union`'s doc).
-        if matches!(self.env_shape(expr), Some(Shape::Any) | Some(Shape::Union(_))) {
+        let unresolved_shape = matches!(self.env_shape(expr), Some(Shape::Any) | Some(Shape::Union(_)));
+        let roots_at_param = self.param_root(expr).is_some();
+        if unresolved_shape || roots_at_param {
             self.sig.raises.implicit.push("TypeError".to_string());
         }
     }
