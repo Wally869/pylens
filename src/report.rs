@@ -283,6 +283,7 @@ mod tests {
             declared: None,
             guard_samples: Vec::new(),
             default_literal: None,
+            hints: Vec::new(),
         });
         sig.mutations.push(Mutation {
             target: MutationTarget::Param {

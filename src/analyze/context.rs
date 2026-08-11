@@ -230,6 +230,11 @@ pub(in crate::analyze) struct FunctionFacts<'a> {
     /// tests and ternary conditions as they're visited — see `collect::guards`. Merged into
     /// `ParamInfo::guard_samples` in `finish`.
     pub(in crate::analyze) guard_samples: HashMap<String, Vec<serde_json::Value>>,
+    /// Parameter root -> inferred content-domain tags (`"url"`, `"json"`, ...), computed once
+    /// up front from the whole function body — see `collect::hints`. Merged into
+    /// `ParamInfo::hints` in `finish`. Unlike `guard_samples`, this isn't accumulated
+    /// incrementally during the walk.
+    pub(in crate::analyze) hints: HashMap<String, Vec<String>>,
     pub(in crate::analyze) sig: EffectSignature,
 }
 
@@ -262,6 +267,7 @@ impl<'a> FunctionFacts<'a> {
             call_sites: Vec::new(),
             import_call_sites: Vec::new(),
             guard_samples: HashMap::new(),
+            hints: HashMap::new(),
             sig,
         }
     }

@@ -50,6 +50,7 @@ fn param_info(
         declared,
         guard_samples: Vec::new(),
         default_literal,
+        hints: Vec::new(),
     }
 }
 

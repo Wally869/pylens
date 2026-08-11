@@ -15,6 +15,7 @@ pub(super) fn finish(facts: FunctionFacts, param_defs: Vec<ParamInfo>) -> Effect
         .map(|pi| ParamInfo {
             shape: facts.shapes.get(&pi.name).cloned().unwrap_or(Shape::Any),
             guard_samples: facts.guard_samples.get(&pi.name).cloned().unwrap_or_default(),
+            hints: facts.hints.get(&pi.name).cloned().unwrap_or_default(),
             ..pi
         })
         .collect();

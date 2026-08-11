@@ -79,6 +79,25 @@ fn guard_samples_appear_in_generated_vectors() {
     );
 }
 
+#[test]
+fn hinted_param_receives_a_corpus_value_at_default_budget() {
+    let sigs = analyze_source(
+        "from urllib.parse import urlparse\ndef f(url):\n    return urlparse(url)\n",
+    )
+    .expect("parse");
+    let f = sig(&sigs, "f");
+    let vectors = gen_inputs(&f, 12);
+    assert!(!vectors.is_empty());
+    assert!(
+        vectors.iter().any(|v| v
+            .positional
+            .first()
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.starts_with("http://"))),
+        "expected a well-formed URL from the hint corpus among generated inputs: {vectors:?}"
+    );
+}
+
 fn abs_num(v: &Value) -> f64 {
     v.as_f64().expect("expected a JSON number").abs()
 }

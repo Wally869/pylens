@@ -235,6 +235,13 @@ pub struct ParamInfo {
     /// input only, never folded into `shape` — it can't affect the may-set or purity.
     #[serde(skip)]
     pub default_literal: Option<serde_json::Value>,
+    /// Inferred content-domain tags (`"url"`, `"email"`, `"path"`, `"json"`, `"date"`,
+    /// `"numeric_str"`, `"regex"`, `"html"`) — see `analyze::collect::hints`. **Advisory only**,
+    /// exactly like `type_mismatches`: never folded into `shape`, never affects `purity` or
+    /// `raises`. Feeds `generate::seeds::hint_candidates` so generation is more likely to reach
+    /// a function's real body instead of raising on the first parse of a placeholder string.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<String>,
 }
 
 /// The full effect signature of one function/method.

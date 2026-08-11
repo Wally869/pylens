@@ -315,6 +315,7 @@ mod tests {
             declared: None,
             guard_samples: Vec::new(),
             default_literal: None,
+            hints: Vec::new(),
         }
     }
 
@@ -380,6 +381,7 @@ mod tests {
             declared: None,
             guard_samples: Vec::new(),
             default_literal: None,
+            hints: Vec::new(),
         });
         sig.params.push(ParamInfo {
             name: "flag".to_string(),
@@ -389,6 +391,7 @@ mod tests {
             declared: None,
             guard_samples: Vec::new(),
             default_literal: None,
+            hints: Vec::new(),
         });
         sig.params.push(ParamInfo {
             name: "kwargs".to_string(),
@@ -398,6 +401,7 @@ mod tests {
             declared: None,
             guard_samples: Vec::new(),
             default_literal: None,
+            hints: Vec::new(),
         });
         let out = render_stub(std::slice::from_ref(&sig));
         assert!(out.contains(

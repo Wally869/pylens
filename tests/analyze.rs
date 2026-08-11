@@ -859,3 +859,53 @@ fn project_local_import_never_matches_a_stdlib_model() {
         f.unresolved_effects
     );
 }
+
+#[test]
+fn param_named_url_passed_to_urlparse_gets_url_tag() {
+    let s = analyze(
+        "from urllib.parse import urlparse\ndef f(url):\n    return urlparse(url)\n",
+    );
+    let f = sig(&s, "f");
+    let p = f.params.iter().find(|p| p.name == "url").unwrap();
+    assert!(
+        p.hints.iter().any(|h| h == "url"),
+        "expected the url tag: {:?}",
+        p.hints
+    );
+}
+
+#[test]
+fn param_with_no_evidence_gets_no_hints() {
+    let s = analyze("def f(x):\n    return x + 1\n");
+    let f = sig(&s, "f");
+    let x = f.params.iter().find(|p| p.name == "x").unwrap();
+    assert!(x.hints.is_empty(), "expected no hints: {:?}", x.hints);
+}
+
+#[test]
+fn hints_never_change_purity_or_raises() {
+    let with_hint = analyze("def f(s):\n    return int(s)\n");
+    let without_hint = analyze("def f(z):\n    return int(z)\n");
+    let f_hint = sig(&with_hint, "f");
+    let f_plain = sig(&without_hint, "f");
+    assert_eq!(f_hint.purity, f_plain.purity);
+    assert_eq!(f_hint.raises, f_plain.raises);
+    let s = f_hint.params.iter().find(|p| p.name == "s").unwrap();
+    assert!(
+        s.hints.iter().any(|h| h == "numeric_str"),
+        "expected the numeric_str tag: {:?}",
+        s.hints
+    );
+}
+
+#[test]
+fn hints_field_omitted_from_json_when_empty() {
+    let s = analyze("def f(x):\n    return x + 1\n");
+    let f = sig(&s, "f");
+    let json = serde_json::to_value(f).unwrap();
+    let param = &json["params"][0];
+    assert!(
+        param.get("hints").is_none(),
+        "expected `hints` omitted from JSON when empty: {param}"
+    );
+}
