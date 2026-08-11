@@ -86,7 +86,9 @@ fn shape_kind_tag(shape: &Shape) -> Option<&'static str> {
         Shape::Seq(_) => Some("seq"),
         Shape::Map(..) => Some("map"),
         Shape::Set(_) => Some("set"),
-        Shape::Any | Shape::Union(_) => None,
+        // No declared annotation ever names a bare class the way it names `int`/`list`/... —
+        // `permitted_shape_kinds` has no comparable tag for `Instance`, so it's never flagged.
+        Shape::Any | Shape::Union(_) | Shape::Instance(_) => None,
     }
 }
 

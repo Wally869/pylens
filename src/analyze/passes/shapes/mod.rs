@@ -74,13 +74,13 @@ impl Pass for ShapesPass {
             match stmt {
                 ast::Stmt::FunctionDef(def) => {
                     let receiver = receivers.next().unwrap_or(ReceiverKind::None);
-                    ctx.shapes.push(infer_function(def, receiver));
+                    ctx.shapes.push(infer_function(def, receiver, &ctx.classes));
                 }
                 ast::Stmt::ClassDef(class) => {
                     for member in &class.body {
                         if let ast::Stmt::FunctionDef(def) = member {
                             let receiver = receivers.next().unwrap_or(ReceiverKind::None);
-                            ctx.shapes.push(infer_function(def, receiver));
+                            ctx.shapes.push(infer_function(def, receiver, &ctx.classes));
                         }
                     }
                 }
@@ -92,7 +92,11 @@ impl Pass for ShapesPass {
 
 /// Run the fixpoint walk for one function, returning the final name -> shape env (params and
 /// locals alike; the caller/`EffectsPass` picks out only the parameter names it needs).
-fn infer_function(def: &ast::StmtFunctionDef, receiver: ReceiverKind) -> HashMap<String, Shape> {
+fn infer_function(
+    def: &ast::StmtFunctionDef,
+    receiver: ReceiverKind,
+    classes: &std::collections::HashSet<String>,
+) -> HashMap<String, Shape> {
     let params = param_names(&def.parameters);
     let self_param = match receiver {
         ReceiverKind::SelfParam | ReceiverKind::Cls => params.first().cloned(),
@@ -103,7 +107,7 @@ fn infer_function(def: &ast::StmtFunctionDef, receiver: ReceiverKind) -> HashMap
         .filter(|p| Some(p.as_str()) != self_param.as_deref())
         .collect();
 
-    let mut state = ShapeState::new(&tracked);
+    let mut state = ShapeState::new(&tracked, classes.clone());
     for _ in 0..MAX_ITERATIONS {
         let before = state.env.clone();
         visit_body(&def.body, &mut state);

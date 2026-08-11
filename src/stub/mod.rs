@@ -30,9 +30,9 @@ pub(crate) struct ObservedTypes {
 /// Map an inferred parameter [`Shape`] to a Python type expression.
 ///
 /// `Int`→`int`, `Float`→`float`, `Bool`→`bool`, `Str`→`str`, `Bytes`→`bytes`, `None`→`None`,
-/// `Seq(e)`→`list[<e>]`, `Set(e)`→`set[<e>]`, `Map(k,v)`→`dict[<k>, <v>]`, `Any`→`Any`,
-/// `Union([..])`→PEP 604 `A | B | ...` (an `Optional[X]` is just `Union(X, None)`, so it renders
-/// as `X | None` with no separate case needed).
+/// `Seq(e)`→`list[<e>]`, `Set(e)`→`set[<e>]`, `Map(k,v)`→`dict[<k>, <v>]`, `Instance(C)`→`C`,
+/// `Any`→`Any`, `Union([..])`→PEP 604 `A | B | ...` (an `Optional[X]` is just `Union(X, None)`, so
+/// it renders as `X | None` with no separate case needed).
 pub fn shape_to_pytype(shape: &Shape) -> String {
     match shape {
         Shape::Int => "int".to_string(),
@@ -52,6 +52,7 @@ pub fn shape_to_pytype(shape: &Shape) -> String {
             .map(shape_to_pytype)
             .collect::<Vec<_>>()
             .join(" | "),
+        Shape::Instance(name) => name.clone(),
     }
 }
 

@@ -25,6 +25,31 @@ fn attr_off_receiver<'e>(expr: &'e ast::Expr, self_param: &str) -> Option<&'e st
     }
 }
 
+/// How a resolved [`CallSite`]'s receiver maps onto the callee's `SelfAttr` mutations.
+#[derive(Debug, Clone)]
+pub(in crate::analyze) enum CallReceiver {
+    /// A plain function call — no receiver.
+    None,
+    /// `self.m(...)` / `cls.m(...)`: the callee's `SelfAttr` mutations are the caller's own
+    /// receiver's mutations too, and propagate unchanged.
+    CallerSelf,
+    /// `x.m(...)` on a tracked root whose settled shape is exactly `Shape::Instance(C)`: the
+    /// callee's `SelfAttr` mutations are mutations of that root, so they're rewritten onto it.
+    /// `resolve_target` only ever returns a root here when `x` is a genuine caller-visible
+    /// target — a declared parameter, a `self`-attribute, a global, or a nonlocal — never a
+    /// fresh local (`x = Foo(...)`), which stays untracked (`aliases.remove`, unchanged since
+    /// before this feature) precisely because a freshly constructed object is never the
+    /// caller's object. So a resolved call on a fresh local produces `CallReceiver::None`
+    /// instead: its raises/io/global-writes/unresolved-effects still propagate (computed
+    /// unconditionally in `interprocedural.rs`, independent of the receiver), but its
+    /// `SelfAttr` mutations are dropped rather than fabricated onto a name that isn't a
+    /// parameter — the same treatment a fresh local list/dict/set already gets. Dropping can
+    /// only ever narrow the (already correctly over-approximated) mutation may-set for a target
+    /// the dynamic recorder could never observe anyway (it only diffs real arguments and
+    /// `self`), so it cannot introduce an under-approximation.
+    Root(MutationTarget),
+}
+
 /// One resolved intra-module call: a call site, inside some caller function, whose callee the
 /// Effects pass determined (via the Declarations symbol table) is a function/method defined in
 /// this same module. Consumed by the Interprocedural pass.
@@ -45,10 +70,8 @@ pub(in crate::analyze) struct CallSite {
     /// Index into `ModuleAnalysis::declarations` / `ModuleAnalysis::signatures` (the two are
     /// built in the same module-traversal order) identifying the callee.
     pub(in crate::analyze) callee: usize,
-    /// The call was `self.method(...)` / `cls.method(...)` on the caller's own receiver — so
-    /// the callee's `SelfAttr` mutations are mutations of the caller's own receiver too, and
-    /// propagate unchanged rather than through `arg_roots`.
-    pub(in crate::analyze) via_self: bool,
+    /// How the callee's `SelfAttr` mutations map onto the caller.
+    pub(in crate::analyze) receiver: CallReceiver,
     /// The caller-side root each positional call argument resolves to (`None` where it doesn't
     /// root to a tracked target), parallel in order to the call's positional arguments.
     pub(in crate::analyze) arg_roots: Vec<Option<MutationTarget>>,
@@ -113,6 +136,10 @@ pub(in crate::analyze) struct ModuleAnalysis {
     /// Function/method symbol table built by the Declarations pass; the enabler for intra-file
     /// call resolution (Effects) and effect propagation (Interprocedural).
     pub(in crate::analyze) declarations: Vec<DeclInfo>,
+    /// Names of classes declared at module top level, built by the Declarations pass. The
+    /// Shapes pass consults this to infer `Shape::Instance(C)` for a same-module constructor
+    /// call `C(...)`; an imported class isn't in this set, so it stays `Any`.
+    pub(in crate::analyze) classes: HashSet<String>,
     /// Per-function name->shape environments (params and locals) built by the Shapes pass, one
     /// entry per function/method in the same order as `declarations`. The Effects pass reads
     /// the parameter shapes out of these; never serialized directly.
@@ -139,6 +166,7 @@ impl ModuleAnalysis {
             bindings: HashMap::new(),
             has_star: false,
             declarations: Vec::new(),
+            classes: HashSet::new(),
             shapes: Vec::new(),
             signatures: Vec::new(),
             call_sites: Vec::new(),
@@ -157,6 +185,9 @@ pub(in crate::analyze) struct ModuleCtx<'a> {
     pub(in crate::analyze) has_star: bool,
     /// The module-wide function/method symbol table, for resolving local calls.
     pub(in crate::analyze) declarations: &'a [DeclInfo],
+    /// Names of classes declared at module top level, for resolving a same-module constructor
+    /// call `C(...)` against `C.__init__`.
+    pub(in crate::analyze) classes: &'a HashSet<String>,
 }
 
 /// Per-function accumulator: the mutable state one function's Effects walk reads and writes,
@@ -183,6 +214,9 @@ pub(in crate::analyze) struct FunctionFacts<'a> {
     /// The module-wide symbol table (read-only here), for resolving a call to a locally-defined
     /// function/method — see `passes::declarations::resolve_unique`.
     pub(in crate::analyze) declarations: &'a [DeclInfo],
+    /// Names of classes declared at module top level, for resolving a same-module constructor
+    /// call `C(...)` against `C.__init__` the same way a method call resolves against a class.
+    pub(in crate::analyze) classes: &'a HashSet<String>,
     /// The class this function is a method of, `None` for a free function — the `owner` half of
     /// resolving `self.method(...)` / `cls.method(...)` against `declarations`.
     pub(in crate::analyze) owner: Option<String>,
@@ -223,6 +257,7 @@ impl<'a> FunctionFacts<'a> {
             used_imports: Vec::new(),
             may_use_star: false,
             declarations: module.declarations,
+            classes: module.classes,
             owner,
             call_sites: Vec::new(),
             import_call_sites: Vec::new(),

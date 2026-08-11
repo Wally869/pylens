@@ -15,7 +15,11 @@
 //!   callee's own `**kwargs`); sound, since the may-set only grows and an unmapped root has
 //!   nothing to over-approximate onto.
 //! - A callee `SelfAttr` mutation propagates unchanged when the call was `self.method(...)` /
-//!   `cls.method(...)` on the caller's own receiver — same underlying object.
+//!   `cls.method(...)` on the caller's own receiver — same underlying object
+//!   ([`CallReceiver::CallerSelf`]). When the call was `x.method(...)` on a tracked local whose
+//!   settled shape resolved to exactly one class ([`CallReceiver::Root`]), the mutation's root is
+//!   rewritten onto that local instead — same underlying object, different name. Dropped if the
+//!   receiver isn't tracked at all ([`CallReceiver::None`]).
 //! - A callee `Global` mutation propagates unchanged (a module-global name is absolute, not
 //!   parameterized by the call).
 //! - A callee's raises — explicit and implicit alike — fold into the caller's `raises.implicit`:
@@ -41,7 +45,7 @@ use ruff_python_ast as ast;
 
 use crate::model::{Mutation, MutationTarget, ParamKind, UnresolvedEffect};
 
-use super::super::context::{CallSite, ModuleAnalysis};
+use super::super::context::{CallReceiver, CallSite, ModuleAnalysis};
 use super::super::pass::Pass;
 
 pub(in crate::analyze) struct InterproceduralPass;
@@ -86,7 +90,7 @@ fn apply_call_site(ctx: &mut ModuleAnalysis, caller: usize, site: &CallSite) -> 
                 &callee_positional,
                 &site.arg_roots,
                 &site.kwarg_roots,
-                site.via_self,
+                &site.receiver,
             )?;
             Some(Mutation { target, via: m.via, name: m.name.clone() })
         })
@@ -109,7 +113,7 @@ fn apply_call_site(ctx: &mut ModuleAnalysis, caller: usize, site: &CallSite) -> 
                 .may_affect
                 .iter()
                 .map(|t| {
-                    remap_target(t, &callee_positional, &site.arg_roots, &site.kwarg_roots, site.via_self)
+                    remap_target(t, &callee_positional, &site.arg_roots, &site.kwarg_roots, &site.receiver)
                         .unwrap_or_else(|| t.clone())
                 })
                 .collect();
@@ -148,11 +152,14 @@ fn remap_target(
     callee_positional: &[String],
     arg_roots: &[Option<MutationTarget>],
     kwarg_roots: &[(String, Option<MutationTarget>)],
-    via_self: bool,
+    receiver: &CallReceiver,
 ) -> Option<MutationTarget> {
     match target {
-        MutationTarget::SelfAttr { .. } if via_self => Some(target.clone()),
-        MutationTarget::SelfAttr { .. } => None,
+        MutationTarget::SelfAttr { .. } => match receiver {
+            CallReceiver::CallerSelf => Some(target.clone()),
+            CallReceiver::Root(root) => Some(root.clone()),
+            CallReceiver::None => None,
+        },
         MutationTarget::Param { name } => {
             if let Some((_, root)) = kwarg_roots.iter().find(|(kw, _)| kw == name) {
                 return root.clone();

@@ -3,7 +3,7 @@
 //! refinement (write) side of the env, and [`super::shape_of`] for read-only shape derivation
 //! from an expression.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::model::Shape;
 
@@ -13,17 +13,20 @@ use crate::model::Shape;
 pub(super) struct ShapeState {
     pub(super) aliases: HashMap<String, String>,
     pub(super) env: HashMap<String, Shape>,
+    /// Names of classes declared in this module — a constructor call `C(...)` for `C` in this
+    /// set infers `Shape::Instance(C)`; anything else (including an imported class) doesn't.
+    pub(super) classes: HashSet<String>,
 }
 
 impl ShapeState {
-    pub(super) fn new(params: &[String]) -> Self {
+    pub(super) fn new(params: &[String], classes: HashSet<String>) -> Self {
         let mut aliases = HashMap::new();
         let mut env = HashMap::new();
         for p in params {
             aliases.insert(p.clone(), p.clone());
             env.insert(p.clone(), Shape::Any);
         }
-        Self { aliases, env }
+        Self { aliases, env, classes }
     }
 
     /// The representative name `name` currently denotes the same object as (identity, not

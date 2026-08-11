@@ -14,7 +14,16 @@ impl Walker < '_ , '_ > {
                         self.facts.aliases.insert(n.to_string(), root);
                         return;
                     }
-                    // Rebinding: x no longer aliases its original parameter object.
+                    // Rebinding: x no longer aliases its original parameter object. This holds
+                    // even for `x = Foo(...)` where `Foo` is a same-module class: the freshly
+                    // constructed instance is never the caller's object, so a later
+                    // `x.method(...)`'s `SelfAttr` mutations can't be attributed to any
+                    // caller-visible root either (`CallReceiver::Root` requires `x` to already be
+                    // a tracked root — a parameter, `self`-attribute, global, or nonlocal — which
+                    // a fresh local, by construction, is not). Mirrors the treatment of a fresh
+                    // local list/dict/set: the mutation is real but invisible to the caller, so it
+                    // isn't recorded as an effect at all, never fabricated onto a name that isn't
+                    // actually a parameter.
                     self.facts.aliases.remove(n);
                     // Writing a module-level global declared in this scope.
                     if self.facts.globals.contains(n) {

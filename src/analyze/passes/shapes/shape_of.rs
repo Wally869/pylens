@@ -60,7 +60,7 @@ pub(super) fn shape_of(expr: &ast::Expr, state: &ShapeState) -> Shape {
         Expr::If(i) => Shape::join(shape_of(&i.body, state), shape_of(&i.orelse, state)),
         Expr::Named(n) => shape_of(&n.value, state),
         Expr::Starred(s) => shape_of(&s.value, state),
-        Expr::Call(c) => shape_of_call(c),
+        Expr::Call(c) => shape_of_call(c, state),
         Expr::ListComp(_) => Shape::any_seq(),
         Expr::SetComp(_) => Shape::any_set(),
         Expr::DictComp(_) => Shape::any_map(),
@@ -73,7 +73,7 @@ fn join_all(iter: impl Iterator<Item = Shape>) -> Shape {
     iter.fold(Shape::Any, Shape::join)
 }
 
-fn shape_of_call(call: &ast::ExprCall) -> Shape {
+fn shape_of_call(call: &ast::ExprCall, state: &ShapeState) -> Shape {
     let ast::Expr::Name(n) = call.func.as_ref() else {
         return Shape::Any;
     };
@@ -86,6 +86,7 @@ fn shape_of_call(call: &ast::ExprCall) -> Shape {
         "list" | "tuple" | "sorted" | "reversed" => Shape::any_seq(),
         "dict" => Shape::any_map(),
         "set" | "frozenset" => Shape::any_set(),
+        name if state.classes.contains(name) => Shape::Instance(name.to_string()),
         _ => Shape::Any,
     }
 }

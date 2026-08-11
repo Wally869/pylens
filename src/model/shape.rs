@@ -11,6 +11,9 @@ pub enum Shape {
     Seq(Box<Shape>),
     Map(Box<Shape>, Box<Shape>),
     Set(Box<Shape>),
+    /// An instance of a class declared in this module, named by its class name. Produced only
+    /// for a same-module class constructor call (`Foo(...)`); an imported class stays `Any`.
+    Instance(String),
     Any,
     Union(Vec<Shape>),
 }
@@ -72,7 +75,7 @@ pub fn same_constructor(a: &Shape, b: &Shape) -> bool {
         (Shape::Int, Shape::Int) | (Shape::Float, Shape::Float) | (Shape::Bool, Shape::Bool)
         | (Shape::Str, Shape::Str) | (Shape::Bytes, Shape::Bytes) | (Shape::None, Shape::None)
         | (Shape::Seq(_), Shape::Seq(_)) | (Shape::Map(..), Shape::Map(..)) | (Shape::Set(_), Shape::Set(_))
-    )
+    ) || matches!((a, b), (Shape::Instance(x), Shape::Instance(y)) if x == y)
 }
 
 impl Serialize for Shape {
@@ -110,6 +113,11 @@ impl Serialize for Shape {
                 map.serialize_entry("union", members)?;
                 map.end()
             }
+            Shape::Instance(name) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("instance", name)?;
+                map.end()
+            }
         }
     }
 }
@@ -142,10 +150,59 @@ impl<'de> Deserialize<'de> for Shape {
                         Ok(Shape::Map(Box::new(fields.key), Box::new(fields.value)))
                     }
                     "union" => Ok(Shape::union_of(map.next_value::<Vec<Shape>>()?)),
-                    other => Err(de::Error::unknown_variant(other, &["seq", "set", "map", "union"])),
+                    "instance" => Ok(Shape::Instance(map.next_value()?)),
+                    other => Err(de::Error::unknown_variant(other, &["seq", "set", "map", "union", "instance"])),
                 }
             }
         }
         deserializer.deserialize_any(ShapeVisitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instance_serde_round_trip() {
+        let shape = Shape::Instance("Foo".to_string());
+        let json = serde_json::to_string(&shape).expect("serialize");
+        assert_eq!(json, r#"{"instance":"Foo"}"#);
+        let back: Shape = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, shape);
+    }
+
+    #[test]
+    fn same_class_instance_joins_to_itself() {
+        let joined = Shape::join(Shape::Instance("Foo".into()), Shape::Instance("Foo".into()));
+        assert_eq!(joined, Shape::Instance("Foo".into()));
+    }
+
+    #[test]
+    fn different_class_instances_join_to_a_union() {
+        let joined = Shape::join(Shape::Instance("Foo".into()), Shape::Instance("Bar".into()));
+        assert_eq!(
+            joined,
+            Shape::Union(vec![Shape::Instance("Bar".into()), Shape::Instance("Foo".into())])
+        );
+    }
+
+    #[test]
+    fn instance_joined_with_non_instance_shape_unions() {
+        let joined = Shape::join(Shape::Instance("Foo".into()), Shape::Int);
+        assert_eq!(joined, Shape::Union(vec![Shape::Int, Shape::Instance("Foo".into())]));
+    }
+
+    #[test]
+    fn union_canonicalization_merges_same_class_instances() {
+        let u = Shape::union_of([
+            Shape::Instance("Foo".into()),
+            Shape::Instance("Foo".into()),
+            Shape::Instance("Bar".into()),
+        ]);
+        assert_eq!(
+            u,
+            Shape::Union(vec![Shape::Instance("Bar".into()), Shape::Instance("Foo".into())])
+        );
     }
 }

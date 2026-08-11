@@ -625,3 +625,125 @@ fn ordered_guard_records_boundary_neighbors() {
         x.guard_samples
     );
 }
+
+#[test]
+fn local_instance_method_call_resolves_but_reports_no_mutation() {
+    // `account` is a fresh local, not a parameter: the caller can never observe its mutation
+    // (exactly like a fresh local list/dict — see `local_collection_mutation_is_not_an_effect`),
+    // so the resolved call must not fabricate a mutation onto a name that isn't a real parameter.
+    let s = analyze(
+        "class Account:\n\
+         \x20   def __init__(self):\n\
+         \x20       self.balance = 0\n\
+         \x20   def deposit(self, amount):\n\
+         \x20       self.balance += amount\n\
+         def f(amount):\n\
+         \x20   account = Account()\n\
+         \x20   account.deposit(amount)\n",
+    );
+    let f = sig(&s, "f");
+    // Not an opaque, unresolved call: the deposit method resolved, so no
+    // `call_method_unknown` for it.
+    assert!(!f.unresolved_effects.iter().any(|u| u.reason == "call_method_unknown"));
+    assert!(f.mutations.is_empty(), "expected no mutations, got {:?}", f.mutations);
+}
+
+#[test]
+fn constructor_call_to_same_module_class_is_not_an_unknown_callee() {
+    let s = analyze(
+        "class Account:\n\
+         \x20   def __init__(self):\n\
+         \x20       self.balance = 0\n\
+         def f():\n\
+         \x20   account = Account()\n\
+         \x20   return account\n",
+    );
+    let f = sig(&s, "f");
+    assert!(!f.unresolved_effects.iter().any(|u| u.reason == "call_unknown_callee"));
+}
+
+#[test]
+fn raise_propagates_through_a_resolved_constructor_and_a_resolved_method_call() {
+    let s = analyze(
+        "class Account:\n\
+         \x20   def __init__(self, amount):\n\
+         \x20       if amount < 0:\n\
+         \x20           raise ValueError('negative')\n\
+         \x20       self.balance = amount\n\
+         \x20   def deposit(self, amount):\n\
+         \x20       if amount < 0:\n\
+         \x20           raise ValueError('negative')\n\
+         \x20       self.balance += amount\n\
+         def f(amount):\n\
+         \x20   account = Account(amount)\n\
+         \x20   account.deposit(amount)\n",
+    );
+    let f = sig(&s, "f");
+    // Both the constructor's and `deposit`'s `ValueError` propagate to the caller, though
+    // neither call attributes a mutation (the receiver is always a fresh, caller-invisible
+    // local) — the point of resolving these calls is the raise (and any io/global-write),
+    // not the mutation, which genuinely can't reach the caller.
+    assert!(f.raises.explicit.contains(&"ValueError".to_string())
+        || f.raises.implicit.contains(&"ValueError".to_string()));
+    assert!(f.mutations.is_empty());
+    assert!(!f.unresolved_effects.iter().any(|u| u.reason == "call_unknown_callee"));
+}
+
+#[test]
+fn union_of_two_instances_does_not_resolve_the_method_call() {
+    let s = analyze(
+        "class Account:\n\
+         \x20   def label(self, tag):\n\
+         \x20       return tag\n\
+         class Basket:\n\
+         \x20   def label(self, tag):\n\
+         \x20       return tag\n\
+         def f(flag, tag):\n\
+         \x20   if flag:\n\
+         \x20       holder = Account()\n\
+         \x20   else:\n\
+         \x20       holder = Basket()\n\
+         \x20   holder.label(tag)\n",
+    );
+    let f = sig(&s, "f");
+    // A union receiver must NOT resolve — it stays an unresolved, opaque call.
+    assert!(
+        f.unresolved_effects
+            .iter()
+            .any(|u| u.reason == "call_method_unknown" && u.callee.as_deref() == Some("label"))
+    );
+}
+
+#[test]
+fn inherited_method_does_not_resolve() {
+    let s = analyze(
+        "class Base:\n\
+         \x20   def run(self):\n\
+         \x20       return 1\n\
+         class Sub(Base):\n\
+         \x20   pass\n\
+         def f():\n\
+         \x20   obj = Sub()\n\
+         \x20   obj.run()\n",
+    );
+    let f = sig(&s, "f");
+    // `run` is declared on `Base`, not `Sub` — `resolve_unique(decls, Some("Sub"), "run")`
+    // finds nothing, so the call stays unresolved rather than misattributing to `Base`.
+    assert!(
+        f.unresolved_effects
+            .iter()
+            .any(|u| u.reason == "call_method_unknown" && u.callee.as_deref() == Some("run"))
+    );
+}
+
+#[test]
+fn imported_class_does_not_infer_an_instance_shape() {
+    let s = analyze("from somewhere import Widget\ndef f():\n    w = Widget()\n    w.render()\n");
+    let f = sig(&s, "f");
+    // `Widget` isn't declared in this module (it's imported), so the constructor call is a
+    // foreign effect, not a same-module class — its shape stays `Any`, so `w.render()` can never
+    // resolve through `Shape::Instance` (it still reaches the generic `call_method_unknown`
+    // acknowledgment for an unrecognized method, same as any other unresolved receiver).
+    assert!(f.unresolved_effects.iter().any(|u| u.reason == "call_import" && u.callee.as_deref() == Some("Widget")));
+    assert!(f.unresolved_effects.iter().any(|u| u.reason == "call_method_unknown"));
+}

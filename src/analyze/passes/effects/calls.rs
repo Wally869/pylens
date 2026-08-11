@@ -3,7 +3,7 @@ use crate::model::*;
 use super::super::super::collect::aliases::{dotted_attr, leftmost_name};
 use super::super::super::collect::mutations::{is_known_readonly_method, is_mutating_method};
 use super::super::super::collect::exceptions::call_implicit_exception;
-use super::super::super::context::{CallSite, ImportCallSite};
+use super::super::super::context::{CallReceiver, CallSite, ImportCallSite};
 use super::super::declarations::resolve_unique;
 use super::builtins::is_known_pure_builtin;
 use super::Walker;
@@ -58,7 +58,39 @@ impl Walker < '_ , '_ > {
                         let kwarg_roots = self.keyword_arg_roots(&call.arguments);
                         self.facts.call_sites.push(CallSite {
                             callee,
-                            via_self: true,
+                            receiver: CallReceiver::CallerSelf,
+                            arg_roots,
+                            kwarg_roots,
+                        });
+                        if has_unpack {
+                            self.acknowledge_unpacked_call(attr.attr.as_str(), &call.arguments);
+                        }
+                    } else if let Some(Shape::Instance(class)) = self.facts.env_shape(&attr.value)
+                        && let Some(callee) = resolve_unique(
+                            self.facts.declarations,
+                            Some(class.as_str()),
+                            attr.attr.as_str(),
+                        )
+                    {
+                        // `x.method(...)` where `x`'s settled shape is EXACTLY one
+                        // `Shape::Instance(C)` (a `Union` containing instances never matches this
+                        // arm — resolving to just one member would under-approximate the others)
+                        // and `method` resolves uniquely on `C` itself (an inherited method,
+                        // defined on a base class, isn't owned by `C` in the declarations table
+                        // and so deliberately stays unresolved below — resolving it would risk
+                        // misattributing effects to the wrong class if `C` overrides it). The call
+                        // resolves — and thus the callee's raises/io/unresolved effects propagate
+                        // — regardless of whether `x` itself is a trackable root; the receiver
+                        // maps its `SelfAttr` mutations onto `x` only when it is.
+                        let receiver = match self.facts.resolve_target(&attr.value, None) {
+                            Some(t) => CallReceiver::Root(t),
+                            None => CallReceiver::None,
+                        };
+                        let arg_roots = self.positional_arg_roots(&call.arguments);
+                        let kwarg_roots = self.keyword_arg_roots(&call.arguments);
+                        self.facts.call_sites.push(CallSite {
+                            callee,
+                            receiver,
                             arg_roots,
                             kwarg_roots,
                         });
@@ -71,15 +103,18 @@ impl Walker < '_ , '_ > {
                             if let Some(t) = self.facts.resolve_target(&attr.value, None) {
                                 self.facts.add_mutation(t, MutationKind::Method, Some(method));
                             }
-                        } else if !is_known_readonly_method(method)
-                            && let Some(t) = self.facts.resolve_target(&attr.value, None)
-                        {
-                            // An unrecognized method on a tracked root could mutate its receiver —
-                            // we can't see through it, so record it rather than assume purity.
+                        } else if !is_known_readonly_method(method) {
+                            // An unrecognized method could mutate its receiver or raise — we can't
+                            // see through it, so record it rather than assume purity. This holds
+                            // whether or not the receiver is itself a trackable root (e.g. `x`
+                            // bound to two different classes on two branches, so its shape is a
+                            // `Union` rather than one `Instance` — see the arm above); `may_affect`
+                            // is simply narrower (possibly empty) when it isn't.
+                            let may_affect = self.facts.resolve_target(&attr.value, None).into_iter().collect();
                             self.facts.sig.unresolved_effects.push(UnresolvedEffect {
                                 reason: "call_method_unknown".to_string(),
                                 callee: Some(method.to_string()),
-                                may_affect: vec![t],
+                                may_affect,
                             });
                         }
                     }
@@ -110,7 +145,30 @@ impl Walker < '_ , '_ > {
                         let kwarg_roots = self.keyword_arg_roots(&call.arguments);
                         self.facts.call_sites.push(CallSite {
                             callee,
-                            via_self: false,
+                            receiver: CallReceiver::None,
+                            arg_roots,
+                            kwarg_roots,
+                        });
+                        if has_unpack {
+                            self.acknowledge_unpacked_call(n, &call.arguments);
+                        }
+                    } else if self.facts.classes.contains(n)
+                        && let Some(callee) =
+                            resolve_unique(self.facts.declarations, Some(n), "__init__")
+                    {
+                        // `Foo(...)` where `Foo` is a class declared in this module and declares
+                        // its own `__init__` — resolves the same way `x.m(...)` resolves against a
+                        // class (a class with no declared `__init__`, an inherited one, has no
+                        // entry under its own name in `declarations` and so `resolve_unique`
+                        // leaves it unresolved, deliberately). The receiver is always fresh — the
+                        // call expression itself is the constructor, there's no caller-visible
+                        // object yet to attribute `SelfAttr` mutations to — so raises/io/global
+                        // writes/unresolved effects propagate, but the receiver never does.
+                        let arg_roots = self.positional_arg_roots(&call.arguments);
+                        let kwarg_roots = self.keyword_arg_roots(&call.arguments);
+                        self.facts.call_sites.push(CallSite {
+                            callee,
+                            receiver: CallReceiver::None,
                             arg_roots,
                             kwarg_roots,
                         });

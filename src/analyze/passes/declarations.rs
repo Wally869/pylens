@@ -41,6 +41,7 @@ impl Pass for DeclarationsPass {
                     ctx.declarations.push(decl_info(def, None));
                 }
                 ast::Stmt::ClassDef(class) => {
+                    ctx.classes.insert(class.name.as_str().to_string());
                     for member in &class.body {
                         if let ast::Stmt::FunctionDef(def) = member {
                             ctx.declarations

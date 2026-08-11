@@ -288,6 +288,12 @@ fn candidates(shape: &Shape) -> Vec<Candidate> {
             out.sort_by_key(|cand| cand.rank);
             out
         }
+        // The jail can build a receiver for a method under test from `__init__`, but it has no
+        // way to construct an object for an ordinary parameter typed `Instance(C)` — generating
+        // like `Any` is the honest stopping point until that gap closes (constructing `C` here
+        // would need its own `__init__` probe, the same machinery `record.rs` already has for
+        // the receiver, generalized to an arbitrary parameter position).
+        Shape::Instance(_) => candidates(&Shape::Any),
     }
 }
 

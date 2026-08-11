@@ -32,6 +32,7 @@ impl Pass for EffectsPass {
                 imports: &ctx.bindings,
                 has_star: ctx.has_star,
                 declarations: &ctx.declarations,
+                classes: &ctx.classes,
             };
             for stmt in &module.body {
                 match stmt {

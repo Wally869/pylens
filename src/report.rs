@@ -59,6 +59,7 @@ pub fn shape_to_string(shape: &Shape) -> String {
             .map(shape_to_string)
             .collect::<Vec<_>>()
             .join("|"),
+        Shape::Instance(name) => name.clone(),
     }
 }
 

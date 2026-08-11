@@ -14,6 +14,8 @@ pub fn shape_value_to_string(v: &Value) -> String {
                 let key = kv.get("key").map(shape_value_to_string).unwrap_or_else(|| "any".to_string());
                 let value = kv.get("value").map(shape_value_to_string).unwrap_or_else(|| "any".to_string());
                 format!("map<{key},{value}>")
+            } else if let Some(name) = map.get("instance").and_then(Value::as_str) {
+                name.to_string()
             } else {
                 "any".to_string()
             }
