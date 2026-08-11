@@ -39,14 +39,15 @@ pub struct ModuleAnalysisResult {
 /// `returns` may-set against its untrusted `declared_return` annotation, flagging only full
 /// disjointness. Purity runs last, classifying callers against their complete, propagated
 /// effect set rather than treating every local call as opaque.
-pub fn analyze_module(module: &ast::ModModule) -> Vec<EffectSignature> {
-    analyze_module_with_call_sites(module).signatures
+pub fn analyze_module(module: &ast::ModModule, src: &str) -> Vec<EffectSignature> {
+    analyze_module_with_call_sites(module, src).signatures
 }
 
 /// Same pipeline as [`analyze_module`], additionally returning each function's imported call
-/// sites — see [`ModuleAnalysisResult`].
-pub fn analyze_module_with_call_sites(module: &ast::ModModule) -> ModuleAnalysisResult {
-    let mut ctx = ModuleAnalysis::new();
+/// sites — see [`ModuleAnalysisResult`]. `src` is the module's source text, needed to resolve
+/// each function's `body_lines` (byte offsets -> line numbers).
+pub fn analyze_module_with_call_sites(module: &ast::ModModule, src: &str) -> ModuleAnalysisResult {
+    let mut ctx = ModuleAnalysis::new(src);
     let pipeline: Vec<Box<dyn Pass>> = vec![
         Box::new(passes::imports::ImportsPass),
         Box::new(passes::declarations::DeclarationsPass),

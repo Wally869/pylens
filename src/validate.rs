@@ -251,6 +251,7 @@ mod tests {
             stderr: None,
             error: None,
             minimized: None,
+            lines: Vec::new(),
         }
     }
 
@@ -268,6 +269,7 @@ mod tests {
             stderr: None,
             error: None,
             minimized: None,
+            lines: Vec::new(),
         }
     }
 
@@ -285,6 +287,7 @@ mod tests {
             stderr: None,
             error: None,
             minimized: None,
+            lines: Vec::new(),
         }
     }
 

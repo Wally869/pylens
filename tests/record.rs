@@ -330,6 +330,73 @@ fn raised_case_carries_a_smaller_minimized_input() {
 }
 
 #[test]
+fn non_finite_float_return_is_tagged_and_round_trips() {
+    if !ready("non_finite_float_return_is_tagged_and_round_trips") {
+        return;
+    }
+    // `json.dumps` emits bare NaN/Infinity, which serde_json rejects; the worker must instead
+    // tag them the same way it tags set/tuple/dict so the response is valid JSON.
+    let nan_src = "def f():\n    return float('nan')\n";
+    let rec = record_file(nan_src, 1).expect("record");
+    let f = rec.functions.iter().find(|r| r.signature.name == "f").expect("f record");
+    assert!(!f.cases.is_empty(), "expected generated cases");
+    for c in &f.cases {
+        assert_eq!(c.outcome, "returned");
+        assert_eq!(c.ret, Some(serde_json::json!({ "__t__": "float", "v": "nan" })));
+    }
+
+    let inf_src = "def f():\n    return float('inf')\n";
+    let rec = record_file(inf_src, 1).expect("record");
+    let f = rec.functions.iter().find(|r| r.signature.name == "f").expect("f record");
+    assert!(!f.cases.is_empty(), "expected generated cases");
+    for c in &f.cases {
+        assert_eq!(c.outcome, "returned");
+        assert_eq!(c.ret, Some(serde_json::json!({ "__t__": "float", "v": "inf" })));
+    }
+}
+
+#[test]
+fn unreachable_branch_is_reported_as_missed_coverage() {
+    if !ready("unreachable_branch_is_reported_as_missed_coverage") {
+        return;
+    }
+    // The unconditional `return 1` makes every line after it dead code — no input can ever
+    // reach it, so it must show up as `missed`, never silently folded into `executed`.
+    let src = "def f(x):\n    return 1\n    y = x + 1\n    return y\n";
+    let rec = record_file(src, 4).expect("record");
+    let f = rec
+        .functions
+        .iter()
+        .find(|r| r.signature.name == "f")
+        .expect("f record");
+    let cov = f.coverage.as_ref().expect("f should carry coverage");
+    assert_eq!(cov.total, 3, "body_lines: return 1 / y = x + 1 / return y");
+    assert_eq!(cov.executed, 1, "only the unconditional return 1 ever runs");
+    assert!(cov.missed.contains(&3), "y = x + 1 must be reported missed: {:?}", cov.missed);
+    assert!(cov.missed.contains(&4), "return y must be reported missed: {:?}", cov.missed);
+}
+
+#[test]
+fn fully_exercised_function_reports_full_coverage() {
+    if !ready("fully_exercised_function_reports_full_coverage") {
+        return;
+    }
+    // A single-statement body that always runs, regardless of input, must report executed ==
+    // total — nothing to miss.
+    let src = "def f(x):\n    return x + 1\n";
+    let rec = record_file(src, 4).expect("record");
+    let f = rec
+        .functions
+        .iter()
+        .find(|r| r.signature.name == "f")
+        .expect("f record");
+    let cov = f.coverage.as_ref().expect("f should carry coverage");
+    assert_eq!(cov.total, 1);
+    assert_eq!(cov.executed, cov.total, "expected full coverage: {:?}", cov.missed);
+    assert!(cov.missed.is_empty());
+}
+
+#[test]
 fn keyword_only_mutation_is_detected() {
     if !ready("keyword_only_mutation_is_detected") {
         return;

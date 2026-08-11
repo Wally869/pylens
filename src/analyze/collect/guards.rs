@@ -140,7 +140,10 @@ fn literal_container(expr: &ast::Expr) -> Option<Vec<Value>> {
     if vals.is_empty() { None } else { Some(vals) }
 }
 
-fn literal_value(expr: &ast::Expr) -> Option<Value> {
+/// A directly-written literal's value: number, string, bool, `None`, or a negated number
+/// (`-1`). Shared with `effects::setup`'s default-value extraction — a parameter's own default
+/// is the same kind of "written literal" evidence a guard comparison is.
+pub(in crate::analyze) fn literal_value(expr: &ast::Expr) -> Option<Value> {
     match expr {
         ast::Expr::NumberLiteral(n) => match &n.value {
             ast::Number::Int(i) => i.as_i64().map(|v| json!(v)),

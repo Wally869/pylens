@@ -44,6 +44,8 @@ def deserialize(v):
             return tuple(deserialize(x) for x in items)
         if t == "dict":
             return {deserialize(k): deserialize(val) for k, val in items}
+        if t == "float":
+            return {"nan": float("nan"), "inf": float("inf"), "-inf": float("-inf")}[v["v"]]
         return v
     if isinstance(v, list):
         return [deserialize(x) for x in v]
@@ -53,6 +55,11 @@ def deserialize(v):
 
 
 def serialize(v):
+    if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))):
+        # json.dumps(allow_nan=False) rejects NaN/Infinity; the Rust side's serde_json can't
+        # hold them either, so a non-finite float needs the same tagged encoding as set/tuple/dict.
+        tag = "nan" if v != v else ("inf" if v > 0 else "-inf")
+        return {"__t__": "float", "v": tag}
     if isinstance(v, bool) or v is None or isinstance(v, (int, float, str)):
         return v
     if isinstance(v, list):
@@ -83,6 +90,7 @@ def base_response():
         "exception": None,
         "return_aliases_arg": None,
         "error": None,
+        "lines": [],
     }
 
 
@@ -121,6 +129,24 @@ def _state(obj):
         return vars(obj)
     except TypeError:
         return None
+
+
+def _make_tracer(executed):
+    """A `sys.settrace` global trace function that records every line reached in the compiled
+    module under test (`co_filename == "<pylens>"`), skipping frames from anywhere else (stdlib,
+    the harness itself). Python 3.10 predates `sys.monitoring` (3.12+), so `settrace` is the only
+    line-level hook available.
+    """
+
+    def local_trace(frame, event, arg):
+        if event == "line" and frame.f_code.co_filename == "<pylens>":
+            executed.add(frame.f_lineno)
+        return local_trace
+
+    def global_trace(frame, event, arg):
+        return local_trace
+
+    return global_trace
 
 
 def run_request(req):
@@ -201,17 +227,24 @@ def run_request(req):
     # protocol channel and so each is recorded as the channel it actually is.
     out_buf = io.StringIO()
     err_buf = io.StringIO()
+    executed_lines = set()
     try:
         with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
-            ret = fn(*args, **kwargs)
-            if hasattr(ret, "__next__"):  # drain generators/iterators to realize effects
-                collected = []
-                for i, x in enumerate(ret):
-                    if i >= 1000:
-                        collected.append("__truncated__")
-                        break
-                    collected.append(x)
-                ret = collected
+            # Traced region: the call under test and (if it returns a generator) draining it —
+            # not the module load or the receiver construction above.
+            sys.settrace(_make_tracer(executed_lines))
+            try:
+                ret = fn(*args, **kwargs)
+                if hasattr(ret, "__next__"):  # drain generators/iterators to realize effects
+                    collected = []
+                    for i, x in enumerate(ret):
+                        if i >= 1000:
+                            collected.append("__truncated__")
+                            break
+                        collected.append(x)
+                    ret = collected
+            finally:
+                sys.settrace(None)
         resp["ok"] = True
         resp["return"] = serialize(ret)
         alias = None
@@ -227,6 +260,8 @@ def run_request(req):
     except Exception as e:
         resp["ok"] = False
         resp["exception"] = {"type": type(e).__name__, "message": str(e)}
+
+    resp["lines"] = sorted(executed_lines)
 
     out_text = out_buf.getvalue()
     if out_text:
@@ -256,9 +291,9 @@ def oneshot():
     except Exception as e:
         resp = base_response()
         resp["error"] = make_error("bad_request", type(e).__name__, str(e))
-        sys.stdout.write(json.dumps(resp))
+        sys.stdout.write(json.dumps(resp, allow_nan=False))
         return
-    sys.stdout.write(json.dumps(run_request(req)))
+    sys.stdout.write(json.dumps(run_request(req), allow_nan=False))
 
 
 def _handle_in_child(line, timeout):
@@ -278,7 +313,7 @@ def _handle_in_child(line, timeout):
             resp = base_response()
             resp["error"] = exc_error("harness", e)
         try:
-            os.write(w, json.dumps(resp).encode())
+            os.write(w, json.dumps(resp, allow_nan=False).encode())
         finally:
             os.close(w)
             os._exit(0)
@@ -322,14 +357,14 @@ def serve():
             # gets the same `stage="resource"` category (kind distinguishes the specific cause).
             resp = base_response()
             resp["error"] = make_error("resource", "timeout", f"request exceeded {timeout}s")
-            out = json.dumps(resp).encode()
+            out = json.dumps(resp, allow_nan=False).encode()
         elif not out:
             # The child produced nothing at all — most likely SIGKILLed by an rlimit (CPU/mem)
             # or crashed outright. Either way this is a harness-side failure, never a semantic
             # result, so it stays on the `error` channel (never `exception`).
             resp = base_response()
             resp["error"] = make_error("harness", "no_output", "child produced no output")
-            out = json.dumps(resp).encode()
+            out = json.dumps(resp, allow_nan=False).encode()
         sys.stdout.buffer.write(out + b"\n")
         sys.stdout.buffer.flush()
 

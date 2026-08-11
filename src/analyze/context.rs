@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use ruff_python_ast as ast;
+use ruff_source_file::LineIndex;
 
 use crate::model::*;
 
@@ -98,8 +99,11 @@ impl ImportCallSite {
 }
 
 /// Module-wide state threaded through the pass pipeline.
-#[derive(Default)]
 pub(in crate::analyze) struct ModuleAnalysis {
+    /// Byte-offset -> line-number index over the module source, built once up front so the
+    /// Effects pass can compute each function's `body_lines` (the coverage denominator) without
+    /// re-scanning the source per function.
+    pub(in crate::analyze) line_index: LineIndex,
     /// Full import catalog (all styles, including nested). Built by the Imports pass.
     pub(in crate::analyze) imports: Vec<Import>,
     /// In-scope import binding -> the module it names. Built by the Imports pass.
@@ -128,8 +132,18 @@ pub(in crate::analyze) struct ModuleAnalysis {
 }
 
 impl ModuleAnalysis {
-    pub(in crate::analyze) fn new() -> Self {
-        Self::default()
+    pub(in crate::analyze) fn new(src: &str) -> Self {
+        Self {
+            line_index: LineIndex::from_source_text(src),
+            imports: Vec::new(),
+            bindings: HashMap::new(),
+            has_star: false,
+            declarations: Vec::new(),
+            shapes: Vec::new(),
+            signatures: Vec::new(),
+            call_sites: Vec::new(),
+            import_call_sites: Vec::new(),
+        }
     }
 }
 

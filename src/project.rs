@@ -75,6 +75,11 @@ struct FileEntry {
     /// Functions that never executed (`uncallable`: module didn't load, constructor failed) —
     /// validate observed nothing for them, so their zero defects must not read as "validated".
     uncallable: usize,
+    /// Sum of `coverage.executed` over this file's functions that carry a `coverage` (see
+    /// `record::Coverage`) — the numerator half of the project-wide aggregate.
+    coverage_executed: usize,
+    /// Sum of `coverage.total` over the same functions — the denominator half.
+    coverage_total: usize,
     ok: bool,
 }
 
@@ -87,6 +92,8 @@ fn error_entry(path: String, message: String) -> FileEntry {
         soft_defects: 0,
         functions_checked: 0,
         uncallable: 0,
+        coverage_executed: 0,
+        coverage_total: 0,
         ok: false,
     }
 }
@@ -103,6 +110,8 @@ fn build_report(root: &Path, mut entries: Vec<FileEntry>, include_defects: bool)
     let mut soft_total = 0usize;
     let mut checked_total = 0usize;
     let mut uncallable_total = 0usize;
+    let mut coverage_executed_total = 0usize;
+    let mut coverage_total_total = 0usize;
     for e in &entries {
         functions += e.purities.len();
         for p in &e.purities {
@@ -116,6 +125,8 @@ fn build_report(root: &Path, mut entries: Vec<FileEntry>, include_defects: bool)
         soft_total += e.soft_defects;
         checked_total += e.functions_checked;
         uncallable_total += e.uncallable;
+        coverage_executed_total += e.coverage_executed;
+        coverage_total_total += e.coverage_total;
     }
 
     let mut summary = serde_json::json!({
@@ -130,6 +141,12 @@ fn build_report(root: &Path, mut entries: Vec<FileEntry>, include_defects: bool)
         summary["soft_defects"] = serde_json::json!(soft_total);
         summary["functions_checked"] = serde_json::json!(checked_total);
         summary["uncallable"] = serde_json::json!(uncallable_total);
+    }
+    if coverage_total_total > 0 {
+        summary["coverage"] = serde_json::json!({
+            "executed": coverage_executed_total,
+            "total": coverage_total_total,
+        });
     }
 
     let files_json: Vec<Value> = entries.into_iter().map(|e| e.json).collect();
@@ -239,18 +256,18 @@ struct AnalyzedFile {
     import_call_sites: Vec<Vec<crate::analyze::ImportCallSite>>,
 }
 
-fn analyze_file_raw(root: &Path, path: &Path) -> Result<AnalyzedFile, FileEntry> {
+fn analyze_file_raw(root: &Path, path: &Path) -> Result<AnalyzedFile, Box<FileEntry>> {
     let rel = relative_path(root, path);
     let src = match std::fs::read_to_string(path) {
         Ok(s) => crate::strip_bom(&s).to_string(),
-        Err(e) => return Err(error_entry(rel, format!("read error: {e}"))),
+        Err(e) => return Err(Box::new(error_entry(rel, format!("read error: {e}")))),
     };
     let parsed = match crate::parse::parse_source(&src) {
         Ok(p) => p,
-        Err(e) => return Err(error_entry(rel, format!("parse error: {e}"))),
+        Err(e) => return Err(Box::new(error_entry(rel, format!("parse error: {e}")))),
     };
     let imports = collect_imports(parsed.syntax());
-    let result = analyze_module_with_call_sites(parsed.syntax());
+    let result = analyze_module_with_call_sites(parsed.syntax(), &src);
     Ok(AnalyzedFile {
         path: rel,
         src,
@@ -275,7 +292,7 @@ struct EnrichedFile {
 /// point works from the same cross-file-propagated signatures. A file that fails to read or
 /// parse becomes an error [`FileEntry`] instead, kept out of propagation.
 fn analyze_and_propagate(root: &Path, files: &[PathBuf]) -> (Vec<EnrichedFile>, Vec<FileEntry>) {
-    let raw: Vec<Result<AnalyzedFile, FileEntry>> = parallel_map(files, |path| analyze_file_raw(root, path));
+    let raw: Vec<Result<AnalyzedFile, Box<FileEntry>>> = parallel_map(files, |path| analyze_file_raw(root, path));
 
     let mut srcs = Vec::new();
     let mut units = Vec::new();
@@ -291,7 +308,7 @@ fn analyze_and_propagate(root: &Path, files: &[PathBuf]) -> (Vec<EnrichedFile>, 
                     imports: af.imports,
                 });
             }
-            Err(e) => errors.push(e),
+            Err(e) => errors.push(*e),
         }
     }
     propagate(&mut units, root);
@@ -324,6 +341,8 @@ fn build_analyze_entry(ef: EnrichedFile, index: &ModuleIndex) -> FileEntry {
         soft_defects: 0,
         functions_checked: 0,
         uncallable: 0,
+        coverage_executed: 0,
+        coverage_total: 0,
         ok: true,
     }
 }
@@ -347,6 +366,11 @@ fn record_file_entry(sandbox: &dyn Sandbox, index: &ModuleIndex, ef: EnrichedFil
     match record_with_signatures(sandbox, &src, imports, signatures, max_inputs) {
         Ok(record) => {
             let purities = record.functions.iter().map(|f| f.signature.purity).collect();
+            let (coverage_executed, coverage_total) = record
+                .functions
+                .iter()
+                .filter_map(|f| f.coverage.as_ref())
+                .fold((0, 0), |(e, t), c| (e + c.executed, t + c.total));
             let deps_json: Vec<Value> = record
                 .dependencies
                 .iter()
@@ -365,6 +389,8 @@ fn record_file_entry(sandbox: &dyn Sandbox, index: &ModuleIndex, ef: EnrichedFil
                 soft_defects: 0,
                 functions_checked: 0,
                 uncallable: 0,
+                coverage_executed,
+                coverage_total,
                 ok: true,
             }
         }
@@ -396,6 +422,8 @@ fn validate_file_entry(sandbox: &dyn Sandbox, ef: EnrichedFile, max_inputs: usiz
 
     let mut hard_total = 0usize;
     let mut soft_total = 0usize;
+    let mut coverage_executed = 0usize;
+    let mut coverage_total = 0usize;
     let functions_json: Vec<Value> = record
         .functions
         .iter()
@@ -405,27 +433,36 @@ fn validate_file_entry(sandbox: &dyn Sandbox, ef: EnrichedFile, max_inputs: usiz
             let soft = defects.len() - hard;
             hard_total += hard;
             soft_total += soft;
+            if let Some(cov) = &f.coverage {
+                coverage_executed += cov.executed;
+                coverage_total += cov.total;
+            }
             serde_json::json!({
                 "name": f.signature.name,
                 "owner": f.signature.owner,
                 "hard_defects": hard,
                 "soft_defects": soft,
                 "defects": defects,
+                "coverage": f.coverage,
             })
         })
         .collect();
     let purities = record.functions.iter().map(|f| f.signature.purity).collect();
     let functions_checked = record.functions.len();
     let uncallable = record.functions.iter().filter(|f| f.uncallable.is_some()).count();
+    let mut summary = serde_json::json!({
+        "hard_defects": hard_total,
+        "soft_defects": soft_total,
+        "functions_checked": functions_checked,
+        "uncallable": uncallable,
+    });
+    if coverage_total > 0 {
+        summary["coverage"] = serde_json::json!({ "executed": coverage_executed, "total": coverage_total });
+    }
     let json = serde_json::json!({
         "path": path,
         "functions": functions_json,
-        "summary": {
-            "hard_defects": hard_total,
-            "soft_defects": soft_total,
-            "functions_checked": functions_checked,
-            "uncallable": uncallable,
-        }
+        "summary": summary,
     });
     FileEntry {
         path,
@@ -435,6 +472,8 @@ fn validate_file_entry(sandbox: &dyn Sandbox, ef: EnrichedFile, max_inputs: usiz
         soft_defects: soft_total,
         functions_checked,
         uncallable,
+        coverage_executed,
+        coverage_total,
         ok: true,
     }
 }

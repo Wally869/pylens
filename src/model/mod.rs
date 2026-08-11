@@ -229,6 +229,12 @@ pub struct ParamInfo {
     /// per-parameter literal extraction only. See `analyze::collect::guards`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guard_samples: Vec<serde_json::Value>,
+    /// The parameter's default value, when it's a literal (number/string/bool/`None`) — the
+    /// function's own source, not an annotation, so it's trustworthy evidence of intent (unlike
+    /// `declared`). Feeds `generate::candidates_for`/`generate::generation_shape`: a generation
+    /// input only, never folded into `shape` — it can't affect the may-set or purity.
+    #[serde(skip)]
+    pub default_literal: Option<serde_json::Value>,
 }
 
 /// The full effect signature of one function/method.
@@ -273,6 +279,12 @@ pub struct EffectSignature {
     /// declared annotation and the inferred may-set are fully disjoint.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub type_mismatches: Vec<TypeMismatch>,
+    /// The 1-based line numbers of every statement in this function's body (nested statements
+    /// included, nested `def`/`class` bodies excluded — see `analyze::collect::body_lines`), used
+    /// as the coverage denominator in `record.rs`. An internal input, not part of the JSON
+    /// contract that downstream consumers key off.
+    #[serde(skip)]
+    pub body_lines: Vec<u32>,
 }
 
 
@@ -352,6 +364,7 @@ impl EffectSignature {
             may_use_star: false,
             decorators: Vec::new(),
             type_mismatches: Vec::new(),
+            body_lines: Vec::new(),
         }
     }
 }

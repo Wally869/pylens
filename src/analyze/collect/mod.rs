@@ -2,6 +2,7 @@
 //! Each collector is a swappable unit responsible for one concern.
 
 pub(super) mod aliases;
+pub(super) mod body_lines;
 pub(super) mod exceptions;
 pub(super) mod guards;
 pub(super) mod mutations;

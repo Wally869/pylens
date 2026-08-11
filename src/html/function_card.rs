@@ -29,6 +29,21 @@ pub fn function_card(command: &str, entry: &Value) -> String {
     }
     out.push_str("</div>\n");
 
+    if let Some(cov) = entry.get("coverage").filter(|c| !c.is_null()) {
+        let executed = cov.get("executed").and_then(Value::as_u64).unwrap_or(0);
+        let total = cov.get("total").and_then(Value::as_u64).unwrap_or(0);
+        let missed = cov
+            .get("missed")
+            .and_then(Value::as_array)
+            .map(|a| values_to_strings(a))
+            .unwrap_or_default();
+        write!(out, "<div class=\"row coverage\">coverage: {executed}/{total} lines").unwrap();
+        if !missed.is_empty() {
+            write!(out, " (missed: {})", escape_html(&missed.join(", "))).unwrap();
+        }
+        out.push_str("</div>\n");
+    }
+
     if command == "validate" {
         let hard = entry.get("hard_defects").and_then(Value::as_u64).unwrap_or(0);
         let soft = entry.get("soft_defects").and_then(Value::as_u64).unwrap_or(0);

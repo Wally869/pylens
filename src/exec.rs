@@ -112,6 +112,11 @@ pub struct CallResult {
     /// Harness-level failure (function missing, bad source, import/ctor failure, timeout, …) —
     /// not a Python raise from the function under test.
     pub error: Option<HarnessError>,
+    /// 1-based line numbers reached in the module under test during the call (and, for a
+    /// generator, its draining) — sorted ascending. Populated even when the call ends in `error`
+    /// (a resource kill still ran some lines first). See `record::coverage`.
+    #[serde(default)]
+    pub lines: Vec<u32>,
 }
 
 /// A jailed Python execution → observed effects. Implementors provide [`Sandbox::transport`]

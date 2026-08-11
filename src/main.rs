@@ -137,7 +137,7 @@ fn cmd_record(args: &[String]) {
         .unwrap_or_else(|| fail("record needs a <file.py>"));
     let inputs: usize = flag(args, "--inputs")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(4);
+        .unwrap_or(12);
 
     if std::path::Path::new(&path).is_dir() {
         if format == Format::Pyi {
@@ -190,7 +190,7 @@ fn cmd_validate(args: &[String]) {
         .unwrap_or_else(|| fail("validate needs a <file.py>"));
     let inputs: usize = flag(args, "--inputs")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(4);
+        .unwrap_or(12);
 
     if std::path::Path::new(&path).is_dir() {
         match pylens::project::validate_project(std::path::Path::new(&path), inputs) {
@@ -240,6 +240,7 @@ fn cmd_validate(args: &[String]) {
                 name: &f.signature.name,
                 owner: f.signature.owner.as_deref(),
                 defects,
+                coverage: f.coverage.as_ref(),
             })
             .collect();
         let uncallable = record.functions.iter().filter(|f| f.uncallable.is_some()).count();
@@ -269,18 +270,27 @@ fn cmd_validate(args: &[String]) {
                     "hard_defects": hard,
                     "soft_defects": soft,
                     "defects": defects,
+                    "coverage": f.coverage,
                 })
             })
             .collect();
 
+        let (cov_executed, cov_total) = per_function.iter().filter_map(|(f, _)| f.coverage.as_ref()).fold(
+            (0usize, 0usize),
+            |(e, t), c| (e + c.executed, t + c.total),
+        );
+        let mut summary = serde_json::json!({
+            "hard_defects": hard_total,
+            "soft_defects": soft_total,
+            "functions_checked": record.functions.len(),
+        });
+        if cov_total > 0 {
+            summary["coverage"] = serde_json::json!({ "executed": cov_executed, "total": cov_total });
+        }
         let out = serde_json::json!({
             "schema_version": pylens::SCHEMA_VERSION,
             "functions": functions,
-            "summary": {
-                "hard_defects": hard_total,
-                "soft_defects": soft_total,
-                "functions_checked": record.functions.len(),
-            }
+            "summary": summary,
         });
         if format == Format::Html {
             let mut html_data = out;

@@ -6,8 +6,37 @@
 use serde_json::Value;
 
 use crate::model::{DefKind, EffectSignature, Shape};
-use crate::record::{DepStatus, ModuleRecord};
+use crate::record::{Coverage, DepStatus, ModuleRecord};
 use crate::validate::{Defect, Severity};
+
+/// One function's executed-line coverage as a scannable line: `executed/total lines`, plus the
+/// missed line numbers when any remain.
+fn coverage_line(cov: &Coverage) -> String {
+    if cov.missed.is_empty() {
+        format!("coverage: {}/{} lines\n", cov.executed, cov.total)
+    } else {
+        format!(
+            "coverage: {}/{} lines (missed: {})\n",
+            cov.executed,
+            cov.total,
+            cov.missed.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+        )
+    }
+}
+
+/// Sum `executed`/`total` over every present coverage, for an aggregate figure across the
+/// functions that have one (uncallable/case-less functions carry no `coverage`).
+fn aggregate_coverage<'a>(covs: impl Iterator<Item = &'a Coverage>) -> Option<(usize, usize)> {
+    let mut executed = 0usize;
+    let mut total = 0usize;
+    let mut any = false;
+    for cov in covs {
+        any = true;
+        executed += cov.executed;
+        total += cov.total;
+    }
+    any.then_some((executed, total))
+}
 
 /// Render `shape` compactly: scalars as their tag, containers recursively
 /// (`seq<seq<float>>`, `map<str,int>`, `set<any>`).
@@ -118,6 +147,13 @@ pub fn record_summary(file: &str, record: &ModuleRecord) -> String {
         out.push_str(&format!(
             "    {total} cases: {returned} returned, {raised} raised, {error} error\n"
         ));
+        if let Some(cov) = &f.coverage {
+            out.push_str("    ");
+            out.push_str(&coverage_line(cov));
+        }
+    }
+    if let Some((executed, total)) = aggregate_coverage(record.functions.iter().filter_map(|f| f.coverage.as_ref())) {
+        out.push_str(&format!("  aggregate coverage: {executed}/{total} lines\n"));
     }
     out
 }
@@ -128,6 +164,7 @@ pub struct FunctionValidation<'a> {
     pub name: &'a str,
     pub owner: Option<&'a str>,
     pub defects: &'a [Defect],
+    pub coverage: Option<&'a Coverage>,
 }
 
 /// Render the `validate` result: per function with any defects, hard/soft counts and one line
@@ -151,6 +188,9 @@ pub fn validate_summary(
             "  WARNING: {uncallable} function(s) uncallable — never executed, nothing validated\n"
         ));
     }
+    if let Some((executed, total)) = aggregate_coverage(results.iter().filter_map(|r| r.coverage)) {
+        out.push_str(&format!("  aggregate coverage: {executed}/{total} lines\n"));
+    }
     for r in results {
         if r.defects.is_empty() {
             continue;
@@ -171,6 +211,10 @@ pub fn validate_summary(
                 "    [{:?}/{:?}] {}\n",
                 d.dimension, d.severity, d.observed
             ));
+        }
+        if let Some(cov) = r.coverage {
+            out.push_str("    ");
+            out.push_str(&coverage_line(cov));
         }
     }
     out
@@ -206,6 +250,11 @@ pub fn project_summary(report: &Value) -> String {
             ));
         }
     }
+    if let Some(coverage) = summary.get("coverage") {
+        let executed = coverage["executed"].as_u64().unwrap_or(0);
+        let total = coverage["total"].as_u64().unwrap_or(0);
+        out.push_str(&format!("  aggregate coverage: {executed}/{total} lines\n"));
+    }
     if let Some(files) = report["files"].as_array() {
         for f in files {
             let path = f["path"].as_str().unwrap_or("?");
@@ -232,6 +281,7 @@ mod tests {
             kind: Default::default(),
             declared: None,
             guard_samples: Vec::new(),
+            default_literal: None,
         });
         sig.mutations.push(Mutation {
             target: MutationTarget::Param {

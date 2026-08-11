@@ -3,7 +3,7 @@
 //! `self` mutations, aliasing). This is the record for one function; it does no comparison and
 //! computes no score — that belongs to whatever consumes these records.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -77,6 +77,50 @@ pub struct Case {
     /// still raises the same exception type. See [`crate::shrink::shrink_case`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub minimized: Option<MinimizedInput>,
+    /// Lines this case reached in the module under test — an input to [`coverage_for`]'s
+    /// per-function aggregate, not something a consumer needs per case (noisy at N cases).
+    #[serde(skip)]
+    pub lines: Vec<u32>,
+}
+
+/// A function's executed-line coverage, aggregated over all its cases: how many of its
+/// `body_lines` (see [`EffectSignature::body_lines`]) were reached by *some* case, and which
+/// ones never were. This is exactly the gap `docs/DESIGN.md` flags as unmeasured — generated
+/// inputs are heuristic, so `validate` only checks the paths they happen to reach; `coverage`
+/// makes that reach visible instead of leaving it implicit.
+#[derive(Serialize)]
+pub struct Coverage {
+    pub executed: usize,
+    pub total: usize,
+    pub missed: Vec<u32>,
+}
+
+/// Aggregate `cases`' observed lines against `sig.body_lines`, intersecting so lines the trace
+/// saw in some *other* function of the same module (the call reached past this function's own
+/// body) don't inflate `executed`. `None` when there's nothing to measure: no `body_lines`, or no
+/// cases to have measured them with.
+fn coverage_for(sig: &EffectSignature, cases: &[Case]) -> Option<Coverage> {
+    if cases.is_empty() || sig.body_lines.is_empty() {
+        return None;
+    }
+    let body: HashSet<u32> = sig.body_lines.iter().copied().collect();
+    let reached: HashSet<u32> = cases
+        .iter()
+        .flat_map(|c| c.lines.iter().copied())
+        .filter(|l| body.contains(l))
+        .collect();
+    let mut missed: Vec<u32> = sig
+        .body_lines
+        .iter()
+        .copied()
+        .filter(|l| !reached.contains(l))
+        .collect();
+    missed.sort_unstable();
+    Some(Coverage {
+        executed: reached.len(),
+        total: sig.body_lines.len(),
+        missed,
+    })
 }
 
 /// Why a function couldn't be executed at all — recorded once, instead of as N identical
@@ -98,6 +142,10 @@ pub struct FunctionRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uncallable: Option<Uncallable>,
     pub cases: Vec<Case>,
+    /// Executed-line coverage over `body_lines`, aggregated over `cases`. Omitted when there's
+    /// nothing to measure — see [`coverage_for`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<Coverage>,
 }
 
 /// Whether a dependency's module resolves in the jail.
@@ -186,6 +234,7 @@ pub fn record_with_signatures(
                     error: err.clone(),
                 }),
                 cases: Vec::new(),
+                coverage: None,
             });
             continue;
         }
@@ -193,10 +242,16 @@ pub fn record_with_signatures(
             DefKind::Function => (None, function_cases(sandbox, src, sig, max_inputs)?),
             DefKind::Method => method_record(sandbox, src, sig, &sigs, max_inputs, &mut ctor_cache)?,
         };
+        let coverage = if uncallable.is_some() {
+            None
+        } else {
+            coverage_for(sig, &cases)
+        };
         functions.push(FunctionRecord {
             signature: sig.clone(),
             uncallable,
             cases,
+            coverage,
         });
     }
     Ok(ModuleRecord {
@@ -424,6 +479,7 @@ fn build_case(
             stderr,
             error: Some(err.clone()),
             minimized: None,
+            lines: r.lines.clone(),
         };
     }
     if r.ok {
@@ -440,6 +496,7 @@ fn build_case(
             stderr,
             error: None,
             minimized: None,
+            lines: r.lines.clone(),
         }
     } else {
         Case {
@@ -455,6 +512,7 @@ fn build_case(
             stderr,
             error: None,
             minimized: None,
+            lines: r.lines.clone(),
         }
     }
 }

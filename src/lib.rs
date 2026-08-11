@@ -34,7 +34,7 @@ pub fn analyze_source(
     src: &str,
 ) -> Result<Vec<model::EffectSignature>, ruff_python_parser::ParseError> {
     let parsed = parse::parse_source(src)?;
-    Ok(analyze::analyze_module(parsed.syntax()))
+    Ok(analyze::analyze_module(parsed.syntax(), src))
 }
 
 /// Parse Python source and catalog its imports (all styles, including nested).

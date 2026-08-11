@@ -34,6 +34,37 @@ fn ordinary_params_unaffected() {
 }
 
 #[test]
+fn seq_int_param_receives_sorted_and_palindrome_property_lists_at_default_budget() {
+    // `x - 1` pins the element shape to Int (`- * // % **` all pin Int; see
+    // `analyze/passes/shapes/mod.rs`), so `xs` infers as Seq(Int); none of these branch
+    // conditions bind a literal through the guard collector (`is_sorted`/comparisons on `xs`
+    // itself aren't a direct param comparison), so only the property corpus can reach them.
+    let sigs = analyze_source(
+        "def f(xs):\n    for x in xs:\n        y = x - 1\n    return xs\n",
+    )
+    .expect("parse");
+    let f = sig(&sigs, "f");
+    let vectors = gen_inputs(&f, 12);
+    assert!(!vectors.is_empty());
+    let ascending = json!([1, 2, 3, 4, 5]);
+    let descending = json!([5, 4, 3, 2, 1]);
+    let palindrome = json!([1, 2, 1]);
+    let lists: Vec<&Value> = vectors.iter().filter_map(|v| v.positional.first()).collect();
+    assert!(
+        lists.contains(&&ascending),
+        "expected a sorted-ascending list among generated inputs: {vectors:?}"
+    );
+    assert!(
+        lists.contains(&&descending),
+        "expected a sorted-descending list among generated inputs: {vectors:?}"
+    );
+    assert!(
+        lists.contains(&&palindrome),
+        "expected a palindrome list among generated inputs: {vectors:?}"
+    );
+}
+
+#[test]
 fn guard_samples_appear_in_generated_vectors() {
     let sigs = analyze_source("def f(x):\n    if x == 42:\n        return 1\n    return 0\n")
         .expect("parse");
@@ -166,6 +197,68 @@ fn shrink_candidates_tagged_set_keeps_tag() {
         let items = c.get("items").and_then(Value::as_array).expect("items array");
         assert!(items.len() <= 3);
     }
+}
+
+#[test]
+fn base_vector_comes_first() {
+    let sigs = analyze_source("def f(a, b):\n    return a\n").expect("parse");
+    let f = sig(&sigs, "f");
+    let vectors = gen_inputs(&f, 12);
+    assert!(!vectors.is_empty());
+    // `Shape::Any` is inferred for untyped/unused params; its Base candidate is numeric (`1`) —
+    // a string base would poison comparison/arithmetic guards for every sibling parameter held
+    // fixed while this one varies.
+    assert_eq!(vectors[0].positional, vec![json!(1), json!(1)]);
+}
+
+#[test]
+fn every_parameter_varies_at_a_small_budget() {
+    let sigs = analyze_source("def f(a, b):\n    return a\n").expect("parse");
+    let f = sig(&sigs, "f");
+    let vectors = gen_inputs(&f, 4);
+    assert!(!vectors.is_empty());
+    let first_values: std::collections::HashSet<_> =
+        vectors.iter().map(|v| v.positional[0].to_string()).collect();
+    let second_values: std::collections::HashSet<_> =
+        vectors.iter().map(|v| v.positional[1].to_string()).collect();
+    assert!(
+        first_values.len() > 1,
+        "the first parameter must vary even at a small budget: {vectors:?}"
+    );
+    assert!(
+        second_values.len() > 1,
+        "the second parameter must vary even at a small budget: {vectors:?}"
+    );
+}
+
+#[test]
+fn no_duplicate_vectors() {
+    let sigs = analyze_source("def f(a, b, *, c):\n    return a\n").expect("parse");
+    let f = sig(&sigs, "f");
+    let vectors = gen_inputs(&f, 32);
+    let mut seen = Vec::new();
+    for v in &vectors {
+        assert!(!seen.contains(v), "duplicate generated vector: {v:?}");
+        seen.push(v.clone());
+    }
+}
+
+#[test]
+fn single_parameter_function_spends_whole_budget_on_it() {
+    let sigs = analyze_source("def f(x):\n    return x\n").expect("parse");
+    let f = sig(&sigs, "f");
+    let vectors = gen_inputs(&f, 12);
+    let distinct: std::collections::HashSet<_> =
+        vectors.iter().map(|v| v.positional[0].to_string()).collect();
+    assert_eq!(
+        distinct.len(),
+        vectors.len(),
+        "every emitted vector for a single-param function should differ: {vectors:?}"
+    );
+    assert!(
+        vectors.len() > 1,
+        "a single-param function should still spend budget across candidates: {vectors:?}"
+    );
 }
 
 #[test]

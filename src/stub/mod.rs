@@ -313,6 +313,7 @@ mod tests {
             kind: ParamKind::Positional,
             declared: None,
             guard_samples: Vec::new(),
+            default_literal: None,
         }
     }
 
@@ -377,6 +378,7 @@ mod tests {
             kind: ParamKind::VarPositional,
             declared: None,
             guard_samples: Vec::new(),
+            default_literal: None,
         });
         sig.params.push(ParamInfo {
             name: "flag".to_string(),
@@ -385,6 +387,7 @@ mod tests {
             kind: ParamKind::KeywordOnly,
             declared: None,
             guard_samples: Vec::new(),
+            default_literal: None,
         });
         sig.params.push(ParamInfo {
             name: "kwargs".to_string(),
@@ -393,6 +396,7 @@ mod tests {
             kind: ParamKind::VarKeyword,
             declared: None,
             guard_samples: Vec::new(),
+            default_literal: None,
         });
         let out = render_stub(std::slice::from_ref(&sig));
         assert!(out.contains(

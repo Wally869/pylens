@@ -1,5 +1,6 @@
 use ruff_python_ast as ast;
 use crate::model::*;
+use super::super::super::collect::body_lines::collect_body_lines;
 use super::super::super::collect::returns::can_fall_through;
 use super::super::super::context::{ModuleAnalysis, ModuleCtx};
 use super::super::super::pass::Pass;
@@ -37,8 +38,9 @@ impl Pass for EffectsPass {
                     ast::Stmt::FunctionDef(def) => {
                         let receiver = receivers.next().unwrap_or(ReceiverKind::None);
                         let shapes = shapes_iter.next().cloned().unwrap_or_default();
-                        let (sig, call_sites, import_call_sites) =
+                        let (mut sig, call_sites, import_call_sites) =
                             analyze_function(def, DefKind::Function, receiver, module_ctx, shapes, None);
+                        sig.body_lines = collect_body_lines(&def.body, &ctx.line_index);
                         ctx.signatures.push(sig);
                         ctx.call_sites.push(call_sites);
                         ctx.import_call_sites.push(import_call_sites);
@@ -57,6 +59,7 @@ impl Pass for EffectsPass {
                                     Some(class.name.as_str()),
                                 );
                                 sig.owner = Some(class.name.as_str().to_string());
+                                sig.body_lines = collect_body_lines(&def.body, &ctx.line_index);
                                 ctx.signatures.push(sig);
                                 ctx.call_sites.push(call_sites);
                                 ctx.import_call_sites.push(import_call_sites);
