@@ -13,7 +13,8 @@ pylens examines the behavior of Python code. It has two engines with one shared 
 
 `validate` connects the two engines. It makes sure that the static analysis predicted each
 observed effect (`observed ⊆ static`). The static side over-approximates. It must never miss an
-effect that a true run shows.
+effect that a true run shows. `record` and `validate` also report how many lines of each
+function the generated inputs reached, so you can see how much the check covered.
 
 The output is JSON with a version. The other formats are a terminal summary, `.pyi` stubs, and
 one HTML file.

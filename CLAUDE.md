@@ -25,6 +25,9 @@ pylens record   <file.py|dir> [--inputs N] [--format json|summary|pyi|html]  # s
 pylens validate <file.py|dir> [--inputs N] [--format json|summary|html]      # exits non-zero on a hard defect
 ```
 
+`--inputs` defaults to 12. `record` and `validate` also report executed-line coverage per
+function, which tells you how much of the function the generated inputs actually reached.
+
 `analyze` is static and needs no sandbox. `record` is `analyze` plus the dynamic layer, on one
 static core. A directory argument starts project mode.
 
@@ -47,7 +50,8 @@ static core. A directory argument starts project mode.
   Advisory only.
 - **Purity** — derives the `Purity` from the collected facts.
 
-Extension points: the `Pass` trait, `collect/`, `generate.rs`, the `Sandbox` trait, and the
+Extension points: the `Pass` trait, `collect/`, `generate/`, `models.rs`, the `Sandbox` trait,
+and the
 `report`, `stub`, and `html` formatters.
 
 ## Codemap
@@ -60,9 +64,11 @@ Extension points: the `Pass` trait, `collect/`, `generate.rs`, the `Sandbox` tra
   `mod.rs` (`EffectSignature`, params, mutations, raises, imports, `TypeMismatch`, `Purity`).
 - `src/analyze/` — `mod.rs` (the driver), `pass.rs` (the `Pass` trait), `context.rs` (the shared
   state), `passes/` (one file for each pass; `shapes/` and `effects/` have submodules),
-  `collect/` (aliases, mutations, exceptions, shapes, returns, guards).
-- `src/generate.rs` — input generation from the shapes, guided by the guards. Also gives the
-  shrink candidates.
+  `collect/` (aliases, mutations, exceptions, shapes, returns, guards, hints, body_lines).
+- `src/analyze/models.rs` — the stdlib effect table (raises and io), keyed on the resolved
+  module path. An entry removes an unresolved acknowledgment, so each entry over-approximates.
+- `src/generate/` — `mod.rs` (the sampler: ranked candidates, one parameter at a time),
+  `seeds.rs` (the shape, property and domain corpora). Also gives the shrink candidates.
 - `src/exec.rs` — sandboxed execution: the `Sandbox` trait, `Nsjail`, the `NsjailPool` fork
   server. There is no unsandboxed launcher.
 - `src/record.rs` — the static signature and the sandboxed cases (`ModuleRecord`, `Case`), with
@@ -99,6 +105,15 @@ If you do not, the sandbox tests use the old worker.
 - Over-approximation is tolerable and stays low. Under-approximation is a bug — a hard defect in
   `pylens validate`. The `examples/` corpus stays at zero hard defects; `tests/validate.rs` and
   `tests/project.rs` enforce this. Do not make them weaker to hide a new finding. Report it.
+- **A parameter's inferred shape is a hypothesis, not a guarantee.** It comes from the
+  operations inside the function and it constrains no caller, so it must never narrow a
+  may-set. A local's shape can narrow one: `xs = []` really is a list. This rule was broken
+  once — the implicit-raise set used a parameter's shape to prove the very operation that
+  produced that shape could not fail — so do not reintroduce it.
+- The harness cannot check everything. Generation draws from the same shapes the analysis
+  infers, so a claim justified by that shared assumption is unfalsifiable rather than true.
+  `io` `filesystem` claims have no observation channel at all, because the jail's file system
+  is read only.
 - Greenfield: no backwards compatibility, no dead code, no comments about a previous approach.
 - Before you increase `SCHEMA_VERSION`, read the version section in `docs/SCHEMA.md`.
 - Rust edition 2024. ruff is pinned to a fixed revision in `Cargo.toml`.

@@ -23,6 +23,8 @@ pylens record   examples/<file>.py --format html > report.html  # one HTML repor
 | `config.py` | Dynamic attribute writes with `setattr`, on `self` and on a parameter (`dynamic_setattr` unresolved effects), together with concrete `self`-attribute mutation. |
 | `ledger.py` | A class whose methods use **true** libraries (`hashlib` and `datetime`): class-method records (`self`-attribute mutation and a raise), together with resolved dependencies. |
 | `deps.py` | Each **import style**, with a mix of resolvable stdlib modules and missing or fake packages: plain, `as` alias, dotted path with an alias, `from … import a, b`, single, dotted-from-missing, `*` star, and relative. It shows the resolution report in `dependencies`. |
+| `pipeline.py` | Instance shapes: a local built from a same-module class, whose method call resolves and whose raise propagates to the caller, next to a local bound to two different classes on two branches, which stays unresolved. |
+| `interproc.py` | The regression guard for the shape-narrowing bug: a callee whose parameter pins to `int`, called from a function whose parameter stays `any`. The caller must still predict the `TypeError`. |
 | `lazy_deps.py` | Imports **in function bodies**. The module loads, thus a missing import (`matplotlib`) raises `ModuleNotFoundError` at call time, but a true one (`json`) operates correctly. |
 
 The generated records for these files are in `../records/`. To make them again, run

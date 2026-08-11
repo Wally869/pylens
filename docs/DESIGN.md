@@ -35,6 +35,18 @@ Two consequences:
   shape but return different values. The sandboxed `record` layer supplies the ground truth at
   the value level.
 
+A third rule, learned from a bug: **a parameter's inferred shape is a hypothesis, not a
+guarantee.** pylens infers it from the operations inside the function, and Python lets a caller
+pass anything, so the shape must never narrow a may-set. The implicit-raise set once used it
+that way: `x < 0` was the only evidence that `x` is an integer, and that conclusion then proved
+`x < 0` could not raise `TypeError`. A local's shape can narrow a may-set — `xs = []` really is
+a list at that point — but a parameter's cannot.
+
+That bug also shows a limit of the harness. Input generation draws its candidates from the same
+inferred shapes, so analysis and generation shared the assumption and no generated input could
+contradict it. Only a caller with a broader shape broke the symmetry. When a claim is justified
+by what pylens itself will generate, it is unfalsifiable, not true.
+
 ## Effect types (from the point of view of the caller)
 
 1. **Return** — a value or `None`, and the coarse inferred kind. A new binding of a parameter
@@ -44,7 +56,9 @@ Two consequences:
 3. **Global and module-state writes.**
 4. **Nonlocal and closure mutation.**
 5. **`self`-attribute mutation** (methods).
-6. **World I/O** — stdout, files, network, and the environment.
+6. **World I/O** — the tokens are `stdout`, `stderr`, `stdin` and `filesystem`. `print` gives
+   `stdout`, or both console tokens when it has a `file` argument that pylens cannot resolve;
+   `input` gives `stdin`; `open` and the modelled file-system calls give `filesystem`.
 7. **Exceptions** — explicit (`raise` and `assert`), and implicit (the may-sets from the
    operators and the calls).
 8. **Generator and async.**
@@ -64,10 +78,12 @@ parse (ruff) → pass pipeline → effect signatures → input generation → ja
   BOM in a file, but the `compile()` function in the sandboxed worker does not accept one in
   text. The analyzer and the sandbox must see the same source.
 - **`model/`** — the pure data model: the effect-signature types (`mod.rs`) and the recursive
-  `Shape` lattice with canonical unions of limited width (`shape.rs`). The serialization is the
-  schema.
+  `Shape` lattice with canonical unions of limited width (`shape.rs`). The lattice includes
+  `Instance(class)`, so a value built from a class declared in the module carries that class.
+  The serialization is the schema.
 - **`analyze/`** — an ordered pass pipeline over a shared context. One AST walk drives it, with
-  one collector for each subject (aliases, mutations, exceptions, shapes, returns, guards):
+  one collector for each subject (aliases, mutations, exceptions, shapes, returns, guards,
+  hints, body lines):
   **Imports → Declarations → Shapes → Effects → Interprocedural → TypeCheck → Purity**. Shapes
   runs to a fixpoint before Effects, thus the walk reads the final shapes. Interprocedural
   propagates the effects of the local callees to the callers, to a fixpoint (recursion
@@ -76,14 +92,43 @@ parse (ruff) → pass pipeline → effect signatures → input generation → ja
   implicit `TypeError` — the unpack operation itself can raise before the callee runs. pylens
   does not remove the effects. TypeCheck is advisory. Purity runs last, thus it sees the
   complete effect sets.
-- **`generate.rs`** — input generation from the shapes, over the cartesian product of the
-  candidates for each parameter, recursive and with a limit on the width. It is
-  **guard-guided**: it adds the literal and boundary values from the guard expressions of the
-  function to the candidate pool (`if qty > 10` gives 9, 10, and 11). Thus the generated inputs
-  are more probable to reach the guarded branches. There is no constraint solver: if a shape
-  stays `Any`, pylens gives values of different types, and some of them do not agree with the
-  true expectation of the function. This module also supplies the candidates for the shrink
-  operation.
+
+  Effects also resolves a method call on a local instance. If a local's shape is exactly one
+  `Instance(C)` and `C.m` is declared in the module, `x.m(...)` resolves like any intra-module
+  call, and the constructor call `C(...)` resolves to `C.__init__`. A local bound to two
+  different classes joins to a union and stays unresolved, because a choice between the members
+  would under-approximate the other one. An inherited method stays unresolved. A fresh local's
+  self-attribute mutations are dropped, not reported: the taxonomy is from the point of view of
+  the caller, and the caller cannot see an object that the function just built.
+- **`analyze/models.rs`** — the effect model table for the standard library. The key is the
+  resolved module path, thus an aliased import finds the same entry. The table gives the raises
+  and the io, and it removes the `call_import` acknowledgment. That is the reason each entry
+  over-approximates: after the entry, a missed effect is a hard defect and not a soft one.
+  Calls whose behavior depends on runtime state stay out of the table on purpose.
+- **`generate/`** — input generation from the shapes: `mod.rs` is the sampler and `seeds.rs`
+  holds the candidate values. Each candidate has a rank, and the sampler spends the budget in
+  rank order. The ranks, best first:
+
+  1. **Base** — one typical value for each shape, used to hold a parameter fixed.
+  2. **Guard** — the literal and boundary values from the guard expressions of the function
+     (`if qty > 10` gives 9, 10 and 11), and the parameter's own literal default. A default is
+     the source of the function, not an annotation, thus pylens can trust it.
+  3. **Hint** — the domain corpora (URL, e-mail, path, JSON, date, numeric string, regular
+     expression, HTML), selected by the hints collector.
+  4. **Edge** — empty, zero, singleton, negative.
+  5. **Property** — sorted, descending, palindrome, all-equal and duplicate-heavy sequences,
+     primes, powers of two, float traps. These fill a gap that the guard collector cannot fill:
+     it extracts a literal only when the parameter is a direct operand, thus `n % 2 == 0`,
+     `len(xs) > 3` and `xs == xs[::-1]` give no sample.
+  6. **Filler** — the generic spread.
+
+  The sampler varies one parameter at a time and holds the others at their base value, then
+  fills the remaining budget with combinations. One parameter at a time gives much more
+  coverage than a diagonal through the cartesian product at a small budget.
+
+  There is no constraint solver: if a shape stays `Any`, pylens gives values of different types,
+  and some of them do not agree with the true expectation of the function. This module also
+  supplies the candidates for the shrink operation.
 - **`record.rs`** (with `shrink.rs`) — connects the static signatures to the sandboxed execution: the probes for the
   dependencies, the module load, and the constructor (if a module cannot load, pylens marks each
   function `uncallable` one time), the construction of the cases, and the greedy **input
@@ -153,12 +198,34 @@ Monty (insufficient maturity).
   protocol channel.
 - pylens compares the exceptions by **exception type**, not by message. The validator and the
   minimizer use the same rule.
+- **Coverage:** the worker traces the call with `sys.settrace` and returns the executed lines.
+  The jail runs Python 3.10, thus `sys.monitoring` is not available. The analyzer supplies the
+  denominator: the statement lines of the function body, without the bodies of the nested
+  definitions. A bare string-literal statement is not counted, because CPython compiles it away
+  and never traces it. An `elif` condition line is counted, because it does execute. `record`
+  and `validate` report executed, total and missed for each function.
+- `SystemExit` is a `BaseException`, thus `except Exception` does not catch it. The worker
+  catches it specially and reports it as a semantic raise, which is what it is.
+  `KeyboardInterrupt` stays uncaught: that is a signal to the harness, not the behavior of the
+  function.
 
 ## Known limitations
 
-- pylens does not model the library calls. A call through an import becomes an
-  `unresolved_effects` entry, and `record` shows the actual behavior.
-- The cross-file propagation covers the free functions. Imported *methods* and longer dotted
-  call chains stay unresolved.
-- The input generation uses heuristics. It does not reach each branch, and validate examines
-  only the paths that the generated inputs reach.
+- **Library calls are modelled only in part.** `analyze/models.rs` covers the most frequent
+  standard-library namespaces. Every other call through an import becomes an
+  `unresolved_effects` entry, and `record` shows the actual behavior. Measured over the CPython
+  3.13 standard library, the table removes 29% of the `call_import` sites (13761 to 9742).
+- **Method resolution covers same-module classes only.** A local built from a class declared in
+  the module resolves. An imported class, an inherited method, a union of two classes, and a
+  longer dotted chain all stay unresolved. `call_method_unknown` is now the largest unresolved
+  category, at 16202 sites over the same corpus, and a large part of it is the unbound
+  superclass form `Base.method(self, ...)`.
+- **Input generation is heuristic, but the gap is now measured.** Coverage says how much of each
+  function the generated inputs reached, so "validate only examines the paths the inputs reach"
+  is a number and not a warning. Generation still has no constraint solver.
+- **A rebound parameter reports the shape it was rebound to.** `def f(x): x = []` reports `x`
+  as a sequence, and the `.pyi` stub then writes that annotation, although the caller may pass
+  anything. `validate` cannot catch this, because it concerns a declared shape and not an
+  effect.
+- **Not every claim can be checked.** An `io` `filesystem` claim has no observation channel at
+  all: the jail's file system is read only, thus no execution can confirm or contradict it.

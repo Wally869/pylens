@@ -55,7 +55,7 @@ and, for a project-local entry, a `project_target` path.
   },
   "mutations": [ /* Mutation, below */ ],
   "global_writes": ["COUNTER"],
-  "io": ["stdout"],
+  "io": ["stdout"],                  // "stdout" | "stderr" | "stdin" | "filesystem"
   "unresolved_effects": [ /* UnresolvedEffect, below */ ],
   "uses": [ { "binding": "np", "module": { "package": "numpy" } } ],
   "may_use_star": false,             // omitted if false
@@ -78,12 +78,18 @@ decorator makes it `unknown`.
 | `kind` | `positional` (the default, omitted) \| `var_positional` \| `var_keyword` \| `keyword_only` |
 | `declared` | the annotation, not trusted; omitted if absent |
 | `guard_samples` | the literal and boundary values from the guards of the function; omitted if empty |
+| `hints` | inferred domain tags — `url`, `email`, `path`, `json`, `date`, `numeric_str`, `regex`, `html`; omitted if empty. **Advisory only**, like `type_mismatches`: they direct input generation and never change the may-set or the purity |
 
 ### Shape
 
 The scalars and `Any` are single tag strings: `"int"`, `"float"`, `"bool"`, `"str"`, `"bytes"`,
 `"none"`, and `"any"`. The containers are objects with one tagged key: `{"seq": <Shape>}`,
 `{"set": <Shape>}`, and `{"map": {"key": <Shape>, "value": <Shape>}}`.
+
+`{"instance": "Foo"}` is a value built from a class declared in the module. pylens infers it for
+a local bound to a constructor call. A parameter receives it only when the function rebinds the
+parameter name to such a call, which is a known defect — refer to the limitations in
+[DESIGN.md](DESIGN.md).
 
 `{"union": [<Shape>, ...]}` is canonical. pylens flattens it (a union never contains a union),
 merges the members with the same constructor, sorts them, and removes the duplicates. It
@@ -139,6 +145,11 @@ The signature fields, and also:
 - `uncallable` — present if the function never executed:
   `{ "reason": "module_not_loadable" | "constructor_failed", "error": <HarnessError> }`.
 - `cases` — one entry for each executed input.
+- `coverage` — `{ "executed": <int>, "total": <int>, "missed": [<line>...] }`, the executed
+  lines of the function body over all its cases. `total` counts the statement lines of the body,
+  without the bodies of the nested definitions and without a bare string-literal statement,
+  which CPython never traces. Omitted when the function is `uncallable`, has no cases, or has an
+  empty body count.
 
 ### Case
 
@@ -172,6 +183,9 @@ For each function: the `hard_defects` and `soft_defects` counts, and a `defects`
   not predict an observed effect. This is a pylens soundness bug. The CLI exits with a non-zero
   code.
 - **soft** — an acknowledged `unresolved_effects` entry covers the missed effect.
+
+Each function also carries the `coverage` object described above. The `summary` carries an
+aggregate `coverage` of `{ "executed", "total" }` over the functions that have one.
 
 The `summary` also has an `uncallable` count. A function that never executed gives a result with
 zero defects, which has no value. Thus pylens shows the count, and you do not read the result as

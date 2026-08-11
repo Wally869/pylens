@@ -89,7 +89,7 @@ For a field-by-field reference, refer to [SCHEMA.md](SCHEMA.md).
 pylens record <file.py> [--inputs N] [--format json|summary|pyi|html]
 ```
 
-`record` generates a maximum of N input vectors for each function (the default is 4), runs each
+`record` generates a maximum of N input vectors for each function (the default is 12), runs each
 input in the sandbox, and adds the results to the report:
 
 - `dependencies` — each import, and its resolution status. If a module-level import is missing,
@@ -97,10 +97,27 @@ input in the sandbox, and adds the results to the report:
 - `cases` — one entry for each input. An entry has the arguments, the outcome (`returned`,
   `raised`, or `error`), the return value or the exception, the mutations of the arguments or of
   `self` (before and after), and the captured stdout and stderr.
+- `coverage` — how many lines of the function the inputs reached: `executed`, `total`, and the
+  `missed` line numbers.
 
-pylens makes the inputs from the inferred shapes. It also adds boundary values and literals from
-the guards of the function (`if qty > 10:` gives 9, 10, and 11). For a case that raises, pylens
-also shrinks the input to a smaller input that raises the same exception (`minimized`).
+pylens makes the inputs from the inferred shapes, then adds better candidates and tries them
+first:
+
+- the literal and boundary values from the guards of the function (`if qty > 10:` gives 9, 10
+  and 11), and the literal default of the parameter;
+- values that match the domain of the parameter — a URL, an e-mail address, a file path, a JSON
+  document, a date, a numeric string, a regular expression, or HTML. pylens selects these from
+  the calls that take the parameter (`json.loads(s)`, `urlparse(u)`), the methods called on it,
+  and its name. Each corpus has correct and incorrect members, because the incorrect ones reach
+  the error branch;
+- structural properties that a random value almost never has: a sorted list, a descending list,
+  a palindrome, an all-equal list, a prime, a power of two, a float trap.
+
+pylens varies one parameter at a time and holds the other parameters at a typical value. At a
+small budget this reaches much more of the function than a diagonal through each combination.
+
+For a case that raises, pylens also shrinks the input to a smaller input that raises the same
+exception (`minimized`).
 
 If the sandbox stops the code (out of memory, recursion, or timeout), pylens reports `error`. It
 does not report that the function raised.
@@ -117,6 +134,9 @@ pylens validate <file.py> [--inputs N] [--format json|summary|html]
   is a pylens bug. The exit code is not zero, thus you can use this command as a CI gate.
 - **soft** defect — an `unresolved_effects` entry covers the missed effect. This is a known
   limit, not a bug.
+
+The summary also gives the aggregate coverage. Read it together with the defect counts: a result
+of zero defects at low coverage only means that the inputs did not reach much of the code.
 
 ## Directory mode
 
@@ -160,13 +180,19 @@ come from the execution and not from the static analysis.
 
 ## Limitations
 
-- pylens does not model the calls into libraries. It marks them unresolved. `record` shows their
-  actual behavior.
+- pylens models the most frequent standard-library calls (`os.path`, `re`, `math`, `struct`,
+  `itertools`, `time`, `json`, and parts of `os` and `sys`). It marks every other call through an
+  import unresolved. `record` shows their actual behavior.
+- pylens resolves a method call only on a local built from a class declared in the same file. An
+  imported class, an inherited method, and a longer dotted chain stay unresolved.
 - The input generation uses the inferred shapes, not a constraint solver. It does not reach each
   branch. If a shape stays `any`, pylens gives values of different types, thus some inputs do not
   agree with the true expectation of the function. The case records this correctly. Increase
   `--inputs` for more coverage.
-- `validate` finds problems only on the paths that the generated inputs reach.
+- `validate` finds problems only on the paths that the generated inputs reach. The coverage
+  figure tells you how large that limit is for your code.
+- A function that rebinds a parameter name reports the new shape as the shape of the parameter.
+  `def f(x): x = []` reports `x` as a sequence, although the caller can give anything.
 - Relative imports resolve only in directory mode.
 - The sandbox has no network, a read-only file system, and limits on the CPU, the memory, and
   the time. Code that needs more than these limits fails. This is the intended behavior.
