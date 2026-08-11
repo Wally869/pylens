@@ -154,7 +154,17 @@ fn method_self_attr_write_is_detected() {
 #[test]
 fn print_is_stdout_io() {
     let s = analyze("def f():\n    print('hi')\n");
-    assert!(sig(&s, "f").io.contains(&"stdout".to_string()));
+    let f = sig(&s, "f");
+    assert!(f.io.contains(&"stdout".to_string()));
+    assert!(!f.io.contains(&"stderr".to_string()));
+}
+
+#[test]
+fn print_with_unresolved_file_is_stdout_and_stderr_io() {
+    let s = analyze("def f(x, f):\n    print(x, file=f)\n");
+    let sf = sig(&s, "f");
+    assert!(sf.io.contains(&"stdout".to_string()));
+    assert!(sf.io.contains(&"stderr".to_string()));
 }
 
 #[test]

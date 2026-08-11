@@ -416,3 +416,23 @@ fn keyword_only_mutation_is_detected() {
     });
     assert!(mutated_acc, "expected a case mutating the keyword-only `acc` param");
 }
+
+#[test]
+fn stderr_write_is_captured() {
+    if !ready("stderr_write_is_captured") {
+        return;
+    }
+    let src = "import sys\ndef f():\n    print('boom', file=sys.stderr)\n    return None\n";
+    let rec = record_file(src, 4).expect("record");
+    let f = rec
+        .functions
+        .iter()
+        .find(|r| r.signature.name == "f")
+        .expect("f record");
+    assert!(f.signature.io.contains(&"stderr".to_string()));
+    let captured_stderr = f
+        .cases
+        .iter()
+        .any(|c| c.stderr.as_deref().is_some_and(|s| s.contains("boom")));
+    assert!(captured_stderr, "expected a case with captured stderr");
+}

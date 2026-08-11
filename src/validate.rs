@@ -151,10 +151,19 @@ fn check_raise(
     }
 }
 
-/// Captured stdout is checked against the static `io` may-set (mapped the same way the
-/// analyzer records it: `print` ⇒ `"stdout"`). Captured stderr has no static counterpart
-/// today (no analyzer construct is mapped to a distinct stderr channel), so it is
-/// intentionally not checked here.
+/// Captured stdout and stderr are each checked against the static `io` may-set (mapped the
+/// same way the analyzer records it: `print` ⇒ `"stdout"`, `print(..., file=sys.stderr)` ⇒
+/// `"stderr"`, any other `file=` target ⇒ both).
+///
+/// What this check cannot see:
+/// - An interpreter-emitted warning (e.g. a `DeprecationWarning` raised by a call inside the
+///   function) also lands in captured stderr and is attributed to the function here, even
+///   though no `print`/`file=` construct produced it. That's defensible — calling the function
+///   does produce it — but it's usually explained by an `unresolved_effects` entry on the
+///   triggering call, so it reports as a soft defect rather than going unnoticed.
+/// - The `"filesystem"` token has no observation channel at all: the jail's filesystem is
+///   read-only, so no execution can confirm or contradict a filesystem claim. `io` is only
+///   partially validated by this check — stdout and stderr, never filesystem.
 fn check_io(
     sig: &EffectSignature,
     case: &Case,
@@ -162,15 +171,28 @@ fn check_io(
     severity: Severity,
     defects: &mut Vec<Defect>,
 ) {
-    if let Some(out) = &case.stdout
+    check_io_stream(sig, case, index, severity, defects, "stdout", |c| &c.stdout);
+    check_io_stream(sig, case, index, severity, defects, "stderr", |c| &c.stderr);
+}
+
+fn check_io_stream(
+    sig: &EffectSignature,
+    case: &Case,
+    index: usize,
+    severity: Severity,
+    defects: &mut Vec<Defect>,
+    channel: &str,
+    captured: impl FnOnce(&Case) -> &Option<String>,
+) {
+    if let Some(out) = captured(case)
         && !out.is_empty()
-        && !sig.io.iter().any(|c| c == "stdout")
+        && !sig.io.iter().any(|c| c == channel)
     {
         defects.push(Defect {
             case_index: index,
             dimension: Dimension::Io,
-            observed: "stdout captured".to_string(),
-            expected: format!("'stdout' not in static io (static io: {:?})", sig.io),
+            observed: format!("{channel} captured"),
+            expected: format!("'{channel}' not in static io (static io: {:?})", sig.io),
             severity,
         });
     }
@@ -421,6 +443,28 @@ mod tests {
         s.io.push("stdout".to_string());
         let mut case = returned_case(json!(null), Vec::new());
         case.stdout = Some("hello\n".to_string());
+        let defects = validate_signature(&s, &[case]);
+        assert!(defects.is_empty());
+    }
+
+    #[test]
+    fn captured_stderr_requires_static_io() {
+        let mut s = sig("f");
+        s.returns.push(ReturnKind::None);
+        let mut case = returned_case(json!(null), Vec::new());
+        case.stderr = Some("warning\n".to_string());
+        let defects = validate_signature(&s, &[case]);
+        assert_eq!(defects.len(), 1);
+        assert_eq!(defects[0].dimension, Dimension::Io);
+    }
+
+    #[test]
+    fn captured_stderr_covered_by_static_io_yields_no_defect() {
+        let mut s = sig("f");
+        s.returns.push(ReturnKind::None);
+        s.io.push("stderr".to_string());
+        let mut case = returned_case(json!(null), Vec::new());
+        case.stderr = Some("warning\n".to_string());
         let defects = validate_signature(&s, &[case]);
         assert!(defects.is_empty());
     }

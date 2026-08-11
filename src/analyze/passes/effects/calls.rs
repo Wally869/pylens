@@ -8,6 +8,29 @@ use super::super::declarations::resolve_unique;
 use super::builtins::is_known_pure_builtin;
 use super::Walker;
 
+/// Where a `print(...)` call's output goes, resolved from its `file` keyword argument.
+enum PrintTarget {
+    Stdout,
+    Stderr,
+    /// A `file=` keyword is present but its target isn't statically resolvable; the may-set
+    /// must cover both channels rather than guess.
+    Unknown,
+}
+
+/// Classify a `print(...)` call's destination: no `file=` keyword ⇒ [`PrintTarget::Stdout`];
+/// `file=sys.stderr` ⇒ [`PrintTarget::Stderr`]; any other `file=` expression ⇒
+/// [`PrintTarget::Unknown`] (record both channels).
+fn print_file_target(args: &ast::Arguments) -> PrintTarget {
+    let Some(kw) = args.keywords.iter().find(|kw| kw.arg.as_ref().is_some_and(|a| a.as_str() == "file")) else {
+        return PrintTarget::Stdout;
+    };
+    if dotted_attr(&kw.value).as_deref() == Some("sys.stderr") {
+        PrintTarget::Stderr
+    } else {
+        PrintTarget::Unknown
+    }
+}
+
 impl Walker < '_ , '_ > {
         pub fn visit_call(&mut self, call: &ast::ExprCall) {
             // Argument unpacking (`f(*xs)` / `f(**kw)`) can itself raise `TypeError` (non-iterable
@@ -180,7 +203,20 @@ impl Walker < '_ , '_ > {
                             self.facts.sig.raises.implicit.push(exc.to_string());
                         }
                         match n {
-                            "print" => self.facts.sig.io.push("stdout".to_string()),
+                            "print" => {
+                                match print_file_target(&call.arguments) {
+                                    PrintTarget::Stdout => {
+                                        self.facts.sig.io.push("stdout".to_string())
+                                    }
+                                    PrintTarget::Stderr => {
+                                        self.facts.sig.io.push("stderr".to_string())
+                                    }
+                                    PrintTarget::Unknown => {
+                                        self.facts.sig.io.push("stdout".to_string());
+                                        self.facts.sig.io.push("stderr".to_string());
+                                    }
+                                }
+                            }
                             "open" => self.facts.sig.io.push("filesystem".to_string()),
                             "input" => self.facts.sig.io.push("stdin".to_string()),
                             "setattr" | "delattr" | "exec" | "eval" => {
