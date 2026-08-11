@@ -2,52 +2,55 @@
 
 ## Purpose
 
-pylens statically analyzes Python functions and methods (in Rust) to extract their **effects**
-— returns, in-place argument and `self` mutations, raised exceptions, I/O, generator-ness — as
-a normalized **effect signature**. It then runs each function in a jail on generated inputs and
-records the effects it **actually** has. Signature + observed cases = the function's
-**behavioral record**.
+pylens examines Python functions and methods statically, in Rust. It extracts their **effects**
+— the returns, the in-place mutations of the arguments and of `self`, the raised exceptions, the
+I/O, and the generator property — as a normalized **effect signature**. Then it runs each
+function in a sandbox on generated inputs and records the actual effects. The signature and the
+observed cases together are the **behavioral record** of the function.
 
-pylens stops at producing records. Scoring, comparing a candidate against a reference, turning
-records into a training reward — all of that belongs to the consumer. The JSON contract the
-records use is specified in [SCHEMA.md](SCHEMA.md).
+pylens stops at the record. The consumer does the subsequent work: it gives scores, it compares
+a candidate against a reference, and it changes records into a training reward.
+[SCHEMA.md](SCHEMA.md) specifies the JSON contract of the records.
 
-## Principles and the soundness invariant
+## Principles and the soundness rule
 
-The downstream signal is adversarial: anything the analysis cannot see is a hole a consumer's
-reward can be hacked through. So the analyzer is honest about its blind spots
-(`unresolved_effects`) and **over-approximates** — every reported set is a *may-set*:
+The downstream signal is adversarial. If the analysis cannot examine an item, a consumer can use
+that gap to get an incorrect reward. Thus the analyzer records each of its limits in
+`unresolved_effects` and it **over-approximates**. Each reported set is a *may-set*:
 
 > **observed_effects ⊆ static_may_set**
 
-Every observed effect the static side did not predict is a **soundness bug** and must be driven
-to zero (`pylens validate` measures exactly this; a gap in a signature that claimed
-completeness is a **hard** defect, a gap covered by an acknowledged unresolved effect is
-**soft**). The reverse — predicted but never observed — is imprecision: tolerated, kept low.
-Dynamic testing falsifies soundness; it cannot prove it.
+Each observed effect that the static side did not predict is a **soundness bug**. The count must
+go to zero. `pylens validate` measures this. A gap in a signature that said that it was complete
+is a **hard** defect. A gap that an acknowledged unresolved effect covers is **soft**. The
+opposite condition — pylens predicts an effect that never occurs — is imprecision. This is
+tolerable and stays low. Dynamic tests can disprove soundness, but they cannot prove it.
 
-Two consequences drive everything else:
+Two consequences:
 
-- A function is `pure` only when nothing statically unresolved remains. Unknown calls, dynamic
-  constructs, and unrecognized decorators degrade purity to `unknown`, never silently to `pure`.
-- Static effect *shape* is necessary but not sufficient — two functions can share a shape and
-  return different values. The jailed `record` layer supplies the value-level ground truth.
+- A function is `pure` only if no static item stays unresolved. Unknown calls, dynamic
+  constructs, and unknown decorators change the purity to `unknown`. They never change it to
+  `pure`.
+- The static effect *shape* is necessary but not sufficient. Two functions can have the same
+  shape but return different values. The sandboxed `record` layer supplies the ground truth at
+  the value level.
 
-## Effect taxonomy (caller's point of view)
+## Effect types (from the point of view of the caller)
 
-1. **Return** — value vs `None`; coarse inferred kind. Rebinding a parameter name is not an
-   effect.
-2. **Argument mutation** — `p[i]=…`, `p.attr=…`, `del`, mutating methods, augmented assignment.
-3. **Global / module-state writes.**
-4. **Nonlocal / closure mutation.**
+1. **Return** — a value or `None`, and the coarse inferred kind. A new binding of a parameter
+   name is not an effect.
+2. **Argument mutation** — `p[i]=…`, `p.attr=…`, `del`, methods that change the object, and
+   augmented assignment.
+3. **Global and module-state writes.**
+4. **Nonlocal and closure mutation.**
 5. **`self`-attribute mutation** (methods).
-6. **World I/O** — stdout, files, network, env.
-7. **Exceptions** — explicit (`raise`/`assert`) vs implicit (operator- and call-induced
-   may-sets).
-8. **Generator / async.**
+6. **World I/O** — stdout, files, network, and the environment.
+7. **Exceptions** — explicit (`raise` and `assert`), and implicit (the may-sets from the
+   operators and the calls).
+8. **Generator and async.**
 
-Annotations are **untrusted** throughout: recorded, compared against the inferred side
-(`type_mismatches`, advisory only), never used for inference.
+pylens does not trust the annotations at any point. It records them, it compares them against
+the inferred side (`type_mismatches`, advisory only), and it never uses them for inference.
 
 ## Architecture
 
@@ -56,92 +59,106 @@ parse (ruff) → pass pipeline → effect signatures → input generation → ja
                                         └────────── validate: observed ⊆ static ──────────┘
 ```
 
-- **`parse/`** — the ruff boundary; all `ruff_*` usage is isolated here so the parser is
-  swappable. Every source-ingestion point strips a leading UTF-8 BOM first (CPython tolerates
-  one in a file, but the jailed worker's `compile()` on text does not; analyzer and jail must
-  see identical source).
+- **`parse.rs`** — the boundary to ruff. All the `ruff_*` code is only here, thus you can replace
+  the parser. Each source-input point first removes a UTF-8 BOM at the start. CPython accepts a
+  BOM in a file, but the `compile()` function in the sandboxed worker does not accept one in
+  text. The analyzer and the sandbox must see the same source.
 - **`model/`** — the pure data model: the effect-signature types (`mod.rs`) and the recursive
-  `Shape` lattice with canonical width-capped unions (`shape.rs`). Serialization is the schema.
-- **`analyze/`** — an ordered pass pipeline over a shared context, driven by one AST walk with
-  per-concern collectors (aliases, mutations, exceptions, shapes, returns, guards):
-  **Imports → Declarations → Shapes → Effects → Interprocedural → TypeCheck → Purity**.
-  Shapes runs a fixpoint before Effects so the walk reads settled shapes. Interprocedural
-  propagates locally-defined callees' effects onto callers to a fixpoint (recursion included),
-  mapping arguments by position and by keyword name; a call that unpacks (`f(*xs)`/`f(**kw)`)
-  keeps an acknowledged `call_unpacked_args` blind spot plus an implicit `TypeError` — the
-  unpack itself can raise before the callee runs — instead of silently dropping effects.
-  TypeCheck is advisory; Purity runs last so it sees complete effect sets.
-- **`generate/`** — shape-directed input generation, spread over the cartesian product of
-  per-parameter candidates, recursive and breadth-capped. **Guard-guided**: literal and
-  boundary values pulled from the function's own guard expressions (`if qty > 10` seeds
-  9/10/11) join the candidate pool so generated inputs reach guarded branches. Also provides
-  shrink candidates for minimization.
-- **`record/`** — joins static signatures with jailed execution: dependency probing,
-  module-load and constructor probing (an unloadable module marks every function `uncallable`
-  once), case construction, and greedy **input minimization** for raised cases (shrink while
-  the same exception type reproduces, bounded budget; a reporting aid, never fed to validate).
-  Resource kills (OOM/recursion/timeout) are sandbox artifacts — `outcome:"error"`,
-  `error.stage:"resource"` — and are never conflated with a semantic `raised`.
-- **`exec/`** — the `Sandbox` trait and the nsjail launchers (native / WSL-wrapped), the
-  JSON-over-stdio worker protocol, structured `HarnessError`. **No unsandboxed launcher
-  exists.**
-- **`validate/`** — the pure `observed ⊆ static` checker; see the invariant above.
-- **`project/`** — directory mode: `.gitignore`-honoring walk, parallel analyze, parallel
-  jailed record/validate (a small pool of worker threads, each owning its own jail), static
-  project-local import resolution (absolute and relative, `__init__.py` semantics), and
-  **cross-file effect propagation** for `project_local`-imported free functions — the
-  intra-file mapping rules applied over a project-wide fixpoint.
-- **`report/` / `stub/` / `html/`** — formatters over the same data: terminal summary, `.pyi`
-  stubs (PEP 604 unions; `record --format pyi` folds in observed types where the static side
-  stayed unresolved, marked `# observed:` — only when every observation agrees and the worker's
-  tagged serialization makes the type unambiguous), self-contained HTML.
+  `Shape` lattice with canonical unions of limited width (`shape.rs`). The serialization is the
+  schema.
+- **`analyze/`** — an ordered pass pipeline over a shared context. One AST walk drives it, with
+  one collector for each subject (aliases, mutations, exceptions, shapes, returns, guards):
+  **Imports → Declarations → Shapes → Effects → Interprocedural → TypeCheck → Purity**. Shapes
+  runs to a fixpoint before Effects, thus the walk reads the final shapes. Interprocedural
+  propagates the effects of the local callees to the callers, to a fixpoint (recursion
+  included). It maps the arguments by position and by keyword name. If a call unpacks
+  (`f(*xs)` or `f(**kw)`), pylens keeps an acknowledged `call_unpacked_args` limit and an
+  implicit `TypeError` — the unpack operation itself can raise before the callee runs. pylens
+  does not remove the effects. TypeCheck is advisory. Purity runs last, thus it sees the
+  complete effect sets.
+- **`generate.rs`** — input generation from the shapes, over the cartesian product of the
+  candidates for each parameter, recursive and with a limit on the width. It is
+  **guard-guided**: it adds the literal and boundary values from the guard expressions of the
+  function to the candidate pool (`if qty > 10` gives 9, 10, and 11). Thus the generated inputs
+  are more probable to reach the guarded branches. There is no constraint solver: if a shape
+  stays `Any`, pylens gives values of different types, and some of them do not agree with the
+  true expectation of the function. This module also supplies the candidates for the shrink
+  operation.
+- **`record.rs`** (with `shrink.rs`) — connects the static signatures to the sandboxed execution: the probes for the
+  dependencies, the module load, and the constructor (if a module cannot load, pylens marks each
+  function `uncallable` one time), the construction of the cases, and the greedy **input
+  minimization** for the cases that raise (it shrinks the input while the same exception type
+  occurs, with a limited budget; this is an aid for the report only, and validate never uses
+  it). If the sandbox stops the code (out of memory, recursion, or timeout), this is an artifact
+  of the sandbox: `outcome:"error"` with `error.stage:"resource"`. pylens never records it as a
+  semantic `raised`.
+- **`exec.rs`** — the `Sandbox` trait, the nsjail launchers (direct and through WSL), the
+  JSON-over-stdio worker protocol, and the structured `HarnessError`. **There is no unsandboxed
+  launcher.**
+- **`validate.rs`** — the pure checker for `observed ⊆ static`. Refer to the rule above.
+- **`project.rs`** and **`project/`** — directory mode: a walk that obeys `.gitignore`, parallel analysis, parallel
+  sandboxed record and validate (a small pool of worker threads, each with its own sandbox),
+  static resolution of the project-local imports (absolute and relative, with `__init__.py`
+  semantics), and **cross-file effect propagation** for the free functions that come from a
+  `project_local` import. The propagation applies the intra-file mapping rules over a fixpoint
+  across the project.
+- **`report/`, `stub/`, and `html/`** — the formatters for the same data: the terminal summary,
+  the `.pyi` stubs, and one HTML file. The stubs use PEP 604 unions. With `record --format pyi`,
+  pylens adds the observed types where the static side stayed unresolved and marks them with
+  `# observed:`. It does this only if each observation agrees and the tagged serialization of
+  the worker makes the type unambiguous.
 
 ## Execution layer
 
-**Threat model.** Runs at dataset-build time. All input code is untrusted — reference and
-candidate alike. Therefore every Python execution is jailed and there is no unsandboxed path,
-not even for dev or tests.
+**Threat model.** pylens runs when you build the dataset. It does not trust any input code, the
+reference code and the candidate code included. Thus each Python execution occurs in a sandbox.
+There is no unsandboxed path, not for development and not for the tests.
 
-**The sandbox is nsjail on a Linux kernel.** Namespaces + a seccomp-bpf filter + rlimits
-(memory/CPU/time/pids caps, no network, read-only FS). The seccomp filter is a **denylist** of
-the unambiguously dangerous syscalls (ptrace, mount, module load, setns/unshare, bpf, …) on top
-of dropped capabilities and `NO_NEW_PRIVS` — a strict CPython allowlist is fragile across
-interpreter versions and breaks the worker silently; tightening to one is future hardening.
+**The sandbox is nsjail on a Linux kernel.** It uses namespaces, a seccomp-bpf filter, and
+rlimits (limits on the memory, the CPU, the time, and the process count, no network, and a
+read-only file system). The seccomp filter is a **denylist** of the clearly dangerous syscalls
+(ptrace, mount, module load, setns, unshare, bpf, and more), together with dropped capabilities
+and `NO_NEW_PRIVS`. A strict allowlist for CPython is fragile between interpreter versions and
+stops the worker without a clear message. A change to an allowlist is possible future work.
 
-The host only changes how a Linux kernel is reached:
+The host system only changes how pylens reaches a Linux kernel:
 
 | Host | Command shape |
 |---|---|
 | Linux | `nsjail <policy> -- python worker.py` |
 | Windows | `wsl -d <distro> -- nsjail <policy> -- python worker.py` |
 
-Same policy, same worker, same protocol. **No Docker**: on Windows the untrusted code already
-sits behind nsjail *and* the WSL2 VM; a container would add a third layer and a daemon
-dependency for no security gain. (Its one value — hermetic provisioning for CI — can slot in
-later behind the same `Sandbox` trait.) Rejected interpreters (research in
-`docs/research/python-execution.md`): CPython-WASI (cold start, stdlib gaps), RustPython
-(fidelity), Monty (immature).
+The policy, the worker, and the protocol are the same. **There is no Docker.** On Windows, the
+untrusted code is already behind nsjail and the WSL2 virtual machine. A container adds a third
+layer and a dependency on a daemon, with no increase in security. A container has one advantage,
+hermetic provisioning for CI, and you can add it later behind the same `Sandbox` trait. pylens
+rejects these interpreters (refer to the research in `docs/research/python-execution.md`):
+CPython-WASI (slow cold start, missing stdlib modules), RustPython (insufficient fidelity), and
+Monty (insufficient maturity).
 
 **Execution mechanics:**
 
-- Real CPython for oracle fidelity; a persistent fork-server worker pool amortizes interpreter
-  startup while keeping per-call isolation (each request runs in a fresh `fork()`).
-- **Mutation observability:** arguments are serialized to tagged JSON before and after the
-  call; the diff (structural equality — float tolerance, set/dict ordering) is the observed
-  mutation. Tagged JSON covers non-JSON-native types (tuple/set/bytes/objects).
-- **Aliasing:** identity relations (`return is arg[i]`) are reported explicitly — serialization
-  alone destroys identity, which the effect model tracks.
-- **Methods:** the receiver is built from `__init__` and `self` pre/post state is captured like
-  any argument.
-- The function's stdout/stderr are captured as effects and kept off the protocol channel.
-- Exception observations compare by **exception type** (not message) — the same rule the
-  validator and the minimizer use.
+- pylens uses true CPython, because the oracle needs full fidelity. A permanent fork-server
+  worker pool decreases the cost of the interpreter start. Each call keeps its isolation,
+  because each request runs in a new `fork()`.
+- **How pylens sees the mutations:** it serializes the arguments to tagged JSON before and after
+  the call. The difference is the observed mutation. The comparison is structural: it accepts a
+  tolerance on floats and it ignores the order in sets and dicts. Tagged JSON also covers the
+  types that JSON does not have (tuple, set, bytes, and objects).
+- **Aliasing:** pylens reports the identity relations (`return is arg[i]`) explicitly. The
+  serialization alone removes the identity, but the effect model keeps it.
+- **Methods:** pylens builds the receiver with `__init__`. It captures the state of `self`
+  before and after the call, as it does for an argument.
+- pylens captures the stdout and the stderr of the function as effects. They do not go on the
+  protocol channel.
+- pylens compares the exceptions by **exception type**, not by message. The validator and the
+  minimizer use the same rule.
 
 ## Known limitations
 
-- Library calls are not modelled — a call through an import is an honest `unresolved_effects`
-  entry, and `record` shows what it actually did.
-- Cross-file propagation covers free functions; imported *methods* and deeper dotted call
-  chains stay unresolved.
-- Input generation is heuristic: it will not reach every branch, and validate only checks paths
-  the generated inputs actually reach.
+- pylens does not model the library calls. A call through an import becomes an
+  `unresolved_effects` entry, and `record` shows the actual behavior.
+- The cross-file propagation covers the free functions. Imported *methods* and longer dotted
+  call chains stay unresolved.
+- The input generation uses heuristics. It does not reach each branch, and validate examines
+  only the paths that the generated inputs reach.

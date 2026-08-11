@@ -1,49 +1,50 @@
 # pylens
 
-Behavioral analysis of Python code. pylens has two engines that share one core:
+pylens examines the behavior of Python code. It has two engines with one shared core:
 
-- **`analyze`** — static effect and shape analysis, written in Rust on the
-  [ruff](https://github.com/astral-sh/ruff) parser. For each function it infers an **effect
-  signature**: return kinds, argument and `self` mutations, raised exceptions (explicit and
-  implicit), I/O, recursive parameter shapes, and the calls it cannot see through. No sandbox,
-  instant, runs on whole directories.
-- **`record`** — runs the function on generated inputs inside an
-  [nsjail](https://github.com/google/nsjail) sandbox and records what it **actually** does:
-  outcome, return value, mutation diffs, raised exceptions.
+- **`analyze`** — static analysis of effects and shapes. It is written in Rust and it uses the
+  [ruff](https://github.com/astral-sh/ruff) parser. For each function, it infers an **effect
+  signature**: the return kinds, the mutations of the arguments and of `self`, the raised
+  exceptions (explicit and implicit), the I/O, the recursive parameter shapes, and the calls
+  that it cannot examine. It is immediate, it needs no sandbox, and it accepts a full directory.
+- **`record`** — runs the function on generated inputs in an
+  [nsjail](https://github.com/google/nsjail) sandbox. It records the actual behavior: the
+  outcome, the return value, the mutation differences, and the raised exceptions.
 
-`validate` ties them together: it checks that every observed effect was statically predicted
-(`observed ⊆ static`). The static side over-approximates; it must never miss an effect a real
-run can show.
+`validate` connects the two engines. It makes sure that the static analysis predicted each
+observed effect (`observed ⊆ static`). The static side over-approximates. It must never miss an
+effect that a true run shows.
 
-Output is versioned JSON. Other formats: terminal summary, `.pyi` stubs, self-contained HTML.
+The output is JSON with a version. The other formats are a terminal summary, `.pyi` stubs, and
+one HTML file.
 
 ## Requirements
 
-- Rust (edition 2024). The first build fetches and compiles the pinned ruff parser (~1–2 min).
-- A sandbox, only for `record`/`validate`. Executed code is treated as untrusted, so every run
-  is jailed with nsjail on a Linux kernel — native on Linux, via WSL2 on Windows. There is no
-  unsandboxed path. One-time setup:
+- Rust (edition 2024). The first build gets and compiles the pinned ruff parser (1 to 2 min).
+- A sandbox, only for `record` and `validate`. pylens does not trust the code that it executes.
+  Thus each run occurs in an nsjail sandbox on a Linux kernel — directly on Linux, or through
+  WSL2 on Windows. There is no unsandboxed path. Do this setup one time:
 
   ```sh
-  # Windows: run inside your WSL2 distro
+  # Windows: run in your WSL2 distribution
   wsl -d Ubuntu -- bash /mnt/c/Projects/ai/pylens/scripts/provision-sandbox.sh
   # Linux:
   bash scripts/provision-sandbox.sh
   ```
 
-  `analyze` is pure Rust and needs none of this.
+  `analyze` is pure Rust. It does not need this setup.
 
 ## Quick start
 
 ```sh
 cargo build --release
 
-pylens analyze examples/inventory.py   # static signatures, JSON, no jail
-pylens record  examples/inventory.py   # + observed cases, runs the jail
-pylens validate examples/inventory.py  # checks observed ⊆ static
+pylens analyze examples/inventory.py   # static signatures, JSON, no sandbox
+pylens record  examples/inventory.py   # also observed cases, uses the sandbox
+pylens validate examples/inventory.py  # makes sure that observed ⊆ static
 ```
 
-A recorded case from `Inventory.add(name, qty)` — a call that mutates the receiver:
+This is a recorded case from `Inventory.add(name, qty)`, a call that changes the receiver:
 
 ```jsonc
 {
@@ -62,16 +63,19 @@ A recorded case from `Inventory.add(name, qty)` — a call that mutates the rece
 
 | Command | Description |
 |---|---|
-| `pylens analyze <file.py\|dir> [--format json\|summary\|pyi\|html]` | Static effect signature of every function/method, plus catalogued imports. |
-| `pylens record <file.py\|dir> [--inputs N] [--format json\|summary\|pyi\|html]` | `analyze` plus observed cases per function and import resolution probes. Runs the jail. |
-| `pylens validate <file.py\|dir> [--inputs N] [--format json\|summary\|html]` | Runs `record`, then checks `observed ⊆ static`. Exits non-zero on a hard soundness defect. |
+| `pylens analyze <file.py\|dir> [--format json\|summary\|pyi\|html]` | Gives the static effect signature of each function and method, and a list of the imports. |
+| `pylens record <file.py\|dir> [--inputs N] [--format json\|summary\|pyi\|html]` | Does `analyze`, then adds the observed cases for each function and the import probes. Uses the sandbox. |
+| `pylens validate <file.py\|dir> [--inputs N] [--format json\|summary\|html]` | Does `record`, then makes sure that `observed ⊆ static`. Exits with a non-zero code if a hard defect occurs. |
 
-A directory argument switches to project mode: all `*.py` files, analyzed in parallel, with
-imports resolved against the other project files and effects propagated across them.
+A directory argument starts project mode. pylens processes all the `*.py` files in parallel. It
+resolves the imports against the other project files, and it propagates the effects between
+these files.
 
-## Docs
+## Documents
 
-- [User guide](docs/USER_GUIDE.md) — install, sandbox setup, commands, output formats, limits, troubleshooting
-- [SCHEMA.md](docs/SCHEMA.md) — the JSON output contract, field by field, and versioning policy
-- [DESIGN.md](docs/DESIGN.md) — effect taxonomy, soundness invariant, architecture, sandbox rationale
-- [examples/README.md](examples/README.md) — the example corpus, kept at zero hard defects
+- [User guide](docs/USER_GUIDE.md) — installation, sandbox setup, commands, output formats,
+  limits, and troubleshooting
+- [SCHEMA.md](docs/SCHEMA.md) — the JSON output contract, field by field, and the version policy
+- [DESIGN.md](docs/DESIGN.md) — the effect types, the soundness rule, the architecture, and the
+  reasons for the sandbox
+- [examples/README.md](examples/README.md) — the example corpus, which stays at zero hard defects

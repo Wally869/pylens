@@ -1,119 +1,116 @@
-# pylens — agent onboarding
+# pylens
 
-Static **effect + shape analysis** of Python functions (in Rust, via the ruff parser), plus
-**jailed execution** to record what a function *actually* does on generated inputs. Consumers
-build on the JSON output; pylens itself is domain-agnostic.
+Static effect and shape analysis of Python functions, in Rust, on the ruff parser. Also
+sandboxed execution, which records the actual behavior of a function on generated inputs.
+Output is JSON. pylens is independent of the domain; consumers build on the output.
 
-## The one invariant that governs everything
+## Soundness rule
 
 > **`observed_effects ⊆ static_may_set`**
 
-The static analysis over-approximates (**may-sets**). It must **never** report an effect
-(`pure`, a missing mutation, an unlisted raise) that a real execution can contradict. Anything
-the analyzer can't see through degrades to `unresolved`/`Unknown`, never silently to `pure`.
-`pylens validate` measures this invariant — when you change the analyzer, run it and keep the
-corpus sound.
-
-## Two engines, one core
-
-- **`analyze`** (static, pure Rust, no sandbox) — the scale path: instant, parallel, no setup.
-- **`record`** (dynamic, nsjail-jailed) — the ground-truth path: proves the static engine
-  honest and supplies observed behavior.
-
-`record` = `analyze` + the dynamic layer. One static core; the commands are not separate
-pipelines.
-
-## The analyzer is a pass pipeline
-
-`analyze_module` (`src/analyze/mod.rs`) runs ordered passes over a shared `ModuleAnalysis`:
-
-**Imports → Declarations → Shapes → Effects → Interprocedural → TypeCheck → Purity**
-
-- **Imports** — import binding table.
-- **Declarations** — function/method symbol table; the enabler for call resolution.
-- **Shapes** — fixpoint inference of a recursive `Shape` (incl. unions) for every param and
-  local; runs before Effects so Effects reads final shapes.
-- **Effects** — the single AST walk building each `EffectSignature`, delegating to the
-  `collect/` collectors (one traversal, not N).
-- **Interprocedural** — propagates locally-defined callees' effects to callers (fixpoint,
-  positional + keyword mapping; unpacked calls keep an acknowledged blind spot). Project mode
-  extends this across files (`src/project/interproc.rs`).
-- **TypeCheck** — flags declared-vs-inferred mismatches (return and param); advisory only.
-- **Purity** — derives `Purity` from the accumulated facts.
-
-Injection points: the `Pass` trait for pipeline stages; `collect/` for the effect walk;
-`generate.rs` for input strategy; the `Sandbox` trait for launchers; `report`/`stub`/`html`
-for output.
-
-## Codemap
-
-- `src/lib.rs` — crate root: `analyze_source`, `imports_of`, `SCHEMA_VERSION`, `strip_bom`.
-- `src/main.rs` — CLI; a directory arg triggers project mode, file/stdin is single-file.
-- `src/parse.rs` — the ruff parser boundary; all `ruff_*` usage is isolated here.
-- `src/model/` — the data model: `shape.rs` (the recursive `Shape` lattice: join, unions,
-  serde), `mod.rs` (everything else: `EffectSignature`, params, mutations, raises, imports,
-  `TypeMismatch`, `Purity`, …).
-- `src/analyze/` — `mod.rs` (pipeline driver), `pass.rs` (`Pass` trait), `context.rs` (shared
-  state), `passes/` (one file per pass; `shapes/` and `effects/` are split into submodules),
-  `collect/` (per-walk collectors: aliases, mutations, exceptions, shapes, returns, guards).
-- `src/generate.rs` — shape-directed, guard-guided input generation; shrink candidates.
-- `src/exec.rs` — jailed execution: `Sandbox` trait, `Nsjail`, `NsjailPool` fork-server.
-  **No unsandboxed launcher exists.**
-- `src/record.rs` — static signature + jailed cases (`ModuleRecord`/`Case`), before/after
-  mutation diffing.
-- `src/shrink.rs` — greedy input minimization for raised cases (reporting aid only).
-- `src/validate.rs` — the `observed ⊆ static` harness; `Defect` severity: Hard = may-set
-  claimed completeness yet missed an effect, Soft = covered by an acknowledged unresolved.
-- `src/project.rs` + `src/project/` — multi-file mode: `.gitignore`-honoring walk, parallel
-  analyze and jailed record, cross-file propagation (`interproc.rs`), import resolution
-  (`resolve.rs`).
-- `src/report.rs`, `src/stub/`, `src/html/` — output formatters: terminal summary, `.pyi`
-  stubs (incl. observed-type folding for `record --format pyi`), self-contained HTML.
-- `python/worker.py` — the in-jail CPython harness: JSON-over-stdio; `--serve` fork-server.
-- `nsjail/pylens.nsjail.cfg` — the jail policy. `scripts/provision-sandbox.sh` — builds
-  nsjail and **deploys** worker + policy to `$HOME/.local/share/pylens/`.
-- `tests/` — `analyze`/`imports`/`generate` are pure (always run); `pool`/`record`/
-  `validate`/`project` are jail-gated (skip when the sandbox isn't provisioned).
+The static analysis over-approximates (may-sets). It must never report an effect (`pure`, a
+missing mutation, an unlisted raise) that an execution can disprove. What the analyzer cannot
+examine becomes `unresolved` or `Unknown`, never `pure`. `pylens validate` measures this rule.
+Run it after a change to the analyzer.
 
 ## Commands
 
 ```sh
 cargo build --release
-cargo test                          # jail-gated tests skip if sandbox absent
+cargo test                          # the sandbox tests skip if the sandbox is absent
 cargo clippy --all-targets -- -D warnings
 
 pylens analyze  <file.py|dir> [--format json|summary|pyi|html]
-pylens record   <file.py|dir> [--inputs N] [--format json|summary|pyi|html]  # runs the jail; pyi single-file only
-pylens validate <file.py|dir> [--inputs N] [--format json|summary|html]      # exits non-zero on hard defects
+pylens record   <file.py|dir> [--inputs N] [--format json|summary|pyi|html]  # sandbox; pyi is for one file only
+pylens validate <file.py|dir> [--inputs N] [--format json|summary|html]      # exits non-zero on a hard defect
 ```
 
-## Sandbox (read before touching `record`/`worker.py`)
+`analyze` is static and needs no sandbox. `record` is `analyze` plus the dynamic layer, on one
+static core. A directory argument starts project mode.
 
-Every Python execution is nsjail-jailed on a Linux kernel — native on Linux, **via WSL2 on
-Windows**. One-time setup: `bash scripts/provision-sandbox.sh` (on Windows, inside WSL).
+## Pipeline
 
-**Gotcha that bites everyone:** the jail runs the **deployed copy** of `python/worker.py`, not
-the repo file. After editing it, re-run the provision script (or redeploy with
-`wsl -d Ubuntu -- install -m 0644 /mnt/c/Projects/ai/pylens/python/worker.py "$HOME/.local/share/pylens/worker.py"`),
-or jail-gated tests run against the stale worker.
+`analyze_module` (`src/analyze/mod.rs`) runs ordered passes over a shared `ModuleAnalysis`:
+
+**Imports → Declarations → Shapes → Effects → Interprocedural → TypeCheck → Purity**
+
+- **Imports** — the table of the import bindings.
+- **Declarations** — the symbol table of the functions and methods. Call resolution needs it.
+- **Shapes** — fixpoint inference of a recursive `Shape` (unions included) for each parameter
+  and local. Runs before Effects, thus Effects reads the final shapes.
+- **Effects** — the single AST walk that builds each `EffectSignature`. It delegates to the
+  collectors in `collect/`.
+- **Interprocedural** — propagates the effects of the local callees to the callers (a fixpoint;
+  mapping by position and by keyword). A call that unpacks keeps an acknowledged limit. Project
+  mode extends this between files (`src/project/interproc.rs`).
+- **TypeCheck** — reports the disagreements between the declared and the inferred types.
+  Advisory only.
+- **Purity** — derives the `Purity` from the collected facts.
+
+Extension points: the `Pass` trait, `collect/`, `generate.rs`, the `Sandbox` trait, and the
+`report`, `stub`, and `html` formatters.
+
+## Codemap
+
+- `src/lib.rs` — the crate root: `analyze_source`, `imports_of`, `SCHEMA_VERSION`, `strip_bom`.
+- `src/main.rs` — the CLI. A directory starts project mode; a file or stdin starts single-file
+  mode.
+- `src/parse.rs` — the boundary to the ruff parser. All the `ruff_*` code is only here.
+- `src/model/` — the data model: `shape.rs` (the `Shape` lattice: join, unions, serde) and
+  `mod.rs` (`EffectSignature`, params, mutations, raises, imports, `TypeMismatch`, `Purity`).
+- `src/analyze/` — `mod.rs` (the driver), `pass.rs` (the `Pass` trait), `context.rs` (the shared
+  state), `passes/` (one file for each pass; `shapes/` and `effects/` have submodules),
+  `collect/` (aliases, mutations, exceptions, shapes, returns, guards).
+- `src/generate.rs` — input generation from the shapes, guided by the guards. Also gives the
+  shrink candidates.
+- `src/exec.rs` — sandboxed execution: the `Sandbox` trait, `Nsjail`, the `NsjailPool` fork
+  server. There is no unsandboxed launcher.
+- `src/record.rs` — the static signature and the sandboxed cases (`ModuleRecord`, `Case`), with
+  the mutation difference before and after the call.
+- `src/shrink.rs` — greedy input minimization for the cases that raise. An aid for the report
+  only.
+- `src/validate.rs` — the `observed ⊆ static` harness. `Defect` severity is Hard if a may-set
+  said that it was complete but missed an effect, Soft if an acknowledged unresolved entry
+  covers the effect.
+- `src/project.rs`, `src/project/` — multi-file mode: a walk that obeys `.gitignore`, parallel
+  analysis and sandboxed record, cross-file propagation (`interproc.rs`), import resolution
+  (`resolve.rs`).
+- `src/report.rs`, `src/stub/`, `src/html/` — the output formatters: the terminal summary, the
+  `.pyi` stubs (with the observed types for `record --format pyi`), one HTML file.
+- `python/worker.py` — the CPython harness in the sandbox: JSON over stdio, `--serve` fork
+  server.
+- `nsjail/pylens.nsjail.cfg` — the sandbox policy. `scripts/provision-sandbox.sh` — builds
+  nsjail and deploys the worker and the policy to `$HOME/.local/share/pylens/`.
+- `tests/` — `analyze`, `imports`, and `generate` are pure and always run. `pool`, `record`,
+  `validate`, and `project` need the sandbox and skip if it is not provisioned.
+
+## Sandbox
+
+Each Python execution occurs in an nsjail sandbox on a Linux kernel — directly on Linux, through
+WSL2 on Windows. Setup, one time: `bash scripts/provision-sandbox.sh` (on Windows, in WSL).
+
+The sandbox runs the deployed copy of `python/worker.py`, not the file in the repository. After
+a change to that file, run the provision script again, or deploy it with
+`wsl -d Ubuntu -- install -m 0644 /mnt/c/Projects/ai/pylens/python/worker.py "$HOME/.local/share/pylens/worker.py"`.
+If you do not, the sandbox tests use the old worker.
 
 ## Conventions
 
-- **May-set semantics, soundness first.** Over-approximation is tolerated and kept low;
-  under-approximation is a bug — a **hard defect** in `pylens validate`. The `examples/`
-  corpus stays at zero hard defects, enforced by `tests/validate.rs` and `tests/project.rs` —
-  don't weaken them to hide new findings; report them.
-- **Greenfield.** No backwards-compat baggage, no dead code, no "previous approach" comments.
-- Considering a `SCHEMA_VERSION` bump? Read the versioning section in `docs/SCHEMA.md` first.
-- **Rust edition 2024.** ruff is pinned to a fixed rev in `Cargo.toml`.
-- Doc-comment each pass/collector/module with its single responsibility.
-- Resource kills (OOM/recursion/timeout) are `outcome:"error"`, `error.stage:"resource"` —
-  never conflated with a semantic `raised`.
+- Over-approximation is tolerable and stays low. Under-approximation is a bug — a hard defect in
+  `pylens validate`. The `examples/` corpus stays at zero hard defects; `tests/validate.rs` and
+  `tests/project.rs` enforce this. Do not make them weaker to hide a new finding. Report it.
+- Greenfield: no backwards compatibility, no dead code, no comments about a previous approach.
+- Before you increase `SCHEMA_VERSION`, read the version section in `docs/SCHEMA.md`.
+- Rust edition 2024. ruff is pinned to a fixed revision in `Cargo.toml`.
+- Give each pass, collector, and module a doc comment with its one responsibility.
+- If the sandbox stops the code (out of memory, recursion, timeout), the result is
+  `outcome:"error"` with `error.stage:"resource"`. Never record it as a semantic `raised`.
 
 ## Extending
 
-- **New analysis** → a collector under `collect/`, or a new `Pass` (insert in
-  `analyze/mod.rs`). Keep the single-traversal design.
-- **New output** → a formatter module (mirror `report`/`stub`/`html`) + a `--format` value.
-- **New implicit exception / shape rule** → the relevant collector; then run `pylens validate`
-  over the corpus to confirm the soundness gap is closed, not opened.
+- A new analysis → a collector in `collect/`, or a new `Pass` (insert it in `analyze/mod.rs`).
+  Keep the single-traversal design.
+- A new output → a formatter module (`report`, `stub`, and `html` are the examples) and a
+  `--format` value.
+- A new implicit exception or shape rule → the applicable collector. Then run `pylens validate`
+  over the corpus to confirm that the gap is closed.

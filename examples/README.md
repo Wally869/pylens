@@ -1,32 +1,34 @@
 # Example corpus
 
-Non-trivial Python chosen to exercise the analyzer and the record flow. Run any command on
-a single file, or on the whole `examples/` directory to exercise project mode (aggregated report,
-project-local import resolution):
+This is non-trivial Python code that exercises the analyzer and the record flow. Run any command
+on one file, or on the full `examples/` directory to exercise project mode (a collected report,
+and resolution of the project-local imports):
 
 ```sh
 pylens analyze  examples/<file>.py            # static signatures
-pylens record   examples/<file>.py --inputs 4 # signatures + observed cases (jailed)
-pylens validate examples/<file>.py --inputs 4 # observed ⊆ static soundness check (jailed)
+pylens record   examples/<file>.py --inputs 4 # signatures and observed cases (sandboxed)
+pylens validate examples/<file>.py --inputs 4 # the observed ⊆ static check (sandboxed)
 
-pylens analyze  examples --format summary     # same, over every *.py file under examples/
-pylens analyze  examples/<file>.py --format pyi   # inferred .pyi stub instead of JSON
-pylens record   examples/<file>.py --format html > report.html  # self-contained HTML report
+pylens analyze  examples --format summary     # the same, over each *.py file in examples/
+pylens analyze  examples/<file>.py --format pyi   # an inferred .pyi stub in place of JSON
+pylens record   examples/<file>.py --format html > report.html  # one HTML report file
 ```
 
 | File | Exercises |
 |---|---|
-| `inventory.py` | A class with methods: `self`-attribute mutation (dict subscript set, `del`, augmented assign, list append), explicit raises (`ValueError`/`OverflowError`/`KeyError`), receiver pre/post state in cases, a method returning aliased state. |
-| `normalize.py` | Complex free functions: in-place nested-sequence mutation, returning a mutated argument (aliasing), multi-path return unions (`str`/`int`/`none`), explicit raise, default parameter. |
-| `streaming.py` | A generator (`yield`), a qualified stdlib call (`re.finditer` — an external dep the static layer can't model), an unknown free callee, a method call on a parameter, and captured stdout I/O. |
-| `graph.py` | Local aliasing of a parameter that is then mutated (alias tracking must blame the parameter), a `global` write, set/dict/list traversal, a return that aliases an argument. |
-| `config.py` | Dynamic attribute writes via `setattr` on `self` and on a parameter (`dynamic_setattr` unresolved effects) alongside concrete self-attribute mutation. |
-| `ledger.py` | A class whose methods use **real** libraries (`hashlib`, `datetime`): class-method records (self-attr mutation, raise) alongside resolved dependencies. |
-| `deps.py` | Every **import style** mixing resolvable stdlib with missing/fake packages: plain, `as` alias, dotted-path + alias, `from … import a, b`, single, dotted-from-missing, `*` star, and relative. Shows the `dependencies` resolution report. |
-| `lazy_deps.py` | Imports **inside function bodies** — the module loads, so a missing import (`matplotlib`) raises `ModuleNotFoundError` at call time while a real one (`json`) works. |
+| `inventory.py` | A class with methods: `self`-attribute mutation (a dict subscript set, `del`, an augmented assignment, a list append), explicit raises (`ValueError`, `OverflowError`, `KeyError`), the receiver state before and after the call, and a method that returns aliased state. |
+| `normalize.py` | Complex free functions: in-place mutation of a nested sequence, a return of a changed argument (aliasing), return unions from more than one path (`str`, `int`, `none`), an explicit raise, and a default parameter. |
+| `streaming.py` | A generator (`yield`), a qualified stdlib call (`re.finditer` — an external dependency that the static layer cannot model), an unknown free callee, a method call on a parameter, and captured stdout I/O. |
+| `graph.py` | A local alias of a parameter that the code then changes (the alias tracking must attribute the mutation to the parameter), a `global` write, traversal of a set, a dict, and a list, and a return that aliases an argument. |
+| `config.py` | Dynamic attribute writes with `setattr`, on `self` and on a parameter (`dynamic_setattr` unresolved effects), together with concrete `self`-attribute mutation. |
+| `ledger.py` | A class whose methods use **true** libraries (`hashlib` and `datetime`): class-method records (`self`-attribute mutation and a raise), together with resolved dependencies. |
+| `deps.py` | Each **import style**, with a mix of resolvable stdlib modules and missing or fake packages: plain, `as` alias, dotted path with an alias, `from … import a, b`, single, dotted-from-missing, `*` star, and relative. It shows the resolution report in `dependencies`. |
+| `lazy_deps.py` | Imports **in function bodies**. The module loads, thus a missing import (`matplotlib`) raises `ModuleNotFoundError` at call time, but a true one (`json`) operates correctly. |
 
-Generated records for these live in `../records/` (regenerate with `pylens record`).
+The generated records for these files are in `../records/`. To make them again, run
+`pylens record`.
 
-Note: generation is shape-directed, not constraint-solving, so some generated inputs are
-ill-typed for a given function and the case records that honestly (e.g. a `TypeError`, or an
-`AttributeError` when `setattr` is tried on a non-object). That is the real behavior, not a bug.
+Note: the generation uses the shapes, not a constraint solver. Thus some generated inputs have
+an incorrect type for a given function, and the case record shows this correctly (for example, a
+`TypeError`, or an `AttributeError` if the code tries `setattr` on a non-object). This is the
+true behavior, not a bug.
