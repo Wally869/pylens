@@ -8,4 +8,4 @@ def caller(data):
 
 
 def uses_external():
-    return os.getcwd()
+    return os.urandom(4)

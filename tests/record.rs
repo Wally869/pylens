@@ -418,6 +418,42 @@ fn keyword_only_mutation_is_detected() {
 }
 
 #[test]
+fn sys_exit_is_reported_as_raised_not_a_resource_kill() {
+    if !ready("sys_exit_is_reported_as_raised_not_a_resource_kill") {
+        return;
+    }
+    // `sys.exit()` raises `SystemExit`, a `BaseException` the harness's `except Exception` alone
+    // wouldn't catch — a genuine `raise` inside the function's own behavior, so it must surface
+    // as outcome "raised" (not crash the child / surface as a harness `error`).
+    let src = "import sys\ndef f():\n    sys.exit(1)\n";
+    let rec = record_file(src, 3).expect("record");
+    let f = rec
+        .functions
+        .iter()
+        .find(|r| r.signature.name == "f")
+        .expect("f record");
+    assert!(
+        f.signature
+            .raises
+            .implicit
+            .iter()
+            .any(|e| e == "SystemExit"),
+        "static signature should model sys.exit as raising SystemExit: {:?}",
+        f.signature.raises
+    );
+    assert!(!f.cases.is_empty(), "expected generated cases");
+    for c in &f.cases {
+        assert_eq!(
+            c.outcome, "raised",
+            "sys.exit() must surface as a semantic raise: {:?}",
+            c.error
+        );
+        assert_eq!(c.raises.as_deref(), Some("SystemExit"));
+        assert!(c.error.is_none(), "a semantic raise carries no structured error");
+    }
+}
+
+#[test]
 fn stderr_write_is_captured() {
     if !ready("stderr_write_is_captured") {
         return;

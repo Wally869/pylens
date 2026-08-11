@@ -4,6 +4,7 @@
 
 mod collect;
 mod context;
+mod models;
 mod pass;
 mod passes;
 

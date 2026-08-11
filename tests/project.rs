@@ -128,7 +128,7 @@ fn analyze_project_propagates_cross_file_mutation_onto_the_caller() {
     assert!(
         unresolved
             .iter()
-            .any(|u| u["reason"] == "call_import" && u["callee"] == "os.getcwd"),
+            .any(|u| u["reason"] == "call_import" && u["callee"] == "os.urandom"),
         "expected an external import to stay unresolved, got {unresolved:?}"
     );
 }

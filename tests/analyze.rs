@@ -787,3 +787,75 @@ fn imported_class_does_not_infer_an_instance_shape() {
     assert!(f.unresolved_effects.iter().any(|u| u.reason == "call_import" && u.callee.as_deref() == Some("Widget")));
     assert!(f.unresolved_effects.iter().any(|u| u.reason == "call_method_unknown"));
 }
+
+#[test]
+fn modelled_stdlib_call_adds_raises_and_drops_the_unresolved_acknowledgment() {
+    let s = analyze("import os.path\ndef f(a, b):\n    return os.path.join(a, b)\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"TypeError".to_string()));
+    assert!(f.raises.implicit.contains(&"AttributeError".to_string()));
+    assert!(
+        !f.unresolved_effects.iter().any(|u| u.reason == "call_import"),
+        "a modelled call must not also leave a call_import acknowledgment: {:?}",
+        f.unresolved_effects
+    );
+}
+
+#[test]
+fn aliased_stdlib_import_resolves_to_the_same_model_entry() {
+    // `import os.path as p; p.join(...)` must find the `os.path.join` entry via the resolved
+    // module path, not the `p.join` call-site text.
+    let s = analyze("import os.path as p\ndef f(a, b):\n    return p.join(a, b)\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"TypeError".to_string()));
+    assert!(f.raises.implicit.contains(&"AttributeError".to_string()));
+    assert!(
+        !f.unresolved_effects.iter().any(|u| u.reason == "call_import"),
+        "the aliased call must resolve to the os.path.join entry: {:?}",
+        f.unresolved_effects
+    );
+}
+
+#[test]
+fn unmodelled_member_of_a_modelled_namespace_stays_unresolved() {
+    // `os.path.*` is modelled per-name (no namespace fallback), so a member absent from the
+    // table (e.g. `samestat`) must stay an unresolved `call_import`, not silently pass through.
+    let s = analyze("import os.path\ndef f(a, b):\n    return os.path.samestat(a, b)\n");
+    let f = sig(&s, "f");
+    assert!(
+        f.unresolved_effects
+            .iter()
+            .any(|u| u.reason == "call_import" && u.callee.as_deref() == Some("os.path.samestat")),
+        "expected samestat to remain unresolved: {:?}",
+        f.unresolved_effects
+    );
+}
+
+#[test]
+fn do_not_model_list_entry_stays_unresolved() {
+    // `sys.audit` invokes arbitrary hooks — explicitly excluded from the table.
+    let s = analyze("import sys\ndef f():\n    sys.audit('event')\n");
+    let f = sig(&s, "f");
+    assert!(
+        f.unresolved_effects
+            .iter()
+            .any(|u| u.reason == "call_import" && u.callee.as_deref() == Some("sys.audit")),
+        "sys.audit must stay unresolved: {:?}",
+        f.unresolved_effects
+    );
+}
+
+#[test]
+fn project_local_import_never_matches_a_stdlib_model() {
+    // `util.*` ranks high in the stdlib corpus only because it's a relative import inside stdlib
+    // packages — a project's own `util` module must never accidentally match a model entry.
+    let s = analyze("import util\ndef f(x):\n    return util.helper(x)\n");
+    let f = sig(&s, "f");
+    assert!(
+        f.unresolved_effects
+            .iter()
+            .any(|u| u.reason == "call_import" && u.callee.as_deref() == Some("util.helper")),
+        "util.helper must stay unresolved: {:?}",
+        f.unresolved_effects
+    );
+}

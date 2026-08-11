@@ -4,6 +4,7 @@ use super::super::super::collect::aliases::{dotted_attr, leftmost_name};
 use super::super::super::collect::mutations::{is_known_readonly_method, is_mutating_method};
 use super::super::super::collect::exceptions::call_implicit_exception;
 use super::super::super::context::{CallReceiver, CallSite, ImportCallSite};
+use super::super::super::models::{self, ModelEntry};
 use super::super::declarations::resolve_unique;
 use super::builtins::is_known_pure_builtin;
 use super::Walker;
@@ -47,13 +48,21 @@ impl Walker < '_ , '_ > {
                     // foreign effect we can't see through — record it (so the function isn't
                     // mistaken for pure) rather than treating it as a value method.
                     if let Some(base) = leftmost_name(&attr.value)
-                        && self.facts.imports.contains_key(base)
+                        && let Some(module) = self.facts.imports.get(base)
                     {
-                        self.facts.sig.unresolved_effects.push(UnresolvedEffect {
-                            reason: "call_import".to_string(),
-                            callee: dotted_attr(&call.func),
-                            may_affect: self.args_targets(&call.arguments),
-                        });
+                        let full = dotted_attr(&call.func);
+                        let modelled = full
+                            .as_deref()
+                            .and_then(|f| models::resolve_stdlib_call(module, base, f));
+                        if let Some(model) = modelled {
+                            self.apply_model(model);
+                        } else {
+                            self.facts.sig.unresolved_effects.push(UnresolvedEffect {
+                                reason: "call_import".to_string(),
+                                callee: full,
+                                may_affect: self.args_targets(&call.arguments),
+                            });
+                        }
                         // Only a direct `binding.attr(...)` (not a deeper chain like
                         // `binding.sub.attr(...)`) lines up unambiguously with a project-local
                         // `binding.attr` symbol — see `ImportCallSite` doc.
@@ -145,13 +154,18 @@ impl Walker < '_ , '_ > {
                 // Plain function call: `name(...)`.
                 ast::Expr::Name(name) => {
                     let n = name.id.as_str();
-                    if self.facts.imports.contains_key(n) {
+                    if let Some(module) = self.facts.imports.get(n) {
                         // A directly-imported callable (`from json import dumps; dumps(x)`).
-                        self.facts.sig.unresolved_effects.push(UnresolvedEffect {
-                            reason: "call_import".to_string(),
-                            callee: Some(n.to_string()),
-                            may_affect: self.args_targets(&call.arguments),
-                        });
+                        let modelled = models::lookup(&format!("{}.{n}", module.dotted()));
+                        if let Some(model) = modelled {
+                            self.apply_model(model);
+                        } else {
+                            self.facts.sig.unresolved_effects.push(UnresolvedEffect {
+                                reason: "call_import".to_string(),
+                                callee: Some(n.to_string()),
+                                may_affect: self.args_targets(&call.arguments),
+                            });
+                        }
                         let arg_roots = self.positional_arg_roots(&call.arguments);
                         let kwarg_roots = self.keyword_arg_roots(&call.arguments);
                         self.facts.import_call_sites.push(ImportCallSite {
@@ -253,6 +267,17 @@ impl Walker < '_ , '_ > {
             }
             for kw in call.arguments.keywords.iter() {
                 self.visit_expr(&kw.value);
+            }
+        }
+
+        /// Fold a modelled stdlib call's known raises/io into this function's signature — the
+        /// `models` table entry replaces the `call_import` unresolved-effect acknowledgment.
+        fn apply_model(&mut self, model: &ModelEntry) {
+            for r in model.raises {
+                self.facts.sig.raises.implicit.push((*r).to_string());
+            }
+            for io in model.io {
+                self.facts.sig.io.push((*io).to_string());
             }
         }
 

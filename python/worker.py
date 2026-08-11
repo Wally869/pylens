@@ -113,10 +113,13 @@ RESOURCE_EXCEPTIONS = (MemoryError, RecursionError)
 """Exceptions that mean the sandbox ran out of a resource, not that the function under test
 raised as part of its behavior. Caught ahead of the generic `except Exception` in `run_request`
 and reported through `error` (stage `"resource"`), never through `exception` — so a consumer
-can never mistake "ran out of memory/stack" for a semantic raise. `KeyboardInterrupt` /
-`SystemExit` need no special handling here: they are `BaseException`, not `Exception`, so they
-already fall outside the `except Exception` catch and crash the (forked) child, which surfaces
-as `no_output` — already on the error side, never `exception`."""
+can never mistake "ran out of memory/stack" for a semantic raise. `KeyboardInterrupt` is left
+alone: it's a harness signal (never something the function under test does on purpose), so it
+still falls outside every `except` below and crashes the (forked) child, surfacing as
+`no_output` — the error side, never `exception`. `SystemExit` is different: `sys.exit()` is
+genuine function behavior (e.g. a CLI entry point), so `run_request` catches it explicitly,
+below, and reports it through `exception` like any other raise, even though it's a
+`BaseException` the generic `except Exception` wouldn't otherwise see."""
 
 
 def _clip(text):
@@ -257,6 +260,9 @@ def run_request(req):
     except RESOURCE_EXCEPTIONS as e:
         resp["ok"] = False
         resp["error"] = exc_error("resource", e)
+    except SystemExit as e:
+        resp["ok"] = False
+        resp["exception"] = {"type": type(e).__name__, "message": "" if e.code is None else str(e.code)}
     except Exception as e:
         resp["ok"] = False
         resp["exception"] = {"type": type(e).__name__, "message": str(e)}
