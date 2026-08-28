@@ -150,8 +150,6 @@ def _make_tracer(executed, arcs):
     last_line = {}
 
     def local_trace(frame, event, arg):
-        if frame.f_code.co_filename != "<pylens>":
-            return local_trace
         if event == "line":
             cur = frame.f_lineno
             executed.add(cur)
@@ -165,6 +163,12 @@ def _make_tracer(executed, arcs):
         return local_trace
 
     def global_trace(frame, event, arg):
+        # Only frames of the module under test get a local tracer at all. A foreign frame
+        # (stdlib, third-party) returns None, so its per-line events never fire — the win is
+        # large when the function under test leans on pure-Python stdlib code. A foreign frame
+        # calling back into "<pylens>" code still traces: every new call re-enters here.
+        if frame.f_code.co_filename != "<pylens>":
+            return None
         return local_trace
 
     return global_trace
