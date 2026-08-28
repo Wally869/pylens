@@ -117,6 +117,12 @@ pub struct CallResult {
     /// (a resource kill still ran some lines first). See `record::coverage`.
     #[serde(default)]
     pub lines: Vec<u32>,
+    /// `(prev_line, cur_line)` transitions traced within the module under test during the call —
+    /// sorted ascending, per-frame (a call into another traced function never contributes a
+    /// spurious arc from the caller's line to the callee's). See `record::branch_report_for`,
+    /// which turns these into per-branch-outcome coverage.
+    #[serde(default)]
+    pub arcs: Vec<(u32, u32)>,
 }
 
 /// A jailed Python execution → observed effects. Implementors provide [`Sandbox::transport`]

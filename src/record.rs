@@ -10,7 +10,8 @@ use serde_json::{Map, Value};
 
 use crate::exec::{CallResult, HarnessError, NsjailPool, Sandbox};
 use crate::generate::{GenInput, gen_inputs, keyword_only_params, positional_params};
-use crate::model::{DefKind, EffectSignature, Import};
+use crate::model::branch::OutcomeEvidence;
+use crate::model::{BranchKind, DefKind, EffectSignature, Import};
 use crate::shrink::shrink_case;
 use crate::{analyze_source, imports_of};
 
@@ -125,6 +126,10 @@ pub struct Case {
     /// per-function aggregate, not something a consumer needs per case (noisy at N cases).
     #[serde(skip)]
     pub lines: Vec<u32>,
+    /// Line-transition arcs this case traced — an input to [`branch_report_for`]'s per-function
+    /// aggregate, not something a consumer needs per case (noisy at N cases).
+    #[serde(skip)]
+    pub arcs: Vec<(u32, u32)>,
 }
 
 /// A function's executed-line coverage, aggregated over all its cases: how many of its
@@ -167,6 +172,87 @@ fn coverage_for(sig: &EffectSignature, cases: &[Case]) -> Option<Coverage> {
     })
 }
 
+/// One outcome of a [`BranchReport`], and whether the aggregated cases proved it happened.
+#[derive(Debug, Serialize)]
+pub struct BranchOutcomeReport {
+    pub outcome: String,
+    /// `covered` (some case's traced arc/line is the evidence for this outcome) | `uncovered`
+    /// (the evidence was never observed) | `unobservable_line_granularity` (line-level tracing
+    /// cannot distinguish this outcome from its siblings — see
+    /// [`crate::model::branch::OutcomeEvidence::Unobservable`]).
+    pub status: String,
+}
+
+/// One branch point of a function's body — see [`crate::analyze::collect::branches`] — with each
+/// of its outcomes' observed status.
+#[derive(Debug, Serialize)]
+pub struct BranchReport {
+    pub kind: BranchKind,
+    pub line: u32,
+    pub outcomes: Vec<BranchOutcomeReport>,
+}
+
+/// The per-function rollup over every outcome of every [`BranchReport`] — a closed count: every
+/// outcome is exactly one of `covered`, `uncovered`, or `unobservable`.
+#[derive(Debug, Serialize, Default)]
+pub struct BranchCoverage {
+    pub covered: usize,
+    pub uncovered: usize,
+    pub unobservable: usize,
+}
+
+/// Aggregate `cases`' traced lines and arcs against `sig.branch_points`, deciding each outcome's
+/// status from the union of evidence over every case (generated and replayed alike — a branch
+/// outcome reached by any input counts as covered). `None` when there's nothing to measure: no
+/// branch points, or no cases to have measured them with — mirrors [`coverage_for`].
+fn branch_report_for(sig: &EffectSignature, cases: &[Case]) -> Option<(Vec<BranchReport>, BranchCoverage)> {
+    if cases.is_empty() || sig.branch_points.is_empty() {
+        return None;
+    }
+    let lines_seen: HashSet<u32> = cases.iter().flat_map(|c| c.lines.iter().copied()).collect();
+    let arcs_seen: HashSet<(u32, u32)> = cases.iter().flat_map(|c| c.arcs.iter().copied()).collect();
+
+    let mut rollup = BranchCoverage::default();
+    let mut reports = Vec::with_capacity(sig.branch_points.len());
+    for bp in &sig.branch_points {
+        let mut outcomes = Vec::with_capacity(bp.outcomes.len());
+        for o in &bp.outcomes {
+            let status = match o.evidence {
+                OutcomeEvidence::Unobservable => "unobservable_line_granularity",
+                OutcomeEvidence::Arc(a, b) => {
+                    if arcs_seen.contains(&(a, b)) {
+                        "covered"
+                    } else {
+                        "uncovered"
+                    }
+                }
+                OutcomeEvidence::Line(l) => {
+                    if lines_seen.contains(&l) {
+                        "covered"
+                    } else {
+                        "uncovered"
+                    }
+                }
+            };
+            match status {
+                "covered" => rollup.covered += 1,
+                "uncovered" => rollup.uncovered += 1,
+                _ => rollup.unobservable += 1,
+            }
+            outcomes.push(BranchOutcomeReport {
+                outcome: o.outcome.clone(),
+                status: status.to_string(),
+            });
+        }
+        reports.push(BranchReport {
+            kind: bp.kind,
+            line: bp.line,
+            outcomes,
+        });
+    }
+    Some((reports, rollup))
+}
+
 /// Why a function couldn't be executed at all — recorded once, instead of as N identical
 /// per-case failures.
 #[derive(Serialize)]
@@ -190,6 +276,13 @@ pub struct FunctionRecord {
     /// nothing to measure — see [`coverage_for`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coverage: Option<Coverage>,
+    /// Per-branch-outcome accounting over `cases` — see [`branch_report_for`]. Omitted when
+    /// there's nothing to measure (no branch points, or no cases), same as `coverage`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branches: Option<Vec<BranchReport>>,
+    /// The rollup over every outcome in `branches`. Present exactly when `branches` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_coverage: Option<BranchCoverage>,
 }
 
 /// Whether a dependency's module resolves in the jail.
@@ -322,6 +415,8 @@ pub fn record_with_signatures_replay(
                 }),
                 cases: Vec::new(),
                 coverage: None,
+                branches: None,
+                branch_coverage: None,
             });
             continue;
         }
@@ -340,11 +435,21 @@ pub fn record_with_signatures_replay(
         } else {
             coverage_for(sig, &cases)
         };
+        let (branches, branch_coverage) = if uncallable.is_some() {
+            (None, None)
+        } else {
+            match branch_report_for(sig, &cases) {
+                Some((b, c)) => (Some(b), Some(c)),
+                None => (None, None),
+            }
+        };
         functions.push(FunctionRecord {
             signature: sig.clone(),
             uncallable,
             cases,
             coverage,
+            branches,
+            branch_coverage,
         });
     }
     Ok(ModuleRecord {
@@ -599,6 +704,7 @@ fn build_case(
             error: Some(err.clone()),
             minimized: None,
             lines: r.lines.clone(),
+            arcs: r.arcs.clone(),
         };
     }
     if r.ok {
@@ -617,6 +723,7 @@ fn build_case(
             error: None,
             minimized: None,
             lines: r.lines.clone(),
+            arcs: r.arcs.clone(),
         }
     } else {
         Case {
@@ -634,6 +741,7 @@ fn build_case(
             error: None,
             minimized: None,
             lines: r.lines.clone(),
+            arcs: r.arcs.clone(),
         }
     }
 }

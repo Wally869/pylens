@@ -275,6 +275,7 @@ mod tests {
             error: None,
             minimized: None,
             lines: Vec::new(),
+            arcs: Vec::new(),
         }
     }
 
@@ -294,6 +295,7 @@ mod tests {
             error: None,
             minimized: None,
             lines: Vec::new(),
+            arcs: Vec::new(),
         }
     }
 
@@ -313,6 +315,7 @@ mod tests {
             error: None,
             minimized: None,
             lines: Vec::new(),
+            arcs: Vec::new(),
         }
     }
 

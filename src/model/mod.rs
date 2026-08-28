@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 pub mod shape;
 pub use shape::{Shape, is_zero, is_false, same_constructor};
 
+/// The internal branch-point model for `record`'s per-branch-outcome accounting.
+pub mod branch;
+pub use branch::{BranchKind, BranchPoint, BranchPointOutcome, OutcomeEvidence};
+
 /// Whether the analyzed definition is a free function or a method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -313,6 +317,11 @@ pub struct EffectSignature {
     /// contract that downstream consumers key off.
     #[serde(skip)]
     pub body_lines: Vec<u32>,
+    /// The enumerated branch points of this function's body (see `analyze::collect::branches`),
+    /// used by `record.rs` to build the per-branch-outcome accounting. An internal input, not
+    /// part of the JSON contract that downstream consumers key off.
+    #[serde(skip)]
+    pub branch_points: Vec<BranchPoint>,
 }
 
 
@@ -393,6 +402,7 @@ impl EffectSignature {
             decorators: Vec::new(),
             type_mismatches: Vec::new(),
             body_lines: Vec::new(),
+            branch_points: Vec::new(),
         }
     }
 }

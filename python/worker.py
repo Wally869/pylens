@@ -91,6 +91,7 @@ def base_response():
         "return_aliases_arg": None,
         "error": None,
         "lines": [],
+        "arcs": [],
     }
 
 
@@ -134,16 +135,33 @@ def _state(obj):
         return None
 
 
-def _make_tracer(executed):
+def _make_tracer(executed, arcs):
     """A `sys.settrace` global trace function that records every line reached in the compiled
     module under test (`co_filename == "<pylens>"`), skipping frames from anywhere else (stdlib,
     the harness itself). Python 3.10 predates `sys.monitoring` (3.12+), so `settrace` is the only
     line-level hook available.
+
+    Also records every `(prev_line, cur_line)` arc within a frame — the transition line coverage
+    can't see (e.g. an else-less `if`'s false path never has its own line, but the arc from the
+    test line straight to whatever follows it does). `prev_line` is tracked per-frame (keyed by
+    `id(frame)`, cleared on `return`) so a call into another function under trace never creates a
+    spurious arc from the caller's line into the callee's.
     """
+    last_line = {}
 
     def local_trace(frame, event, arg):
-        if event == "line" and frame.f_code.co_filename == "<pylens>":
-            executed.add(frame.f_lineno)
+        if frame.f_code.co_filename != "<pylens>":
+            return local_trace
+        if event == "line":
+            cur = frame.f_lineno
+            executed.add(cur)
+            key = id(frame)
+            prev = last_line.get(key)
+            if prev is not None:
+                arcs.add((prev, cur))
+            last_line[key] = cur
+        elif event == "return":
+            last_line.pop(id(frame), None)
         return local_trace
 
     def global_trace(frame, event, arg):
@@ -231,11 +249,12 @@ def run_request(req):
     out_buf = io.StringIO()
     err_buf = io.StringIO()
     executed_lines = set()
+    executed_arcs = set()
     try:
         with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
             # Traced region: the call under test and (if it returns a generator) draining it —
             # not the module load or the receiver construction above.
-            sys.settrace(_make_tracer(executed_lines))
+            sys.settrace(_make_tracer(executed_lines, executed_arcs))
             try:
                 ret = fn(*args, **kwargs)
                 if hasattr(ret, "__next__"):  # drain generators/iterators to realize effects
@@ -268,6 +287,7 @@ def run_request(req):
         resp["exception"] = {"type": type(e).__name__, "message": str(e)}
 
     resp["lines"] = sorted(executed_lines)
+    resp["arcs"] = sorted(executed_arcs)
 
     out_text = out_buf.getvalue()
     if out_text:

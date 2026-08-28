@@ -3,6 +3,7 @@
 
 pub(super) mod aliases;
 pub(super) mod body_lines;
+pub(super) mod branches;
 pub(super) mod exceptions;
 pub(super) mod guards;
 pub(super) mod hints;

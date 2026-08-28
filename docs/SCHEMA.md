@@ -159,6 +159,22 @@ The signature fields, and also:
   without the bodies of the nested definitions and without a bare string-literal statement,
   which CPython never traces. Omitted when the function is `uncallable`, has no cases, or has an
   empty body count.
+- `branches` — the per-branch-outcome accounting: one entry per branch point in the function's
+  body, `{ "kind": <BranchKind>, "line": <int>, "outcomes": [<BranchOutcome>...] }`. `kind` is
+  `"if"` \| `"while"` \| `"for"` \| `"except"` \| `"try_else"` \| `"match"` \| `"ternary"` \|
+  `"bool_op"` \| `"inline_if"` \| `"comprehension_if"`. A `BranchOutcome` is `{ "outcome": <str>,
+  "status": "covered" | "uncovered" | "unobservable_line_granularity" }`. The outcome names are
+  construct-specific (`"true"`/`"false"` for `if`/ternary, `"enter"`/`"skip"` for `while`,
+  `"iterate"`/`"empty"` for `for`, `"entered"` for `except`/`try_else`/`match`,
+  `"short_circuit"`/`"full_evaluation"` for boolops). `unobservable_line_granularity` means
+  line-level tracing cannot distinguish this outcome from its siblings — same-line constructs
+  (ternaries, `and`/`or` short-circuits, single-line `if x: y` bodies, comprehension guards) are
+  always in that state; every other kind is decided from the traced `(prev_line, cur_line)` arcs
+  (or, for `except`/`try_else`/`match`, the traced handler/clause/case line) aggregated over every
+  case. Omitted under the same conditions as `coverage` (no branch points, or no cases).
+- `branch_coverage` — `{ "covered": <int>, "uncovered": <int>, "unobservable": <int> }`, the
+  rollup over every outcome in `branches` — a closed count, always present exactly when `branches`
+  is.
 
 ### Case
 
