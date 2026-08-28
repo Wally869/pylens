@@ -69,11 +69,28 @@ In flight: `--base-inputs` (the seed batch split from the total budget, so
 the module-load probe folded into the first batch. The final speed check
 and the closing numbers land here after that.
 
-## Open work
+## Open work (priority order — user concerns, 2026-08-29)
 
-1. Same-line constructs (`ternary`, boolops, inline `if`) stay `unobservable_line_granularity`;
+1. **Uncovered branches: the synthesizer's scope is the limit.** On the 500-function corpus
+   set, 92% of the outcomes the `--cover-branches` loop leaves uncovered carry
+   `no_synthesizer`: real-world branch predicates (attribute checks, string/collection
+   methods, multi-variable and locals-derived expressions) are outside
+   `generate/predicate.rs`'s single-parameter comparison forms. A small seed batch therefore
+   REGRESSES coverage (76.3% -> 64.5% at `--base-inputs 4`) — the organic diversity of a full
+   seed batch covers those branches incidentally. The fix is to widen the synthesizer
+   (attribute/method predicates, locals derived from one parameter, multi-parameter
+   coordination), not to tune budgets. Measured baseline to beat: 76.3% covered share at
+   plain `--inputs 12`.
+2. **Memory usage of a bench/corpus run: ~10 GB+ observed by the user.** Not yet diagnosed.
+   Suspects to check: the driver holding every record JSON in memory across 500 functions;
+   Rust-side response buffers for large batches; WSL page-cache growth over thousands of
+   forks; the jail's own per-child memory budget (1 GiB default) times concurrent workers.
+   Measure per-component before changing anything.
+3. Same-line constructs (`ternary`, boolops, inline `if`) stay `unobservable_line_granularity`;
    upgrading observation needs finer-than-line tracing.
-2. The full 103k corpus run and the `SCHEMA_VERSION` 1.0 freeze — pending the user's GO.
+4. The full 103k corpus run and the `SCHEMA_VERSION` 1.0 freeze — pending the user's GO.
+5. T8b closing measurement (three budget settings, clean box) — interrupted at session end;
+   `temp/bench/` has the driver, `temp/chunks/` the corpus set.
 
 ## Measurements to repeat after a change
 
