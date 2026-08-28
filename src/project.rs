@@ -13,7 +13,6 @@ use serde_json::Value;
 
 use crate::analyze::{analyze_module_with_call_sites, collect_imports};
 use crate::exec::{NsjailPool, Sandbox};
-use crate::generate::ValueDomain;
 use crate::model::{EffectSignature, Import, Purity};
 use crate::record::{ProjectReplayMap, RecordFlags, ReplayMap, record_with_signatures};
 use crate::validate::{Severity, validate_function};
@@ -428,10 +427,7 @@ fn record_file_entry(
 pub fn record_project(
     root: &Path,
     max_inputs: usize,
-    domain: Option<&ValueDomain>,
-    cover_branches: bool,
-    stability_runs: Option<usize>,
-    time_budget: Option<std::time::Duration>,
+    flags: RecordFlags,
     replay: Option<&ProjectReplayMap>,
 ) -> Result<Value, String> {
     let files = collect_py_files(root);
@@ -451,7 +447,6 @@ pub fn record_project(
     }
 
     let empty_replay = ReplayMap::new();
-    let flags = RecordFlags { domain, cover_branches, stability_runs, time_budget };
     let mut entries = record_files_parallel(enriched, |pool, ef| {
         let file_replay = replay.and_then(|r| r.get(&ef.path)).unwrap_or(&empty_replay);
         record_file_entry(pool, index, ef, max_inputs, flags, file_replay)

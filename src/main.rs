@@ -1,11 +1,29 @@
 //! pylens CLI.
 //!
 //!   pylens analyze  <file.py|dir> [--format json|summary|pyi|html]      static effect signatures
-//!   pylens record   <file.py|dir> [--inputs N] [--replay <cases.json>]
+//!   pylens record   <file.py|dir> [--inputs N] [--base-inputs N] [--replay <cases.json>]
 //!                    [--value-domain <profile.json>] [--cover-branches]
 //!                    [--stability-runs N] [--time-budget <seconds>]
 //!                    [--format json|summary|pyi|html]                  signatures + observed
 //!                                                                       cases (runs the jail).
+//!                                                                       `--base-inputs N`
+//!                                                                       (N <= `--inputs`, else a
+//!                                                                       usage error) sizes only
+//!                                                                       the initial generated
+//!                                                                       batch; `--inputs` stays
+//!                                                                       the ceiling. Without
+//!                                                                       `--cover-branches` this
+//!                                                                       just caps generation —
+//!                                                                       there's no loop to spend
+//!                                                                       the remaining budget on.
+//!                                                                       With `--cover-branches`,
+//!                                                                       shrinking the seed batch
+//!                                                                       leaves more of the total
+//!                                                                       budget for the targeted
+//!                                                                       loop. Absent, the initial
+//!                                                                       batch uses the full
+//!                                                                       `--inputs` budget — the
+//!                                                                       unchanged default.
 //!                                                                       `--replay` additionally
 //!                                                                       executes externally
 //!                                                                       supplied input tuples;
@@ -115,7 +133,8 @@ fn main() {
         _ => {
             eprintln!(
                 "usage:\n  pylens analyze <file.py|dir> [--format json|summary|pyi|html]\n  \
-                 pylens record <file.py|dir> [--inputs <N>] [--replay <cases.json>] \
+                 pylens record <file.py|dir> [--inputs <N>] [--base-inputs <N>] \
+                 [--replay <cases.json>] \
                  [--value-domain <profile.json>] [--cover-branches] [--stability-runs <N>] \
                  [--time-budget <seconds>] [--format json|summary|pyi|html]\n  \
                  pylens validate <file.py|dir> [--inputs <N>] [--format json|summary|html]"
@@ -218,6 +237,17 @@ fn cmd_record(args: &[String]) {
     let inputs: usize = flag(args, "--inputs")
         .and_then(|s| s.parse().ok())
         .unwrap_or(12);
+    let base_inputs: Option<usize> = flag(args, "--base-inputs").map(|s| {
+        let n: usize = s
+            .parse()
+            .unwrap_or_else(|_| fail(&format!("--base-inputs expects an integer, got {s:?}")));
+        if n > inputs {
+            fail(&format!(
+                "--base-inputs ({n}) must be <= --inputs ({inputs})"
+            ));
+        }
+        n
+    });
     let replay_path = flag(args, "--replay");
     let domain_path = flag(args, "--value-domain");
     let domain = domain_path.as_deref().map(|p| {
@@ -256,10 +286,13 @@ fn cmd_record(args: &[String]) {
         match pylens::project::record_project(
             std::path::Path::new(&path),
             inputs,
-            domain.as_ref(),
-            cover_branches,
-            stability_runs,
-            time_budget,
+            pylens::record::RecordFlags {
+                domain: domain.as_ref(),
+                cover_branches,
+                base_inputs,
+                stability_runs,
+                time_budget,
+            },
             replay.as_ref(),
         ) {
             Ok(report) => match format {
@@ -287,6 +320,7 @@ fn cmd_record(args: &[String]) {
         pylens::record::RecordFlags {
             domain: domain.as_ref(),
             cover_branches,
+            base_inputs,
             stability_runs,
             time_budget,
         },
@@ -491,8 +525,15 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 /// follows a value-taking flag, so `analyze --format pyi file.py` and `analyze file.py --format
 /// pyi` both resolve the path correctly.
 fn positional(args: &[String]) -> Option<&String> {
-    const VALUE_FLAGS: [&str; 6] =
-        ["--format", "--inputs", "--replay", "--value-domain", "--stability-runs", "--time-budget"];
+    const VALUE_FLAGS: [&str; 7] = [
+        "--format",
+        "--inputs",
+        "--base-inputs",
+        "--replay",
+        "--value-domain",
+        "--stability-runs",
+        "--time-budget",
+    ];
     let mut skip_next = false;
     for a in args {
         if skip_next {

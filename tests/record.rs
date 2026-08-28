@@ -867,3 +867,105 @@ fn time_budget_never_drops_replay_cases() {
     assert_eq!(replay_case.outcome, "returned");
     assert_eq!(replay_case.ret, Some(json!(7)));
 }
+
+#[test]
+fn base_inputs_absent_matches_max_inputs_bit_for_bit() {
+    if !ready("base_inputs_absent_matches_max_inputs_bit_for_bit") {
+        return;
+    }
+    let src = "def f(a, b, c):\n    return a + b + c\n";
+    let default_rec =
+        record_file(src, 6, &ReplayMap::new(), RecordFlags::default()).expect("record");
+    let explicit_rec = record_file(
+        src,
+        6,
+        &ReplayMap::new(),
+        RecordFlags { base_inputs: Some(6), ..RecordFlags::default() },
+    )
+    .expect("record");
+    assert_eq!(
+        serde_json::to_value(&default_rec.functions).unwrap(),
+        serde_json::to_value(&explicit_rec.functions).unwrap(),
+        "omitting --base-inputs must be bit-for-bit identical to --base-inputs == --inputs"
+    );
+}
+
+#[test]
+fn base_inputs_shrinks_the_initial_batch() {
+    if !ready("base_inputs_shrinks_the_initial_batch") {
+        return;
+    }
+    let src = "def f(a, b, c):\n    return a + b + c\n";
+    let small = record_file(
+        src,
+        12,
+        &ReplayMap::new(),
+        RecordFlags { base_inputs: Some(1), ..RecordFlags::default() },
+    )
+    .expect("record");
+    let full = record_file(src, 12, &ReplayMap::new(), RecordFlags::default()).expect("record");
+
+    let small_f = small.functions.iter().find(|r| r.signature.name == "f").expect("f record");
+    let full_f = full.functions.iter().find(|r| r.signature.name == "f").expect("f record");
+    assert_eq!(small_f.cases.len(), 1, "a base-inputs of 1 must generate exactly one seed case");
+    assert!(
+        full_f.cases.len() > small_f.cases.len(),
+        "the full budget must generate more cases than a base-inputs of 1: {} vs {}",
+        full_f.cases.len(),
+        small_f.cases.len()
+    );
+}
+
+#[test]
+fn base_inputs_greater_than_inputs_is_a_usage_error() {
+    if !ready("base_inputs_greater_than_inputs_is_a_usage_error") {
+        return;
+    }
+    let src = "def f(a):\n    return a\n";
+    let result = record_file(
+        src,
+        4,
+        &ReplayMap::new(),
+        RecordFlags { base_inputs: Some(5), ..RecordFlags::default() },
+    );
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("--base-inputs > --inputs must be rejected"),
+    };
+    assert!(
+        err.contains("--base-inputs") && err.contains("--inputs"),
+        "error should name both flags: {err:?}"
+    );
+}
+
+#[test]
+fn unloadable_module_is_detected_from_the_first_batch_for_every_function() {
+    if !ready("unloadable_module_is_detected_from_the_first_batch_for_every_function") {
+        return;
+    }
+    // No standalone `probe_load` runs here (the first signature `f` is a plain function with a
+    // non-empty generated batch) — the module-not-loadable verdict must still come out
+    // byte-identical to the standalone-probe path, and cover every function in the file, not
+    // just the one whose batch surfaced the failure.
+    let src = concat!(
+        "import definitely_not_a_real_module_xyz as z\n",
+        "def f(x):\n",
+        "    return z.go(x)\n",
+        "\n",
+        "def g(y):\n",
+        "    return z.go(y)\n",
+    );
+    let rec = record_file(src, 3, &ReplayMap::new(), RecordFlags::default()).expect("record");
+    for name in ["f", "g"] {
+        let func = rec.functions.iter().find(|r| r.signature.name == name).expect("record");
+        let unc = func.uncallable.as_ref().unwrap_or_else(|| panic!("{name} should be uncallable"));
+        assert_eq!(unc.reason, "module_not_loadable");
+        assert_eq!(unc.error.kind, "ModuleNotFoundError");
+        assert_eq!(unc.error.module.as_deref(), Some("definitely_not_a_real_module_xyz"));
+        assert!(func.cases.is_empty(), "no per-case spam when the module can't load: {name}");
+        assert!(func.coverage.is_none());
+        assert!(func.branches.is_none());
+        assert!(func.branch_coverage.is_none());
+        assert!(func.output_type_coverage.is_none());
+    }
+}

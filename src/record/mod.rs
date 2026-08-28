@@ -49,6 +49,14 @@ const EMPTY_KWARGS: &[(String, Value)] = &[];
 pub struct RecordFlags<'a> {
     pub domain: Option<&'a ValueDomain>,
     pub cover_branches: bool,
+    /// `--base-inputs <N>`: the size of the initial generated batch, independent of the total
+    /// per-function budget. `None` (the default) means the initial batch uses the full
+    /// `max_inputs` budget — today's behavior, bit-for-bit. Without `--cover-branches` this
+    /// simply caps how many cases are generated (there is no loop to spend the rest of the
+    /// budget on). With `--cover-branches`, `--inputs` stays the TOTAL per-function budget and
+    /// this only shrinks the seed batch that runs before the targeted loop. The caller must
+    /// ensure `base_inputs <= max_inputs` — checked in [`record_with_signatures`].
+    pub base_inputs: Option<usize>,
     /// `--stability-runs <N>`: re-execute every case (generated, cover-loop, and replayed alike)
     /// until it has run `N` times total, dropping any case whose runs disagree — see
     /// [`stabilize_cases`]. `None` (the default) leaves `record`'s output unchanged, including
@@ -64,13 +72,16 @@ pub struct RecordFlags<'a> {
 
 /// Generation settings threaded through the recording of one function or method: the
 /// `--inputs` budget (interpreted as the TOTAL per-function case budget once `cover_branches` is
-/// set — see `cover::run_loop`), the `--value-domain` profile to enforce (if any), whether
+/// set — see `cover::run_loop`), the size of the initial generated batch (`--base-inputs`, see
+/// [`RecordFlags::base_inputs`]), the `--value-domain` profile to enforce (if any), whether
 /// `--cover-branches` opted into the predicate-targeted coverage loop, and the per-function
 /// `--time-budget` deadline (if any). Bundled to keep `function_cases`/`method_record`'s
 /// argument counts down.
 #[derive(Clone, Copy)]
 pub(super) struct GenOptions<'a> {
     pub(super) max_inputs: usize,
+    /// The initial generated batch's size — `<= max_inputs`, see [`RecordFlags::base_inputs`].
+    pub(super) base_inputs: usize,
     pub(super) domain: Option<&'a ValueDomain>,
     pub(super) cover_branches: bool,
     /// Once `std::time::Instant::now() >= deadline`, generation loops stop starting new
@@ -188,10 +199,18 @@ pub fn record_with_signatures(
     replay: &ReplayMap,
     flags: RecordFlags,
 ) -> Result<ModuleRecord, String> {
-    let RecordFlags { domain, cover_branches, stability_runs, time_budget } = flags;
+    let RecordFlags { domain, cover_branches, base_inputs, stability_runs, time_budget } = flags;
     if let Some(runs) = stability_runs {
         assert!(runs >= 2, "stability_runs must be >= 2 (checked by the CLI)");
     }
+    if let Some(base) = base_inputs
+        && base > max_inputs
+    {
+        return Err(format!(
+            "--base-inputs ({base}) must be <= --inputs ({max_inputs})"
+        ));
+    }
+    let base_inputs = base_inputs.unwrap_or(max_inputs);
     for name in replay.keys() {
         if !sigs.iter().any(|s| &s.name == name) {
             return Err(format!("replay: no function named {name:?} in this module"));
@@ -199,43 +218,49 @@ pub fn record_with_signatures(
     }
     let dependencies = probe_dependencies(sandbox, imports)?;
 
-    // Ground truth for "can anything in this file run": exec the real source once. This
-    // respects guards (e.g. `try: import numpy except ImportError: ...`) that per-import
-    // probing can't see, and yields the exact blocking module via the structured error.
-    let load = sandbox.probe_load(src, None, None)?;
-    let module_error: Option<HarnessError> = if load.ok { None } else { load.error };
+    // Whether the first non-`__init__` signature is a plain function whose initial generated
+    // batch is non-empty: if so, that batch's execution already execs the module, so a separate
+    // load probe is redundant — see `function_cases`'s `probe_module_load` and the module doc.
+    // Restricted to the very first signature (rather than "any function anywhere") so a module
+    // load failure is always detected before any other function's case set — including a
+    // method's constructor probe, which stays untouched — has run.
+    let fold_probe_idx = sigs.iter().position(|s| s.name != "__init__").filter(|&i| {
+        sigs[i].kind == DefKind::Function && !gen_inputs(&sigs[i], base_inputs, domain).is_empty()
+    });
+
+    let mut module_error: Option<HarnessError> = if fold_probe_idx.is_some() {
+        None
+    } else {
+        // Ground truth for "can anything in this file run": exec the real source once. This
+        // respects guards (e.g. `try: import numpy except ImportError: ...`) that per-import
+        // probing can't see, and yields the exact blocking module via the structured error.
+        let load = sandbox.probe_load(src, None, None)?;
+        if load.ok { None } else { load.error }
+    };
 
     let mut functions = Vec::new();
     let mut ctor_cache: HashMap<String, Option<HarnessError>> = HashMap::new();
-    for sig in &sigs {
+    for (i, sig) in sigs.iter().enumerate() {
         if sig.name == "__init__" {
             continue; // the constructor is plumbing; it runs as part of every method case
         }
         if let Some(err) = &module_error {
-            functions.push(FunctionRecord {
-                io_observability: io_observability(&sig.io),
-                signature: sig.clone(),
-                uncallable: Some(Uncallable {
-                    reason: "module_not_loadable".to_string(),
-                    error: err.clone(),
-                }),
-                cases: Vec::new(),
-                coverage: None,
-                branches: None,
-                branch_coverage: None,
-                dropped_cases: stability_runs.map(|_| DroppedCases::default()),
-                output_type_coverage: None,
-                unobserved_returns: None,
-                time_budget_hit: None,
-            });
+            functions.push(uncallable_module_record(sig, err, stability_runs));
             continue;
         }
         let replay_inputs: &[Vec<Value>] = replay.get(&sig.name).map(Vec::as_slice).unwrap_or(&[]);
         let deadline = time_budget.map(|d| std::time::Instant::now() + d);
-        let opts = GenOptions { max_inputs, domain, cover_branches, deadline };
+        let opts = GenOptions { max_inputs, base_inputs, domain, cover_branches, deadline };
         let (uncallable, mut cases, cover_ctx) = match sig.kind {
             DefKind::Function => {
-                let (cases, ctx) = function_cases(sandbox, src, sig, opts, replay_inputs)?;
+                let probe_module_load = fold_probe_idx == Some(i);
+                let (probe_err, cases, ctx) =
+                    function_cases(sandbox, src, sig, opts, replay_inputs, probe_module_load)?;
+                if let Some(err) = probe_err {
+                    functions.push(uncallable_module_record(sig, &err, stability_runs));
+                    module_error = Some(err);
+                    continue;
+                }
                 (None, cases, ctx)
             }
             DefKind::Method => {
@@ -294,6 +319,33 @@ pub fn record_with_signatures(
     })
 }
 
+/// The `FunctionRecord` for a function whose module doesn't load — whether learned from the
+/// standalone `probe_load` or derived from a uniform setup failure across the first generated
+/// batch (see `function_cases`'s `probe_module_load`). Both paths must produce byte-identical
+/// output, so both go through this one place.
+fn uncallable_module_record(
+    sig: &EffectSignature,
+    err: &HarnessError,
+    stability_runs: Option<usize>,
+) -> FunctionRecord {
+    FunctionRecord {
+        io_observability: io_observability(&sig.io),
+        signature: sig.clone(),
+        uncallable: Some(Uncallable {
+            reason: "module_not_loadable".to_string(),
+            error: err.clone(),
+        }),
+        cases: Vec::new(),
+        coverage: None,
+        branches: None,
+        branch_coverage: None,
+        dropped_cases: stability_runs.map(|_| DroppedCases::default()),
+        output_type_coverage: None,
+        unobserved_returns: None,
+        time_budget_hit: None,
+    }
+}
+
 /// For each import, decide whether its module resolves — probing each distinct absolute module
 /// once in the jail. Relative imports can't be resolved standalone and are left `NotProbed`.
 fn probe_dependencies(
@@ -348,15 +400,24 @@ pub(super) fn deadline_passed(deadline: Option<std::time::Instant>) -> bool {
     deadline.is_some_and(|dl| std::time::Instant::now() >= dl)
 }
 
+/// Generate and run the initial batch for a free function, then the `--cover-branches` loop.
+/// `probe_module_load`, when set, checks the *first* dispatched batch for a uniform `stage ==
+/// "setup"` failure across every item — the signature the module-load probe itself would produce
+/// (see [`record_with_signatures`]'s `fold_probe_idx`). When detected, returns
+/// `(Some(error), vec![], CoverContext::not_run())` without recording those setup-error items as
+/// cases and without running the rest of the batches, replay inputs, or the coverage loop —
+/// mirroring what the standalone probe would have short-circuited.
 fn function_cases(
     sandbox: &dyn Sandbox,
     src: &str,
     sig: &EffectSignature,
     opts: GenOptions,
     replay_inputs: &[Vec<Value>],
-) -> Result<(Vec<Case>, cover::CoverContext), String> {
+    probe_module_load: bool,
+) -> Result<(Option<HarnessError>, Vec<Case>, cover::CoverContext), String> {
     let mut cases = Vec::new();
-    let inputs = gen_inputs(sig, opts.max_inputs, opts.domain);
+    let inputs = gen_inputs(sig, opts.base_inputs, opts.domain);
+    let mut first_chunk = true;
     for chunk in inputs.chunks(BATCH_SIZE) {
         if deadline_passed(opts.deadline) {
             break;
@@ -366,6 +427,12 @@ fn function_cases(
             .map(|input| (input.positional.as_slice(), input.kwargs.as_slice()))
             .collect();
         let results = sandbox.call_batch(src, &sig.name, &call_inputs, None, None)?;
+        if probe_module_load && first_chunk
+            && let Some(err) = uniform_setup_failure(&results)
+        {
+            return Ok((Some(err), Vec::new(), cover::CoverContext::not_run()));
+        }
+        first_chunk = false;
         for (input, result) in chunk.iter().zip(&results) {
             let mut case = build_case(sig, input, None, result, CaseSource::Generated);
             if case.outcome == "raised" {
@@ -391,7 +458,28 @@ fn function_cases(
         }
     }
     let ctx = cover::run_loop(sandbox, src, sig, cover::CallTarget::Function, opts, &mut cases)?;
-    Ok((cases, ctx))
+    Ok((None, cases, ctx))
+}
+
+/// Whether every item of `results` failed with the identical `stage == "setup"` [`HarnessError`]
+/// — the signature of a module that didn't load, surfacing on every item of a batch rather than
+/// as a single up-front probe. `None` for an empty batch, any item that succeeded, any non-setup
+/// failure, or any two setup failures that differ.
+fn uniform_setup_failure(results: &[CallResult]) -> Option<HarnessError> {
+    let (first, rest) = results.split_first()?;
+    if first.ok {
+        return None;
+    }
+    let first_err = first.error.as_ref()?;
+    if first_err.stage != "setup" {
+        return None;
+    }
+    for r in rest {
+        if r.ok || r.error.as_ref() != Some(first_err) {
+            return None;
+        }
+    }
+    Some(first_err.clone())
 }
 
 /// Shrink a `raised` case's input, re-executing via `call` (the same call shape — free function
@@ -448,7 +536,7 @@ fn method_record(
     }
 
     let mut cases = Vec::new();
-    let inputs = gen_inputs(sig, opts.max_inputs, opts.domain);
+    let inputs = gen_inputs(sig, opts.base_inputs, opts.domain);
     for chunk in inputs.chunks(BATCH_SIZE) {
         if deadline_passed(opts.deadline) {
             break;

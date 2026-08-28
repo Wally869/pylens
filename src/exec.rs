@@ -92,7 +92,7 @@ pub struct Exc {
 /// (`kind = "MemoryError"`), recursion depth (`kind = "RecursionError"`), or wall time
 /// (`kind = "timeout"`). This is strictly distinct from a semantic Python raise — see
 /// [`HarnessError::is_resource`] and `Case::outcome` in `record.rs`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct HarnessError {
     pub stage: String,
     pub kind: String,

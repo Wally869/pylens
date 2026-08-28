@@ -6,7 +6,7 @@ use std::path::Path;
 
 use pylens::exec::probe;
 use pylens::project::{analyze_project, record_project, validate_project};
-use pylens::record::{ProjectReplayMap, ReplayMap};
+use pylens::record::{ProjectReplayMap, RecordFlags, ReplayMap};
 use serde_json::json;
 
 fn ready(test: &str) -> bool {
@@ -264,7 +264,7 @@ fn record_project_parallelizes_across_files_with_stable_output_order() {
     if !ready("record_project_parallelizes_across_files_with_stable_output_order") {
         return;
     }
-    let report = record_project(Path::new("tests/fixtures/project"), 4, None, false, None, None, None)
+    let report = record_project(Path::new("tests/fixtures/project"), 4, RecordFlags::default(), None)
         .expect("record_project");
 
     let files = report["files"].as_array().expect("files array");
@@ -325,7 +325,7 @@ fn record_project_replay_unmatched_path_is_an_error() {
     let mut replay = ProjectReplayMap::new();
     replay.insert("does_not_exist.py".to_string(), ReplayMap::new());
 
-    let err = record_project(Path::new("tests/fixtures/project"), 4, None, false, None, None, Some(&replay))
+    let err = record_project(Path::new("tests/fixtures/project"), 4, RecordFlags::default(), Some(&replay))
         .expect_err("a replay path matching no analyzed file must be an error");
     assert!(err.contains("does_not_exist.py"), "unexpected message: {err}");
 }
@@ -343,7 +343,7 @@ fn record_project_replay_executes_each_files_own_cases() {
     b_replay.insert("mutate".to_string(), vec![vec![json!([1, 2])]]);
     replay.insert("b.py".to_string(), b_replay);
 
-    let report = record_project(Path::new("tests/fixtures/project"), 4, None, false, None, None, Some(&replay))
+    let report = record_project(Path::new("tests/fixtures/project"), 4, RecordFlags::default(), Some(&replay))
         .expect("record_project");
     let files = report["files"].as_array().expect("files array");
 
