@@ -306,6 +306,8 @@ fn cmd_validate(args: &[String]) {
         })
         .collect();
 
+    let is_validated = |f: &pylens::record::FunctionRecord| f.uncallable.is_none() && !f.cases.is_empty();
+
     if format == Format::Summary {
         let results: Vec<FunctionValidation> = per_function
             .iter()
@@ -316,13 +318,13 @@ fn cmd_validate(args: &[String]) {
                 coverage: f.coverage.as_ref(),
             })
             .collect();
-        let uncallable = record.functions.iter().filter(|f| f.uncallable.is_some()).count();
+        let unvalidated = record.functions.iter().filter(|f| !is_validated(f)).count();
         print!(
             "{}",
             report::validate_summary(
                 &path,
                 record.functions.len(),
-                uncallable,
+                unvalidated,
                 hard_total,
                 soft_total,
                 &results
@@ -344,6 +346,8 @@ fn cmd_validate(args: &[String]) {
                     "soft_defects": soft,
                     "defects": defects,
                     "coverage": f.coverage,
+                    "validated": is_validated(f),
+                    "io_observability": f.io_observability,
                 })
             })
             .collect();
@@ -352,10 +356,12 @@ fn cmd_validate(args: &[String]) {
             (0usize, 0usize),
             |(e, t), c| (e + c.executed, t + c.total),
         );
+        let unvalidated = record.functions.iter().filter(|f| !is_validated(f)).count();
         let mut summary = serde_json::json!({
             "hard_defects": hard_total,
             "soft_defects": soft_total,
             "functions_checked": record.functions.len(),
+            "unvalidated": unvalidated,
         });
         if cov_total > 0 {
             summary["coverage"] = serde_json::json!({ "executed": cov_executed, "total": cov_total });

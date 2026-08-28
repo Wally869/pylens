@@ -76,6 +76,9 @@ struct FileEntry {
     /// Functions that never executed (`uncallable`: module didn't load, constructor failed) —
     /// validate observed nothing for them, so their zero defects must not read as "validated".
     uncallable: usize,
+    /// Functions `validate` observed nothing for at all: uncallable, or callable but left with
+    /// zero cases — the honest superset of `uncallable` (see `FunctionRecord::validated`).
+    unvalidated: usize,
     /// Sum of `coverage.executed` over this file's functions that carry a `coverage` (see
     /// `record::Coverage`) — the numerator half of the project-wide aggregate.
     coverage_executed: usize,
@@ -93,6 +96,7 @@ fn error_entry(path: String, message: String) -> FileEntry {
         soft_defects: 0,
         functions_checked: 0,
         uncallable: 0,
+        unvalidated: 0,
         coverage_executed: 0,
         coverage_total: 0,
         ok: false,
@@ -111,6 +115,7 @@ fn build_report(root: &Path, mut entries: Vec<FileEntry>, include_defects: bool)
     let mut soft_total = 0usize;
     let mut checked_total = 0usize;
     let mut uncallable_total = 0usize;
+    let mut unvalidated_total = 0usize;
     let mut coverage_executed_total = 0usize;
     let mut coverage_total_total = 0usize;
     for e in &entries {
@@ -126,6 +131,7 @@ fn build_report(root: &Path, mut entries: Vec<FileEntry>, include_defects: bool)
         soft_total += e.soft_defects;
         checked_total += e.functions_checked;
         uncallable_total += e.uncallable;
+        unvalidated_total += e.unvalidated;
         coverage_executed_total += e.coverage_executed;
         coverage_total_total += e.coverage_total;
     }
@@ -142,6 +148,7 @@ fn build_report(root: &Path, mut entries: Vec<FileEntry>, include_defects: bool)
         summary["soft_defects"] = serde_json::json!(soft_total);
         summary["functions_checked"] = serde_json::json!(checked_total);
         summary["uncallable"] = serde_json::json!(uncallable_total);
+        summary["unvalidated"] = serde_json::json!(unvalidated_total);
     }
     if coverage_total_total > 0 {
         summary["coverage"] = serde_json::json!({
@@ -342,6 +349,7 @@ fn build_analyze_entry(ef: EnrichedFile, index: &ModuleIndex) -> FileEntry {
         soft_defects: 0,
         functions_checked: 0,
         uncallable: 0,
+        unvalidated: 0,
         coverage_executed: 0,
         coverage_total: 0,
         ok: true,
@@ -399,6 +407,7 @@ fn record_file_entry(
                 soft_defects: 0,
                 functions_checked: 0,
                 uncallable: 0,
+                unvalidated: 0,
                 coverage_executed,
                 coverage_total,
                 ok: true,
@@ -441,6 +450,7 @@ fn validate_file_entry(sandbox: &dyn Sandbox, ef: EnrichedFile, max_inputs: usiz
     let mut soft_total = 0usize;
     let mut coverage_executed = 0usize;
     let mut coverage_total = 0usize;
+    let mut unvalidated = 0usize;
     let functions_json: Vec<Value> = record
         .functions
         .iter()
@@ -454,6 +464,10 @@ fn validate_file_entry(sandbox: &dyn Sandbox, ef: EnrichedFile, max_inputs: usiz
                 coverage_executed += cov.executed;
                 coverage_total += cov.total;
             }
+            let validated = f.uncallable.is_none() && !f.cases.is_empty();
+            if !validated {
+                unvalidated += 1;
+            }
             serde_json::json!({
                 "name": f.signature.name,
                 "owner": f.signature.owner,
@@ -461,6 +475,8 @@ fn validate_file_entry(sandbox: &dyn Sandbox, ef: EnrichedFile, max_inputs: usiz
                 "soft_defects": soft,
                 "defects": defects,
                 "coverage": f.coverage,
+                "validated": validated,
+                "io_observability": f.io_observability,
             })
         })
         .collect();
@@ -472,6 +488,7 @@ fn validate_file_entry(sandbox: &dyn Sandbox, ef: EnrichedFile, max_inputs: usiz
         "soft_defects": soft_total,
         "functions_checked": functions_checked,
         "uncallable": uncallable,
+        "unvalidated": unvalidated,
     });
     if coverage_total > 0 {
         summary["coverage"] = serde_json::json!({ "executed": coverage_executed, "total": coverage_total });
@@ -489,6 +506,7 @@ fn validate_file_entry(sandbox: &dyn Sandbox, ef: EnrichedFile, max_inputs: usiz
         soft_defects: soft_total,
         functions_checked,
         uncallable,
+        unvalidated,
         coverage_executed,
         coverage_total,
         ok: true,

@@ -322,6 +322,11 @@ pub struct EffectSignature {
     /// part of the JSON contract that downstream consumers key off.
     #[serde(skip)]
     pub branch_points: Vec<BranchPoint>,
+    /// The 1-based line numbers of every explicit `return` statement in this function's body
+    /// (see `analyze::collect::returns::collect_return_lines`), used by `record.rs` to compute
+    /// `FunctionRecord::output_type_coverage`. An internal input, not part of the JSON contract.
+    #[serde(skip)]
+    pub return_lines: Vec<u32>,
 }
 
 
@@ -403,6 +408,7 @@ impl EffectSignature {
             type_mismatches: Vec::new(),
             body_lines: Vec::new(),
             branch_points: Vec::new(),
+            return_lines: Vec::new(),
         }
     }
 }

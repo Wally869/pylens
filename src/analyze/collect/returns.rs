@@ -3,6 +3,8 @@
 //! `None` return).
 
 use ruff_python_ast as ast;
+use ruff_source_file::LineIndex;
+use ruff_text_size::Ranged;
 
 use crate::model::ReturnKind;
 
@@ -44,6 +46,63 @@ pub(in crate::analyze) fn classify_return(expr: &ast::Expr) -> ReturnKind {
             _ => ReturnKind::Opaque,
         },
         _ => ReturnKind::Opaque,
+    }
+}
+
+/// The sorted, deduplicated 1-based line numbers of every explicit `return` statement in `body`
+/// (nested statements included, nested `def`/`class` bodies excluded — same traversal shape as
+/// [`crate::analyze::collect::body_lines::collect_body_lines`]). Used by `record.rs` to know
+/// whether generated cases ever executed each return exit, for `FunctionRecord::
+/// output_type_coverage`. A fall-through implicit `None` return has no statement and so no line
+/// here.
+pub(in crate::analyze) fn collect_return_lines(body: &[ast::Stmt], line_index: &LineIndex) -> Vec<u32> {
+    let mut lines = Vec::new();
+    walk_returns(body, line_index, &mut lines);
+    lines.sort_unstable();
+    lines.dedup();
+    lines
+}
+
+fn walk_returns(body: &[ast::Stmt], line_index: &LineIndex, out: &mut Vec<u32>) {
+    for stmt in body {
+        if let ast::Stmt::Return(_) = stmt {
+            out.push(line_index.line_index(stmt.range().start()).get() as u32);
+        }
+        match stmt {
+            ast::Stmt::FunctionDef(_) | ast::Stmt::ClassDef(_) => {}
+            ast::Stmt::If(if_stmt) => {
+                walk_returns(&if_stmt.body, line_index, out);
+                for clause in &if_stmt.elif_else_clauses {
+                    walk_returns(&clause.body, line_index, out);
+                }
+            }
+            ast::Stmt::For(for_stmt) => {
+                walk_returns(&for_stmt.body, line_index, out);
+                walk_returns(&for_stmt.orelse, line_index, out);
+            }
+            ast::Stmt::While(while_stmt) => {
+                walk_returns(&while_stmt.body, line_index, out);
+                walk_returns(&while_stmt.orelse, line_index, out);
+            }
+            ast::Stmt::With(with_stmt) => {
+                walk_returns(&with_stmt.body, line_index, out);
+            }
+            ast::Stmt::Try(try_stmt) => {
+                walk_returns(&try_stmt.body, line_index, out);
+                for handler in &try_stmt.handlers {
+                    let ast::ExceptHandler::ExceptHandler(h) = handler;
+                    walk_returns(&h.body, line_index, out);
+                }
+                walk_returns(&try_stmt.orelse, line_index, out);
+                walk_returns(&try_stmt.finalbody, line_index, out);
+            }
+            ast::Stmt::Match(match_stmt) => {
+                for case in &match_stmt.cases {
+                    walk_returns(&case.body, line_index, out);
+                }
+            }
+            _ => {}
+        }
     }
 }
 

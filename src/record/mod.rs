@@ -10,8 +10,9 @@ use serde_json::{Map, Value};
 
 use crate::exec::{CallResult, HarnessError, NsjailPool, Sandbox};
 use crate::generate::{GenInput, ValueDomain, gen_inputs, keyword_only_params, positional_params};
-use crate::model::{DefKind, EffectSignature, Import};
+use crate::model::{DefKind, EffectSignature, Import, ReturnKind};
 use crate::shrink::shrink_case;
+use crate::validate::observable_io_kind;
 use crate::{analyze_source, imports_of};
 
 mod cover;
@@ -203,6 +204,25 @@ fn coverage_for(sig: &EffectSignature, cases: &[Case]) -> Option<Coverage> {
     })
 }
 
+/// One `io` may-set entry (see [`EffectSignature::io`]) tagged with whether the sandbox has any
+/// channel to observe it — see [`crate::validate::observable_io_kind`]. `record`'s and
+/// `validate`'s honesty flag: a consumer must not read an unobservable `io` claim's absence from
+/// `validate`'s defects as corroboration, since no execution could ever have disproved it.
+#[derive(Serialize)]
+pub struct IoObservability {
+    pub kind: String,
+    pub observable: bool,
+}
+
+fn io_observability(io: &[String]) -> Vec<IoObservability> {
+    io.iter()
+        .map(|kind| IoObservability {
+            kind: kind.clone(),
+            observable: observable_io_kind(kind),
+        })
+        .collect()
+}
+
 /// Why a function couldn't be executed at all — recorded once, instead of as N identical
 /// per-case failures.
 #[derive(Serialize)]
@@ -237,6 +257,84 @@ pub struct FunctionRecord {
     /// entirely when `--stability-runs` wasn't passed, so plain `record` output is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dropped_cases: Option<DroppedCases>,
+    /// Per-`io`-entry observability — see [`IoObservability`]. Parallel to, and never a
+    /// replacement for, the flattened `io: Vec<String>` may-set carried by `signature`.
+    pub io_observability: Vec<IoObservability>,
+    /// Whether every return kind in `signature.returns` was observed in some surviving case's
+    /// return value AND every `return` statement's line was executed by some surviving case —
+    /// see [`output_type_coverage_for`]. `None` when nothing was observed at all (uncallable, or
+    /// zero cases): `validated: false` in `validate` output already carries that story, and
+    /// there is nothing here to be full or partial about.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_type_coverage: Option<OutputTypeCoverage>,
+    /// Present exactly when `output_type_coverage == Some(Partial)`: the static return kinds no
+    /// surviving case's return value matched, and/or the `return` statement lines no surviving
+    /// case ever executed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unobserved_returns: Option<UnobservedReturns>,
+}
+
+/// `"full"` when [`output_type_coverage_for`]'s two conditions both hold; `"partial"` otherwise,
+/// with the gap detailed in [`UnobservedReturns`].
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputTypeCoverage {
+    Full,
+    Partial,
+}
+
+/// What kept `output_type_coverage` from being `full` — see [`output_type_coverage_for`].
+#[derive(Serialize)]
+pub struct UnobservedReturns {
+    /// Static return kinds (from `signature.returns`) no surviving case's return value matched.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<ReturnKind>,
+    /// `return` statement lines (from the function's body) no surviving case executed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<u32>,
+}
+
+/// Whether `cases` observed every static return kind and executed every `return` statement's
+/// line, for one function. `None` when there's nothing to measure: no cases at all. Reuses
+/// [`crate::validate::classify_return`] for the observed-return classification so `record` and
+/// `validate` never disagree on what an observed return value's kind is.
+fn output_type_coverage_for(
+    sig: &EffectSignature,
+    cases: &[Case],
+) -> Option<(OutputTypeCoverage, Option<UnobservedReturns>)> {
+    if cases.is_empty() {
+        return None;
+    }
+    let observed_kinds: HashSet<ReturnKind> = cases
+        .iter()
+        .filter(|c| c.outcome == "returned")
+        .filter_map(|c| c.ret.as_ref())
+        .map(crate::validate::classify_return)
+        .collect();
+    let mut missing_kinds = Vec::new();
+    for kind in &sig.returns {
+        if !observed_kinds.contains(kind) && !missing_kinds.contains(kind) {
+            missing_kinds.push(*kind);
+        }
+    }
+
+    let reached_lines: HashSet<u32> = cases.iter().flat_map(|c| c.lines.iter().copied()).collect();
+    let mut missing_lines: Vec<u32> = sig
+        .return_lines
+        .iter()
+        .copied()
+        .filter(|l| !reached_lines.contains(l))
+        .collect();
+    missing_lines.sort_unstable();
+
+    if missing_kinds.is_empty() && missing_lines.is_empty() {
+        Some((OutputTypeCoverage::Full, None))
+    } else {
+        Some((
+            OutputTypeCoverage::Partial,
+            Some(UnobservedReturns { kinds: missing_kinds, lines: missing_lines }),
+        ))
+    }
 }
 
 /// Whether a dependency's module resolves in the jail.
@@ -446,6 +544,7 @@ pub fn record_with_signatures_replay(
         }
         if let Some(err) = &module_error {
             functions.push(FunctionRecord {
+                io_observability: io_observability(&sig.io),
                 signature: sig.clone(),
                 uncallable: Some(Uncallable {
                     reason: "module_not_loadable".to_string(),
@@ -456,6 +555,8 @@ pub fn record_with_signatures_replay(
                 branches: None,
                 branch_coverage: None,
                 dropped_cases: stability_runs.map(|_| DroppedCases::default()),
+                output_type_coverage: None,
+                unobserved_returns: None,
             });
             continue;
         }
@@ -493,7 +594,16 @@ pub fn record_with_signatures_replay(
                 None => (None, None),
             }
         };
+        let (output_type_coverage, unobserved_returns) = if uncallable.is_some() {
+            (None, None)
+        } else {
+            match output_type_coverage_for(sig, &cases) {
+                Some((otc, unobserved)) => (Some(otc), unobserved),
+                None => (None, None),
+            }
+        };
         functions.push(FunctionRecord {
+            io_observability: io_observability(&sig.io),
             signature: sig.clone(),
             uncallable,
             cases,
@@ -501,6 +611,8 @@ pub fn record_with_signatures_replay(
             branches,
             branch_coverage,
             dropped_cases,
+            output_type_coverage,
+            unobserved_returns,
         });
     }
     Ok(ModuleRecord {

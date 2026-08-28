@@ -169,13 +169,14 @@ pub struct FunctionValidation<'a> {
 }
 
 /// Render the `validate` result: per function with any defects, hard/soft counts and one line
-/// per defect, then the overall summary with the hard-defect total made prominent. Uncallable
-/// functions (module didn't load, constructor failed) produced no observations at all — their
-/// "0 defects" is vacuous, so the count is surfaced rather than letting them pass silently.
+/// per defect, then the overall summary with the hard-defect total made prominent. A function
+/// that never executed — uncallable, or callable but left with zero cases — produced no
+/// observations at all — their "0 defects" is vacuous, so `unvalidated` is surfaced rather than
+/// letting them pass silently (see `FunctionRecord::validated`, computed by the caller).
 pub fn validate_summary(
     file: &str,
     functions_checked: usize,
-    uncallable: usize,
+    unvalidated: usize,
     hard_total: usize,
     soft_total: usize,
     results: &[FunctionValidation],
@@ -184,9 +185,9 @@ pub fn validate_summary(
         "{file}: HARD DEFECTS: {hard_total} — {functions_checked} function(s) checked, \
          {soft_total} soft defect(s)\n"
     );
-    if uncallable > 0 {
+    if unvalidated > 0 {
         out.push_str(&format!(
-            "  WARNING: {uncallable} function(s) uncallable — never executed, nothing validated\n"
+            "  WARNING: {unvalidated} function(s) unvalidated — never executed, nothing validated\n"
         ));
     }
     if let Some((executed, total)) = aggregate_coverage(results.iter().filter_map(|r| r.coverage)) {
@@ -244,10 +245,10 @@ pub fn project_summary(report: &Value) -> String {
         out.push_str(&format!(
             "  HARD DEFECTS: {hard} — {checked} function(s) checked, {soft} soft defect(s)\n"
         ));
-        let uncallable = summary["uncallable"].as_u64().unwrap_or(0);
-        if uncallable > 0 {
+        let unvalidated = summary["unvalidated"].as_u64().unwrap_or(0);
+        if unvalidated > 0 {
             out.push_str(&format!(
-                "  WARNING: {uncallable} function(s) uncallable — never executed, nothing validated\n"
+                "  WARNING: {unvalidated} function(s) unvalidated — never executed, nothing validated\n"
             ));
         }
     }

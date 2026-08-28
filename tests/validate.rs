@@ -5,6 +5,7 @@
 
 use pylens::exec::probe;
 use pylens::record::record_file;
+use pylens::report::{FunctionValidation, validate_summary};
 use pylens::validate::{Severity, validate_function};
 
 fn ready(test: &str) -> bool {
@@ -47,6 +48,46 @@ fn example_corpus_has_zero_hard_defects() {
             );
         }
     }
+}
+
+#[test]
+fn uncallable_function_is_reported_unvalidated_in_the_summary() {
+    if !ready("uncallable_function_is_reported_unvalidated_in_the_summary") {
+        return;
+    }
+    // A module-scope import that can't load stops the whole file from loading, so every function
+    // is `uncallable` — validate observed nothing for it, and that must be surfaced, not read as
+    // a silent pass.
+    let src = "import definitely_not_a_real_module_xyz as z\ndef f(x):\n    return z.go(x)\n";
+    let rec = record_file(src, 3).expect("record");
+    let f = rec
+        .functions
+        .iter()
+        .find(|r| r.signature.name == "f")
+        .expect("f record");
+    assert!(f.uncallable.is_some(), "f should be uncallable");
+
+    let is_validated = |r: &pylens::record::FunctionRecord| r.uncallable.is_none() && !r.cases.is_empty();
+    assert!(!is_validated(f), "an uncallable function must report validated: false");
+
+    let unvalidated = rec.functions.iter().filter(|r| !is_validated(r)).count();
+    assert_eq!(unvalidated, 1);
+
+    let per_function: Vec<_> = rec.functions.iter().map(|r| (r, validate_function(r))).collect();
+    let results: Vec<FunctionValidation> = per_function
+        .iter()
+        .map(|(r, defects)| FunctionValidation {
+            name: &r.signature.name,
+            owner: r.signature.owner.as_deref(),
+            defects,
+            coverage: r.coverage.as_ref(),
+        })
+        .collect();
+    let summary = validate_summary("test.py", rec.functions.len(), unvalidated, 0, 0, &results);
+    assert!(
+        summary.contains("1 function(s) unvalidated"),
+        "expected the unvalidated count in the summary: {summary}"
+    );
 }
 
 #[test]

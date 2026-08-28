@@ -37,9 +37,9 @@ Each top-level output has a `schema_version` field (the `SCHEMA_VERSION` constan
 In project mode, each entry in `files` is the single-file body of that file plus a `path`. If
 the file did not read, parse, or record, the entry is `{ path, error }`. `summary` collects the
 file counts, the function counts, a purity histogram and, for validate, `hard_defects`,
-`soft_defects`, `functions_checked`, and `uncallable`. In project mode, each import or
-dependency entry also has `resolution` (`project_local`, `external`, or `unresolved_relative`)
-and, for a project-local entry, a `project_target` path.
+`soft_defects`, `functions_checked`, `uncallable`, and `unvalidated`. In project mode, each
+import or dependency entry also has `resolution` (`project_local`, `external`, or
+`unresolved_relative`) and, for a project-local entry, a `project_target` path.
 
 ## Effect signature (`functions[]`, the static side)
 
@@ -193,6 +193,23 @@ The signature fields, and also:
   artifact of the sandbox, never a stable observation, so it's dropped without re-execution).
   `coverage`, `branches`, and `branch_coverage` are computed from the surviving `cases` only.
   Omitted entirely when `--stability-runs` wasn't passed, so plain `record` output is unchanged.
+- `io_observability` — one entry per `io` may-set token: `{ "kind": <str>, "observable": <bool>
+  }`. `observable: true` for `"stdout"`/`"stderr"` (captured and checked against the may-set by
+  `validate`'s `check_io` — see below); `observable: false` for `"filesystem"` (the jail's
+  filesystem is read-only, so no execution can ever confirm or contradict a filesystem claim) and
+  `"stdin"` (the worker never feeds a case any stdin). Parallel to, and never a replacement for,
+  the flattened `io: [<str>...]` may-set. A consumer must not read an unobservable `io` entry's
+  absence from `validate`'s defects as corroboration — no execution could ever have disproved it.
+- `output_type_coverage` — `"full"` \| `"partial"`, omitted when the function is `uncallable` or
+  has no `cases` (nothing was observed at all; `validate`'s `unvalidated` already carries that
+  story — see below). `"full"` means every return kind in the static `returns` may-set was
+  observed in some surviving case's return value, AND every `return` statement's source line was
+  executed by some surviving case. Otherwise `"partial"`, with `unobserved_returns` present:
+  `{ "kinds": [<ReturnKind>...], "lines": [<line>...] }` — the static return kinds no case's
+  return value matched, and the `return` statement lines no case ever executed (either list may
+  be empty if only the other dimension is short). The observed-return classification reuses
+  `validate`'s own `classify_return`, so `record` and `validate` never disagree on what an
+  observed return value's kind is.
 
 ### Case
 
@@ -227,9 +244,13 @@ For each function: the `hard_defects` and `soft_defects` counts, and a `defects`
   code.
 - **soft** — an acknowledged `unresolved_effects` entry covers the missed effect.
 
-Each function also carries the `coverage` object described above. The `summary` carries an
-aggregate `coverage` of `{ "executed", "total" }` over the functions that have one.
+Each function also carries the `coverage` object described above, plus the `io_observability`
+list described in "Record additions", and a `validated: <bool>` flag: `false` for a function
+that never executed at all — uncallable, or callable but left with zero cases — which produced a
+`hard_defects`/`soft_defects` count of `0` that has no value (nothing was checked against it, so
+it must not be read as a pass). `true` otherwise.
 
-The `summary` also has an `uncallable` count. A function that never executed gives a result with
-zero defects, which has no value. Thus pylens shows the count, and you do not read the result as
-"validated".
+The `summary` also has an `uncallable` count (functions that never executed because the module
+didn't load or the constructor failed) and an `unvalidated` count (the honest superset:
+`uncallable` functions, plus any callable function left with zero cases — see `validated` above).
+`unvalidated > 0` also prints as a `WARNING` line in `--format summary` output.

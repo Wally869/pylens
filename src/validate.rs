@@ -151,6 +151,17 @@ fn check_raise(
     }
 }
 
+/// Whether an `io` may-set entry of this `kind` has any observation channel at all in the jail:
+/// only `"stdout"`/`"stderr"` do (captured and checked by [`check_io`] below). `"filesystem"`
+/// has none — the jail's filesystem is read-only, so no execution can confirm or contradict it.
+/// `"stdin"` has none either — the worker never feeds a case any stdin, so a claim that a
+/// function reads it is equally uncorroborable. Any future io kind defaults to unobservable
+/// until this function (and a matching check in [`check_io`]) says otherwise, keeping the
+/// classification conservative.
+pub fn observable_io_kind(kind: &str) -> bool {
+    matches!(kind, "stdout" | "stderr")
+}
+
 /// Captured stdout and stderr are each checked against the static `io` may-set (mapped the
 /// same way the analyzer records it: `print` ⇒ `"stdout"`, `print(..., file=sys.stderr)` ⇒
 /// `"stderr"`, any other `file=` target ⇒ both).
@@ -225,7 +236,7 @@ fn check_return(
 /// worker's tagged encoding (`python/worker.py::serialize`): `{"__t__":"set"}` → Set,
 /// `{"__t__":"tuple"}` → Sequence, `{"__t__":"dict"}` → Mapping, `{"__t__":"obj"}` → Opaque
 /// (unknown-shaped, e.g. bytes or a plain object).
-fn classify_return(v: &Value) -> ReturnKind {
+pub fn classify_return(v: &Value) -> ReturnKind {
     match v {
         Value::Null => ReturnKind::None,
         Value::Bool(_) => ReturnKind::Bool,

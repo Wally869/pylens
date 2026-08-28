@@ -480,6 +480,115 @@ fn stderr_write_is_captured() {
 }
 
 #[test]
+fn io_observability_flags_stdout_and_stderr_observable_but_not_filesystem() {
+    if !ready("io_observability_flags_stdout_and_stderr_observable_but_not_filesystem") {
+        return;
+    }
+    // stdout/stderr are captured and checked by `validate::check_io`; the jail's filesystem is
+    // read-only, so an `open(...)` claim has no execution channel that could ever corroborate or
+    // contradict it.
+    let src = concat!(
+        "def f():\n",
+        "    print('hi')\n",
+        "    open('/nonexistent', 'r')\n",
+        "    return None\n"
+    );
+    let rec = record_file(src, 2).expect("record");
+    let f = rec
+        .functions
+        .iter()
+        .find(|r| r.signature.name == "f")
+        .expect("f record");
+    assert!(f.signature.io.contains(&"stdout".to_string()));
+    assert!(f.signature.io.contains(&"filesystem".to_string()));
+
+    let stdout_entry = f
+        .io_observability
+        .iter()
+        .find(|e| e.kind == "stdout")
+        .expect("stdout entry");
+    assert!(stdout_entry.observable, "stdout is captured and checked — must be observable");
+
+    let fs_entry = f
+        .io_observability
+        .iter()
+        .find(|e| e.kind == "filesystem")
+        .expect("filesystem entry");
+    assert!(
+        !fs_entry.observable,
+        "the jail's filesystem is read-only — filesystem claims have no observation channel"
+    );
+}
+
+#[test]
+fn output_type_coverage_is_full_when_every_return_kind_and_line_is_reached() {
+    if !ready("output_type_coverage_is_full_when_every_return_kind_and_line_is_reached") {
+        return;
+    }
+    // A single unconditional return: one return kind, one return line, both always reached.
+    let src = "def f(x):\n    return 1\n";
+    let rec = record_file(src, 4).expect("record");
+    let f = rec
+        .functions
+        .iter()
+        .find(|r| r.signature.name == "f")
+        .expect("f record");
+    assert!(!f.cases.is_empty(), "expected generated cases");
+    assert!(
+        matches!(
+            f.output_type_coverage,
+            Some(pylens::record::OutputTypeCoverage::Full)
+        ),
+        "expected full output-type coverage"
+    );
+    assert!(f.unobserved_returns.is_none());
+}
+
+#[test]
+fn output_type_coverage_is_partial_when_a_return_branch_is_never_reached() {
+    if !ready("output_type_coverage_is_partial_when_a_return_branch_is_never_reached") {
+        return;
+    }
+    // Restrict generation to ints only, so the `x == "unreachable-marker"` string branch (and
+    // its `return "s"` line/kind) is never exercised — the int branch is.
+    let src = concat!(
+        "def f(x):\n",
+        "    if x == \"unreachable-marker\":\n",
+        "        return \"s\"\n",
+        "    return 1\n"
+    );
+    let domain = ValueDomain::parse(r#"{"scalars": ["int"]}"#).expect("parse profile");
+    let rec = record_file_with_options(src, 6, &pylens::record::ReplayMap::new(), Some(&domain), false)
+        .expect("record");
+    let f = rec
+        .functions
+        .iter()
+        .find(|r| r.signature.name == "f")
+        .expect("f record");
+    assert!(!f.cases.is_empty(), "expected generated cases");
+    assert!(
+        f.cases.iter().all(|c| c.ret != Some(serde_json::json!("s"))),
+        "the string branch must never be observed under an int-only domain: {:?}",
+        f.cases.iter().map(|c| &c.ret).collect::<Vec<_>>()
+    );
+    assert!(
+        matches!(
+            f.output_type_coverage,
+            Some(pylens::record::OutputTypeCoverage::Partial)
+        ),
+        "expected partial output-type coverage, got {:?}",
+        f.output_type_coverage.as_ref().map(|_| "present")
+    );
+    let unobserved = f.unobserved_returns.as_ref().expect("unobserved_returns present");
+    assert!(
+        unobserved.kinds.contains(&ReturnKind::Str),
+        "Str return kind should be listed as unobserved: {:?}",
+        unobserved.kinds
+    );
+    assert!(!unobserved.lines.is_empty(), "the never-executed return line should be listed");
+}
+
+#[test]
 fn parse_replay_parses_valid_mapping() {
     let text = r#"{"my_func": [[1, 2], ["a", null]], "other": [[[1, 2, 3]]]}"#;
     let replay = parse_replay(text).expect("parse");
