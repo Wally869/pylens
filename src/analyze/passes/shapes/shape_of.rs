@@ -87,7 +87,10 @@ fn shape_of_name_call(name: &str, state: &ShapeState) -> Shape {
     // A directly-imported callable (`from os.path import join; join(...)`) takes priority over
     // the builtin names below, mirroring the Effects pass's own call resolution order.
     if let Some(module) = state.bindings.get(name) {
-        return models::return_kind(&format!("{}.{name}", module.dotted()))
+        // `name` is the LOCAL binding text; for an aliased from-import (`from os.path import
+        // join as j`) that's the alias `j`, not the real symbol `join` the model table keys on.
+        let real_name = state.import_names.get(name).map(String::as_str).unwrap_or(name);
+        return models::return_kind(&format!("{}.{real_name}", module.dotted()))
             .map(crate::model::ReturnKind::to_shape)
             .unwrap_or(Shape::Any);
     }

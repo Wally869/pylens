@@ -428,6 +428,131 @@ fn self_referential_param_rebind_still_votes() {
 }
 
 #[test]
+fn param_rebound_to_a_constructor_call_still_resolves_the_post_rebind_method() {
+    // The parameter's declared shape stays `Any` (the caller can pass anything — the rebind
+    // must not narrow that), but the post-rebind LOCAL fact (`x` really is a `Box` after `x =
+    // Box()`) is sound to resolve calls made through the name afterward, same as any other
+    // local — flow-sensitive rebind (STATUS.md open work item 1). `Box` declares no `__init__`,
+    // so its own constructor call stays unresolved (`resolve_unique` deliberately leaves an
+    // inherited/absent `__init__` unresolved); `bump` is a real method on `Box` and must resolve,
+    // dropping the `call_method_unknown` acknowledgment. The mutation `bump` performs on its
+    // receiver (`self.n = 1`) is on a freshly constructed object, never the caller's — per the
+    // `CallReceiver` caller-view taxonomy it stays untracked (no root), so it does not appear in
+    // `mutations` either.
+    let s = analyze(
+        "class Box:\n    def bump(self):\n        self.n = 1\n\ndef f(x):\n    x = Box()\n    x.bump()\n    return x\n",
+    );
+    let f = sig(&s, "f");
+    let x = f.params.iter().find(|p| p.name == "x").unwrap();
+    assert_eq!(x.shape, Shape::Any);
+    assert!(
+        !f.unresolved_effects.iter().any(|u| u.reason == "call_method_unknown"),
+        "bump() must resolve through the post-rebind local fact: {:?}",
+        f.unresolved_effects
+    );
+    assert!(
+        f.unresolved_effects
+            .iter()
+            .any(|u| u.reason == "call_unknown_callee" && u.callee.as_deref() == Some("Box")),
+        "Box() itself stays unresolved (no declared __init__): {:?}",
+        f.unresolved_effects
+    );
+    assert!(
+        f.mutations.is_empty(),
+        "a mutation of a fresh local is invisible to the caller: {:?}",
+        f.mutations
+    );
+}
+
+#[test]
+fn pre_rebind_use_stays_frozen_even_though_the_same_name_is_later_rebound() {
+    // Soundness regression caught after the flow-sensitive rebind fix shipped: the env is
+    // flow-INSENSITIVE (one merged shape per name over the whole function), so a call BEFORE the
+    // rebind must not see the post-rebind shape — `x` at `x.bump()` on line 1 could still be
+    // anything the caller passed (e.g. `pre_rebind_call(3)`, which raises `AttributeError`).
+    // Dominance gate: a call only sees the post-rebind evidence when it sits in a top-level
+    // statement strictly AFTER the rebind's own top-level statement (`ShapeState::
+    // frozen_dominance`). Mirrors `temp/probe_flow2.py`.
+    let s = analyze(concat!(
+        "class Box:\n",
+        "    def __init__(self):\n",
+        "        self.n = 0\n",
+        "    def bump(self):\n",
+        "        self.n = 1\n",
+        "\n",
+        "def pre_rebind_call(x):\n",
+        "    x.bump()\n",
+        "    x = Box()\n",
+        "    x.bump()\n",
+    ));
+    let f = sig(&s, "pre_rebind_call");
+    let x = f.params.iter().find(|p| p.name == "x").unwrap();
+    assert_eq!(x.shape, Shape::Any);
+    // Exactly one `call_method_unknown` acknowledgment must survive: the PRE-rebind call, which
+    // must never resolve through the post-rebind `Box` shape.
+    let unknown_method_calls =
+        f.unresolved_effects.iter().filter(|u| u.reason == "call_method_unknown").count();
+    assert_eq!(
+        unknown_method_calls, 1,
+        "expected exactly the pre-rebind bump() call to stay unresolved: {:?}",
+        f.unresolved_effects
+    );
+    // The pre-rebind acknowledgment's `may_affect` must still cover the real parameter `x` —
+    // dropping it (as the regression did) is what left the runtime `AttributeError` uncovered.
+    let pre_rebind_ack = f
+        .unresolved_effects
+        .iter()
+        .find(|u| u.reason == "call_method_unknown")
+        .expect("one call_method_unknown acknowledgment");
+    assert!(
+        pre_rebind_ack.may_affect.contains(&MutationTarget::Param { name: "x".into() }),
+        "expected the pre-rebind acknowledgment to cover the parameter: {:?}",
+        pre_rebind_ack
+    );
+    // No mutation may be attributed to the parameter: `bump`'s `self.n` write belongs to the
+    // fresh post-rebind `Box`, per the `CallReceiver` caller-view taxonomy — never fabricated
+    // onto `x` (the regression reported a bogus `x.n` param mutation here).
+    assert!(
+        f.mutations.is_empty(),
+        "expected no mutation attributed to the parameter: {:?}",
+        f.mutations
+    );
+}
+
+#[test]
+fn rebind_inside_a_loop_body_never_qualifies_for_the_dominance_gate() {
+    // A rebind nested inside ANY compound statement (here, a `for` loop) never qualifies for the
+    // dominance shortcut — on iteration 1, the loop body's `x.bump()` executes BEFORE that same
+    // iteration's `x = Box()`, so no top-level statement ordering can prove the rebind already
+    // happened. `x` stays fully frozen for the whole function, exactly like before the
+    // flow-sensitive rebind fix: `bump()` must never resolve, and the parameter's shape stays
+    // `Any`.
+    let s = analyze(concat!(
+        "class Box:\n",
+        "    def bump(self):\n",
+        "        self.n = 1\n",
+        "\n",
+        "def g(x):\n",
+        "    for _ in range(2):\n",
+        "        x.bump()\n",
+        "        x = Box()\n",
+    ));
+    let f = sig(&s, "g");
+    let x = f.params.iter().find(|p| p.name == "x").unwrap();
+    assert_eq!(x.shape, Shape::Any);
+    assert!(
+        f.unresolved_effects.iter().any(|u| u.reason == "call_method_unknown"),
+        "expected bump() to never resolve inside the loop: {:?}",
+        f.unresolved_effects
+    );
+    assert!(
+        f.mutations.is_empty(),
+        "expected no mutation attributed to the parameter: {:?}",
+        f.mutations
+    );
+}
+
+#[test]
 fn local_rebound_to_a_list_literal_still_infers_a_sequence() {
     // The rebind rule is about parameters, whose caller-supplied value the rebind severs from —
     // a plain local really is what it was last assigned, so `xs = []` still infers `Seq`: the
@@ -928,6 +1053,52 @@ fn aliased_stdlib_import_resolves_to_the_same_model_entry() {
         "the aliased call must resolve to the os.path.join entry: {:?}",
         f.unresolved_effects
     );
+}
+
+#[test]
+fn aliased_from_import_resolves_to_the_same_model_entry() {
+    // `from os.path import join as j; j(...)` must find the `os.path.join` entry through the
+    // original imported name, not the local alias `j` (which would look up the nonexistent
+    // `os.path.j`) — see `ModuleAnalysis::import_names`.
+    let s = analyze("from os.path import join as j\ndef f(a, b):\n    return j(a, b)\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"TypeError".to_string()));
+    assert!(f.raises.implicit.contains(&"AttributeError".to_string()));
+    assert!(
+        !f.unresolved_effects.iter().any(|u| u.reason == "call_import"),
+        "the aliased from-import call must resolve to the os.path.join entry: {:?}",
+        f.unresolved_effects
+    );
+    assert_eq!(f.purity, Purity::Pure);
+}
+
+#[test]
+fn in_body_import_raises_import_error_and_module_not_found_error() {
+    // An `import`/`from ... import ...` statement inside a function body only runs when the
+    // function is called, so a missing module surfaces as `ImportError`/`ModuleNotFoundError`
+    // at call time — unlike a module-level import, which fails the whole module at load time.
+    let s = analyze("def f():\n    import matplotlib\n    return matplotlib.plot([])\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"ImportError".to_string()));
+    assert!(f.raises.implicit.contains(&"ModuleNotFoundError".to_string()));
+}
+
+#[test]
+fn in_body_from_import_raises_import_error_and_module_not_found_error() {
+    let s = analyze("def f():\n    from yaml import safe_load\n    return safe_load('')\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"ImportError".to_string()));
+    assert!(f.raises.implicit.contains(&"ModuleNotFoundError".to_string()));
+}
+
+#[test]
+fn module_level_import_does_not_add_the_implicit_import_raise() {
+    // A module-level import fails the whole module at load time (uncallable), not per-call — it
+    // must not contribute to a function's raise may-set.
+    let s = analyze("import os.path\ndef f(a, b):\n    return os.path.join(a, b)\n");
+    let f = sig(&s, "f");
+    assert!(!f.raises.implicit.contains(&"ImportError".to_string()));
+    assert!(!f.raises.implicit.contains(&"ModuleNotFoundError".to_string()));
 }
 
 #[test]

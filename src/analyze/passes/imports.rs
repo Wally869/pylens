@@ -100,6 +100,7 @@ impl Pass for ImportsPass {
     fn run(&self, module: &ast::ModModule, ctx: &mut ModuleAnalysis) {
         let imports = collect_imports(module);
         let mut bindings: HashMap<String, ModuleRef> = HashMap::new();
+        let mut import_names: HashMap<String, String> = HashMap::new();
         let mut has_star = false;
         for imp in &imports {
             if imp.star {
@@ -108,9 +109,16 @@ impl Pass for ImportsPass {
             for b in imp.bindings() {
                 bindings.entry(b).or_insert_with(|| imp.module.clone());
             }
+            if imp.from {
+                for n in &imp.names {
+                    let local = n.alias.clone().unwrap_or_else(|| n.name.clone());
+                    import_names.entry(local).or_insert_with(|| n.name.clone());
+                }
+            }
         }
         ctx.imports = imports;
         ctx.bindings = bindings;
+        ctx.import_names = import_names;
         ctx.has_star = has_star;
     }
 }

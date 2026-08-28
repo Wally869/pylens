@@ -1,8 +1,7 @@
-use std::collections::HashMap;
 use ruff_python_ast as ast;
 use crate::model::*;
 use super::super::super::collect::hints::infer_hints;
-use super::super::super::context::{CallSite, FunctionFacts, ImportCallSite, ModuleCtx};
+use super::super::super::context::{CallSite, FunctionFacts, ImportCallSite, ModuleCtx, ShapeFacts};
 use super::super::declarations::ReceiverKind;
 use super::setup::{annotation_name, collect_param_defs, collect_param_names, decorator_names};
 use super::{Walker};
@@ -17,7 +16,7 @@ pub(super) fn analyze_function(
     kind: DefKind,
     receiver: ReceiverKind,
     module: ModuleCtx,
-    shapes: HashMap<String, Shape>,
+    shape_facts: ShapeFacts,
     owner: Option<&str>,
 ) -> (EffectSignature, Vec<CallSite>, Vec<ImportCallSite>) {
     let params = collect_param_names(&def.parameters);
@@ -32,7 +31,7 @@ pub(super) fn analyze_function(
 
     let param_names: Vec<String> = param_defs.iter().map(|p| p.name.clone()).collect();
     let mut facts =
-        FunctionFacts::new(self_param, &params, module, shapes, sig, owner.map(str::to_string));
+        FunctionFacts::new(self_param, &params, module, shape_facts, sig, owner.map(str::to_string));
     facts.hints = infer_hints(&def.body, &param_names);
     Walker { facts: &mut facts }.run(&def.body);
     let call_sites = std::mem::take(&mut facts.call_sites);

@@ -48,3 +48,35 @@ fn example_corpus_has_zero_hard_defects() {
         }
     }
 }
+
+#[test]
+fn pre_rebind_method_call_has_zero_hard_defects() {
+    // Regression coverage for `temp/probe_flow2.py`: a call through a parameter BEFORE an
+    // unrelated rebind of that same parameter (`x.bump()` before `x = Box()`) must never resolve
+    // through the post-rebind shape — if it did, the `call_method_unknown` acknowledgment that
+    // covers a real `AttributeError` (e.g. `pre_rebind_call(3)`) would vanish, and `validate`
+    // would report a hard defect. See the dominance gate in
+    // `passes::shapes::state::ShapeState::frozen_dominance` / `context::FunctionFacts::
+    // env_shape`.
+    if !ready("pre_rebind_method_call_has_zero_hard_defects") {
+        return;
+    }
+    let src = concat!(
+        "class Box:\n",
+        "    def __init__(self):\n",
+        "        self.n = 0\n",
+        "    def bump(self):\n",
+        "        self.n = 1\n",
+        "\n",
+        "def pre_rebind_call(x):\n",
+        "    x.bump()\n",
+        "    x = Box()\n",
+        "    x.bump()\n",
+    );
+    let rec = record_file(src, 12).expect("record");
+    for f in &rec.functions {
+        let defects = validate_function(f);
+        let hard: Vec<_> = defects.iter().filter(|d| d.severity == Severity::Hard).collect();
+        assert!(hard.is_empty(), "hard soundness defects in {}: {:?}", f.signature.name, hard);
+    }
+}

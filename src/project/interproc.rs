@@ -10,9 +10,12 @@
 //!
 //! Maps `(file path, function name)` -> that function's flat position in the project (its file
 //! index and its index within that file's signature list). Only free functions (`DefKind::
-//! Function`, no `owner`) are indexed — methods need an instantiated receiver to call through,
-//! which cross-file resolution doesn't attempt; see the module doc for the intra-file pass for
-//! why `self`/`cls` calls are handled separately there.
+//! Function`, no `owner`) are indexed — a call generally needs an instantiated receiver to reach
+//! a method, which cross-file resolution doesn't attempt in general; see the module doc for the
+//! intra-file pass for why `self`/`cls` calls are handled separately there. The one exception is
+//! the unbound-superclass call shape (`Base.method(self, ...)`), which needs no instantiated
+//! receiver of its own — it reuses the caller's — and is resolved through a separate
+//! `(file, class, method)` method table (`build_method_table`), not this one.
 //!
 //! ## Binding resolution
 //!
@@ -35,8 +38,11 @@
 //! Mapping a resolved callee's summary onto its caller follows the exact same rules as the
 //! intra-file pass (positional/keyword param -> caller arg root, `Global` unchanged, raises fold
 //! into `implicit`, io/global_writes/is_generator union, unresolved effects inherited with
-//! `may_affect` remapped) with one simplification: a project-symbol-table callee is always a free
-//! function, so it never has a `SelfAttr` mutation to propagate. The corresponding `call_import`
+//! `may_affect` remapped). Most resolved callees are project-symbol-table free functions, which
+//! never have a `SelfAttr` mutation to propagate; the one exception is an unbound-superclass call
+//! (`Base.method(self, ...)`) resolved through an imported class binding — see
+//! [`ResolvedReceiver`] — whose `SelfAttr` mutations map onto the caller's own receiver, same as
+//! the intra-file pass's `CallReceiver::CallerSelf`. The corresponding `call_import`
 //! unresolved effect is removed from the caller once its call site resolves. Iterated to a
 //! fixpoint (bounded by the total function count across the project, +1) for the same
 //! soundness/termination reasons as the intra-file pass: cross-file (mutual) recursion only ever
@@ -70,11 +76,32 @@ pub struct FileUnit {
 /// What a project-local import binding resolves to.
 #[derive(Clone)]
 enum ImportTarget {
-    /// `from <module> import <function>` — the binding names one specific function.
+    /// `from <module> import <function>` — the binding names one specific function. Also the
+    /// target shape of `from <module> import <Class>`: a from-import binds one name in the
+    /// target file, and that name could equally be a class instead of a free function — see
+    /// `resolve_site`'s unbound-superclass arm, which retries this same target as a class name
+    /// when the call site's own shape asks for one.
     Function { file: String, function: String },
     /// `import <module>` — the binding names the module; the function is whatever attribute the
     /// call site accesses.
     Module { file: String },
+}
+
+/// What kind of callee a resolved [`ImportCallSite`] names, and how its mutations map onto the
+/// caller — the project-wide analogue of [`crate::analyze::CallReceiver`] (only the two variants
+/// cross-file resolution can ever produce; a project-symbol-table function target has no
+/// receiver at all).
+#[derive(Clone, Copy)]
+enum ResolvedReceiver {
+    /// A plain project-local free function — no receiver, no argument-position shift.
+    None,
+    /// `Base.method(self, ...)`: `Base` is an imported binding for a class declared in another
+    /// project file, and the call has the unbound-superclass shape (see
+    /// `ImportCallSite::unbound_receiver`). The callee's `SelfAttr` mutations are the caller's
+    /// own receiver's mutations, and the call's own first positional argument (the receiver,
+    /// written explicitly) has no slot in the callee's receiver-less parameter list — mirrors
+    /// same-module `CallReceiver::CallerSelf` / `positional_arg_roots_skip_first`.
+    CallerSelfSkipFirst,
 }
 
 /// Run cross-file effect propagation over every file's signatures in place, to a fixpoint.
@@ -84,6 +111,7 @@ pub fn propagate(files: &mut [FileUnit], root: &Path) {
     let binding_maps: Vec<HashMap<String, ImportTarget>> =
         files.iter().map(|f| build_binding_map(&f.imports, &f.path, &index)).collect();
     let symbol_table = build_symbol_table(files);
+    let method_table = build_method_table(files);
 
     let total_functions: usize = files.iter().map(|f| f.signatures.len()).sum();
     let max_iterations = total_functions.saturating_add(1);
@@ -94,11 +122,12 @@ pub fn propagate(files: &mut [FileUnit], root: &Path) {
             for func_i in 0..n {
                 let sites = files[file_i].import_call_sites[func_i].clone();
                 for site in &sites {
-                    if let Some(&(callee_file, callee_func)) =
-                        resolve_site(&binding_maps[file_i], site, &symbol_table)
+                    if let Some((callee_file, callee_func, receiver)) =
+                        resolve_site(&binding_maps[file_i], site, &symbol_table, &method_table)
                     {
-                        changed |=
-                            apply_call_site(files, file_i, func_i, callee_file, callee_func, site);
+                        changed |= apply_call_site(
+                            files, file_i, func_i, callee_file, callee_func, site, receiver,
+                        );
                     }
                 }
             }
@@ -123,6 +152,26 @@ fn build_symbol_table(files: &[FileUnit]) -> HashMap<(String, String), (usize, u
         for (func_i, sig) in file.signatures.iter().enumerate() {
             if sig.kind == DefKind::Function && sig.owner.is_none() {
                 table.entry((file.path.clone(), sig.name.clone())).or_insert((file_i, func_i));
+            }
+        }
+    }
+    table
+}
+
+/// Build `(file path, class name, method name) -> (file index, signature index)` for every
+/// project-local method — the cross-file analogue of `declarations::resolve_unique`'s owned-class
+/// lookup, used to resolve an unbound-superclass call (`Base.method(self, ...)`) through an
+/// imported class binding.
+fn build_method_table(files: &[FileUnit]) -> HashMap<(String, String, String), (usize, usize)> {
+    let mut table = HashMap::new();
+    for (file_i, file) in files.iter().enumerate() {
+        for (func_i, sig) in file.signatures.iter().enumerate() {
+            if sig.kind == DefKind::Method
+                && let Some(owner) = &sig.owner
+            {
+                table
+                    .entry((file.path.clone(), owner.clone(), sig.name.clone()))
+                    .or_insert((file_i, func_i));
             }
         }
     }
@@ -164,19 +213,33 @@ fn build_binding_map(
 
 /// Resolve one call site's binding (+ optional attribute) to a project symbol table entry, when
 /// the binding's import target and the call site's shape (attribute or not) line up — see the
-/// module doc's "Binding resolution" section.
-fn resolve_site<'t>(
+/// module doc's "Binding resolution" section. Also tries the unbound-superclass shape
+/// (`Base.method(self, ...)`, `ImportCallSite::unbound_receiver`) against the method table when
+/// a plain function-target lookup misses: `Base` is a from-import binding, so `ImportTarget::
+/// Function{file, function}` already names the right file and the right symbol name — the only
+/// question is whether that symbol is a class declaring `attr` as a method, not a function.
+fn resolve_site(
     binding_map: &HashMap<String, ImportTarget>,
     site: &ImportCallSite,
-    symbol_table: &'t HashMap<(String, String), (usize, usize)>,
-) -> Option<&'t (usize, usize)> {
+    symbol_table: &HashMap<(String, String), (usize, usize)>,
+    method_table: &HashMap<(String, String, String), (usize, usize)>,
+) -> Option<(usize, usize, ResolvedReceiver)> {
     let target = binding_map.get(&site.binding)?;
-    let key = match (target, &site.attr) {
-        (ImportTarget::Function { file, function }, None) => (file.clone(), function.clone()),
-        (ImportTarget::Module { file }, Some(attr)) => (file.clone(), attr.clone()),
-        _ => return None,
-    };
-    symbol_table.get(&key)
+    match (target, &site.attr) {
+        (ImportTarget::Function { file, function }, None) => {
+            let &(f, i) = symbol_table.get(&(file.clone(), function.clone()))?;
+            Some((f, i, ResolvedReceiver::None))
+        }
+        (ImportTarget::Module { file }, Some(attr)) => {
+            let &(f, i) = symbol_table.get(&(file.clone(), attr.clone()))?;
+            Some((f, i, ResolvedReceiver::None))
+        }
+        (ImportTarget::Function { file, function }, Some(attr)) if site.unbound_receiver => {
+            let &(f, i) = method_table.get(&(file.clone(), function.clone(), attr.clone()))?;
+            Some((f, i, ResolvedReceiver::CallerSelfSkipFirst))
+        }
+        _ => None,
+    }
 }
 
 /// Propagate `callee`'s current summary onto `caller`'s signature, and remove the caller's
@@ -189,6 +252,7 @@ fn apply_call_site(
     callee_file: usize,
     callee_func: usize,
     site: &ImportCallSite,
+    receiver: ResolvedReceiver,
 ) -> bool {
     let Some(callee_sig) = files[callee_file].signatures.get(callee_func) else {
         return false;
@@ -199,13 +263,21 @@ fn apply_call_site(
         .filter(|p| p.kind == ParamKind::Positional)
         .map(|p| p.name.clone())
         .collect();
+    // `Base.method(self, ...)`'s own first positional argument is the receiver, written
+    // explicitly rather than implicit in the attribute access — the callee's receiver-less
+    // parameter list has no slot for it, so the position -> parameter mapping skips it, mirroring
+    // same-module `positional_arg_roots_skip_first`.
+    let arg_roots: &[Option<MutationTarget>] = match receiver {
+        ResolvedReceiver::CallerSelfSkipFirst => site.arg_roots.get(1..).unwrap_or(&[]),
+        ResolvedReceiver::None => &site.arg_roots,
+    };
 
     let new_mutations: Vec<Mutation> = callee_sig
         .mutations
         .iter()
         .filter_map(|m| {
             let target =
-                remap_target(&m.target, &callee_positional, &site.arg_roots, &site.kwarg_roots)?;
+                remap_target(&m.target, &callee_positional, arg_roots, &site.kwarg_roots, receiver)?;
             Some(Mutation { target, via: m.via, name: m.name.clone() })
         })
         .collect();
@@ -227,7 +299,7 @@ fn apply_call_site(
                 .may_affect
                 .iter()
                 .map(|t| {
-                    remap_target(t, &callee_positional, &site.arg_roots, &site.kwarg_roots)
+                    remap_target(t, &callee_positional, arg_roots, &site.kwarg_roots, receiver)
                         .unwrap_or_else(|| t.clone())
                 })
                 .collect();
@@ -286,15 +358,21 @@ fn apply_call_site(
 }
 
 /// Map a callee-side mutation/unresolved-effect root onto the caller. `None` if it can't be
-/// attributed to any caller root. A project-symbol-table callee is always a free function, so
-/// unlike the intra-file version there is no `SelfAttr`/`via_self` case to handle.
+/// attributed to any caller root. A plain project-symbol-table function callee never has a
+/// `SelfAttr` mutation to propagate; an unbound-superclass method callee does, and it maps onto
+/// the caller's own receiver — see [`ResolvedReceiver`].
 fn remap_target(
     target: &MutationTarget,
     callee_positional: &[String],
     arg_roots: &[Option<MutationTarget>],
     kwarg_roots: &[(String, Option<MutationTarget>)],
+    receiver: ResolvedReceiver,
 ) -> Option<MutationTarget> {
     match target {
+        MutationTarget::SelfAttr { .. } => match receiver {
+            ResolvedReceiver::CallerSelfSkipFirst => Some(target.clone()),
+            ResolvedReceiver::None => None,
+        },
         MutationTarget::Param { name } => {
             if let Some((_, root)) = kwarg_roots.iter().find(|(kw, _)| kw == name) {
                 return root.clone();
@@ -303,7 +381,7 @@ fn remap_target(
             arg_roots.get(idx).cloned().flatten()
         }
         MutationTarget::Global { .. } => Some(target.clone()),
-        MutationTarget::SelfAttr { .. } | MutationTarget::Nonlocal { .. } | MutationTarget::Unknown => None,
+        MutationTarget::Nonlocal { .. } | MutationTarget::Unknown => None,
     }
 }
 

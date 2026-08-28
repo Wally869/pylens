@@ -20,6 +20,10 @@ pub(super) struct ShapeState<'a> {
     /// before Shapes). Lets `shape_of` resolve a stdlib call (`os.path.join(...)`) against
     /// `models::return_kind` the same way the Effects pass resolves it against `models::lookup`.
     pub(super) bindings: &'a HashMap<String, ModuleRef>,
+    /// In-scope import binding -> the original name it was imported as, for aliased from-import
+    /// bindings. See `context::ModuleAnalysis::import_names`; lets a direct call through an
+    /// aliased from-import resolve `models::return_kind` under the real symbol name.
+    pub(super) import_names: &'a HashMap<String, String>,
     /// Names of this function's tracked parameters (excludes `self`/`cls`). Needed to tell a
     /// rebind of a parameter apart from a rebind of a plain local.
     params: HashSet<String>,
@@ -29,6 +33,27 @@ pub(super) struct ShapeState<'a> {
     /// caller supplied. A rebind whose RHS still reads the parameter (`x = x.strip()`) is not
     /// unrelated and never lands here; see `references_name` in `pinning`.
     pub(super) frozen_params: HashSet<String>,
+    /// For a name in `frozen_params` whose FIRST unrelated rebind sits directly in the function
+    /// body's top-level statement sequence (nesting depth 0) — the top-level index of that
+    /// statement. A name is present here only when its first rebind qualifies; a rebind nested
+    /// inside ANY compound statement (`if`/`for`/`while`/`try`/`with`/`match`) never qualifies,
+    /// even if the same name is rebound again later at depth 0 — the name then stays fully
+    /// frozen for the whole function, exactly as before dominance gating existed. This is the
+    /// SOUND half of the flow-sensitive rebind fix: a later top-level statement can never
+    /// execute before an earlier one completes (no CFG needed to know that), so a call
+    /// (resolved by the Effects pass) sitting in a top-level statement whose index is strictly
+    /// greater than the rebind's index is safely past it; a call at or before that index sees a
+    /// parameter that could still be the caller's original value, so it must not be resolved
+    /// through the post-rebind shape. See `context::FunctionFacts::env_shape`, which applies
+    /// this gate using its own (equivalently computed) top-level index during the Effects walk.
+    pub(super) frozen_dominance: HashMap<String, usize>,
+    /// Current nesting depth relative to the function body: 0 while processing a top-level
+    /// statement directly, incremented while inside any compound statement's nested block(s).
+    pub(super) depth: usize,
+    /// The top-level index (0-based, into the function body's direct statement list) of the
+    /// top-level statement currently being processed (or being processed by an ancestor, for
+    /// nested traversal) — valid at any depth.
+    pub(super) top_level_index: usize,
 }
 
 impl<'a> ShapeState<'a> {
@@ -36,6 +61,7 @@ impl<'a> ShapeState<'a> {
         params: &[String],
         classes: HashSet<String>,
         bindings: &'a HashMap<String, ModuleRef>,
+        import_names: &'a HashMap<String, String>,
     ) -> Self {
         let mut aliases = HashMap::new();
         let mut env = HashMap::new();
@@ -44,14 +70,32 @@ impl<'a> ShapeState<'a> {
             env.insert(p.clone(), Shape::Any);
         }
         let params = params.iter().cloned().collect();
-        Self { aliases, env, classes, bindings, params, frozen_params: HashSet::new() }
+        Self {
+            aliases,
+            env,
+            classes,
+            bindings,
+            import_names,
+            params,
+            frozen_params: HashSet::new(),
+            frozen_dominance: HashMap::new(),
+            depth: 0,
+            top_level_index: 0,
+        }
     }
 
     /// Marks `x` as unrelately rebound if it names one of this function's parameters; a no-op
-    /// for a local. See `frozen_params`.
+    /// for a local. See `frozen_params`/`frozen_dominance`. Idempotent across fixpoint
+    /// iterations: only the FIRST time `x` is frozen does its depth/index get recorded (or
+    /// permanently withheld, if that first rebind was nested).
     pub(super) fn freeze_if_param(&mut self, x: &str) {
-        if self.params.contains(x) {
-            self.frozen_params.insert(x.to_string());
+        if !self.params.contains(x) {
+            return;
+        }
+        let already_frozen = self.frozen_params.contains(x);
+        self.frozen_params.insert(x.to_string());
+        if !already_frozen && self.depth == 0 {
+            self.frozen_dominance.insert(x.to_string(), self.top_level_index);
         }
     }
 

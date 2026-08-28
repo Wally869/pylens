@@ -74,13 +74,31 @@ impl Pass for ShapesPass {
             match stmt {
                 ast::Stmt::FunctionDef(def) => {
                     let receiver = receivers.next().unwrap_or(ReceiverKind::None);
-                    ctx.shapes.push(infer_function(def, receiver, &ctx.classes, &ctx.bindings));
+                    let (shapes, frozen, dominance) = infer_function(
+                        def,
+                        receiver,
+                        &ctx.classes,
+                        &ctx.bindings,
+                        &ctx.import_names,
+                    );
+                    ctx.shapes.push(shapes);
+                    ctx.frozen_params.push(frozen);
+                    ctx.frozen_dominance.push(dominance);
                 }
                 ast::Stmt::ClassDef(class) => {
                     for member in &class.body {
                         if let ast::Stmt::FunctionDef(def) = member {
                             let receiver = receivers.next().unwrap_or(ReceiverKind::None);
-                            ctx.shapes.push(infer_function(def, receiver, &ctx.classes, &ctx.bindings));
+                            let (shapes, frozen, dominance) = infer_function(
+                                def,
+                                receiver,
+                                &ctx.classes,
+                                &ctx.bindings,
+                                &ctx.import_names,
+                            );
+                            ctx.shapes.push(shapes);
+                            ctx.frozen_params.push(frozen);
+                            ctx.frozen_dominance.push(dominance);
                         }
                     }
                 }
@@ -92,12 +110,15 @@ impl Pass for ShapesPass {
 
 /// Run the fixpoint walk for one function, returning the final name -> shape env (params and
 /// locals alike; the caller/`EffectsPass` picks out only the parameter names it needs).
+type InferResult = (HashMap<String, Shape>, std::collections::HashSet<String>, HashMap<String, usize>);
+
 fn infer_function(
     def: &ast::StmtFunctionDef,
     receiver: ReceiverKind,
     classes: &std::collections::HashSet<String>,
     bindings: &HashMap<String, ModuleRef>,
-) -> HashMap<String, Shape> {
+    import_names: &HashMap<String, String>,
+) -> InferResult {
     let params = param_names(&def.parameters);
     let self_param = match receiver {
         ReceiverKind::SelfParam | ReceiverKind::Cls => params.first().cloned(),
@@ -108,22 +129,36 @@ fn infer_function(
         .filter(|p| Some(p.as_str()) != self_param.as_deref())
         .collect();
 
-    let mut state = ShapeState::new(&tracked, classes.clone(), bindings);
+    let mut state = ShapeState::new(&tracked, classes.clone(), bindings, import_names);
     for _ in 0..MAX_ITERATIONS {
         let before = state.env.clone();
-        visit_body(&def.body, &mut state);
+        visit_top_level(&def.body, &mut state);
         if state.env == before {
             break;
         }
     }
-    // A parameter rebound to an unrelated value anywhere in the body has its accumulated
-    // evidence discarded entirely: the rebind severs the shape from the caller's argument, and
-    // the walk has no ordering model that would let it keep only the pre-rebind votes. See
-    // `ShapeState::frozen_params`.
-    for name in &state.frozen_params {
-        state.env.insert(name.clone(), Shape::Any);
+    // A parameter rebound to an unrelated value anywhere in the body severs the shape from the
+    // caller's argument for `ParamInfo::shape` purposes — that override lives in
+    // `passes::effects::finalization::finish`, driven by `frozen_params` returned here. The env
+    // itself is returned unfrozen: after the rebind, the name genuinely denotes whatever the
+    // rebind's evidence says (`x = Box()` really is a `Box` from that point on), which is sound
+    // to resolve calls made through the name — same as any other local, GATED by
+    // `frozen_dominance` (see its doc) so a call site that isn't textually dominated by the
+    // rebind never sees the post-rebind evidence. See `ModuleAnalysis::shapes`'s doc.
+    (state.env, state.frozen_params, state.frozen_dominance)
+}
+
+/// The top-level (function-body-direct) statement walk: sets `depth = 0` and the current
+/// top-level index for each statement before visiting it — the anchor `frozen_dominance`'s
+/// indices are measured against. See `visit_body`, which every NESTED recursion goes through
+/// instead (incrementing `depth`, leaving `top_level_index` inherited from the enclosing
+/// top-level statement).
+fn visit_top_level(body: &[ast::Stmt], state: &mut ShapeState) {
+    for (i, stmt) in body.iter().enumerate() {
+        state.top_level_index = i;
+        state.depth = 0;
+        visit_stmt(stmt, state);
     }
-    state.env
 }
 
 fn param_names(params: &ast::Parameters) -> Vec<String> {
@@ -146,10 +181,16 @@ fn param_names(params: &ast::Parameters) -> Vec<String> {
     out
 }
 
+/// The NESTED statement walk: every call site is inside some compound statement's body, so
+/// `depth` is incremented for the duration — see `frozen_dominance`'s doc on why a rebind seen
+/// at `depth > 0` never qualifies for the dominance gate. `top_level_index` is left untouched,
+/// inherited from the enclosing top-level statement (`visit_top_level`).
 fn visit_body(body: &[ast::Stmt], state: &mut ShapeState) {
+    state.depth += 1;
     for stmt in body {
         visit_stmt(stmt, state);
     }
+    state.depth -= 1;
 }
 
 fn visit_stmt(stmt: &ast::Stmt, state: &mut ShapeState) {

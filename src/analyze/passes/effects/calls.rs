@@ -69,12 +69,23 @@ impl Walker < '_ , '_ > {
                         if matches!(attr.value.as_ref(), ast::Expr::Name(_)) {
                             let arg_roots = self.positional_arg_roots(&call.arguments);
                             let kwarg_roots = self.keyword_arg_roots(&call.arguments);
+                            // `Base.method(self, ...)` where `Base` is imported (not a
+                            // same-module class, which the dedicated arm below handles): the
+                            // shape of an unbound-superclass call, eligible for cross-file
+                            // resolution against a project-local class — see `ImportCallSite::
+                            // unbound_receiver`.
+                            let unbound_receiver = call
+                                .arguments
+                                .args
+                                .first()
+                                .is_some_and(|a| self.is_self_receiver(a));
                             self.facts.import_call_sites.push(ImportCallSite {
                                 binding: base.to_string(),
                                 attr: Some(attr.attr.to_string()),
                                 arg_roots,
                                 kwarg_roots,
                                 has_unpack,
+                                unbound_receiver,
                             });
                         }
                     } else if self.is_self_receiver(&attr.value)
@@ -185,7 +196,16 @@ impl Walker < '_ , '_ > {
                     let n = name.id.as_str();
                     if let Some(module) = self.facts.imports.get(n) {
                         // A directly-imported callable (`from json import dumps; dumps(x)`).
-                        let modelled = models::lookup(&format!("{}.{n}", module.dotted()));
+                        // `n` is the LOCAL binding text, which is the alias for an aliased
+                        // from-import (`from os.path import join as j; j(...)` binds `n = "j"`)
+                        // — the real symbol name (`join`) is what the model table is keyed on.
+                        let real_name = self
+                            .facts
+                            .import_names
+                            .get(n)
+                            .map(String::as_str)
+                            .unwrap_or(n);
+                        let modelled = models::lookup(&format!("{}.{real_name}", module.dotted()));
                         if let Some(model) = modelled {
                             self.apply_model(model);
                         } else {
@@ -203,6 +223,7 @@ impl Walker < '_ , '_ > {
                             arg_roots,
                             kwarg_roots,
                             has_unpack,
+                            unbound_receiver: false,
                         });
                     } else if let Some(callee) = resolve_unique(self.facts.declarations, None, n) {
                         // A call to a module-level function defined in this same module — a

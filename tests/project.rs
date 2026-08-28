@@ -134,6 +134,44 @@ fn analyze_project_propagates_cross_file_mutation_onto_the_caller() {
 }
 
 #[test]
+fn analyze_project_resolves_unbound_superclass_call_through_an_imported_class() {
+    // `Base.method(self, ...)` resolves same-module already (see `analyze.rs`'s equivalent
+    // test); this is the cross-file case (STATUS.md open work item 3): `Base` is imported from a
+    // sibling project file. `CrossFileChild.setup` must end up identical to `LocalChild.setup`
+    // (which resolves the same shape against a same-module base) — same purity, same propagated
+    // `self.ready` mutation, no leftover `call_import` acknowledgment.
+    let report = analyze_project(Path::new("tests/fixtures/xfile_superclass"));
+    let files = report["files"].as_array().expect("files array");
+    let child = files.iter().find(|f| f["path"] == "child.py").expect("child.py entry");
+    let functions = child["functions"].as_array().expect("functions array");
+
+    let local = functions
+        .iter()
+        .find(|f| f["name"] == "setup" && f["owner"] == "LocalChild")
+        .expect("LocalChild.setup");
+    let cross = functions
+        .iter()
+        .find(|f| f["name"] == "setup" && f["owner"] == "CrossFileChild")
+        .expect("CrossFileChild.setup");
+
+    assert_eq!(cross["purity"], local["purity"]);
+    assert_eq!(cross["purity"], "impure");
+    assert_eq!(cross["mutations"], local["mutations"]);
+    let mutations = cross["mutations"].as_array().expect("mutations array");
+    assert!(
+        mutations
+            .iter()
+            .any(|m| m["target"]["root"] == "self_attr" && m["target"]["name"] == "ready"),
+        "expected CrossFileChild.setup to show a propagated self.ready mutation, got {mutations:?}"
+    );
+    let unresolved = cross["unresolved_effects"].as_array().expect("unresolved_effects array");
+    assert!(
+        unresolved.is_empty(),
+        "expected the cross-file superclass call to resolve fully, got {unresolved:?}"
+    );
+}
+
+#[test]
 fn analyze_project_propagates_cross_file_mutation_via_keyword_arg_onto_the_caller() {
     let report = analyze_project(Path::new("tests/fixtures/xfile_kwargs"));
     let files = report["files"].as_array().expect("files array");

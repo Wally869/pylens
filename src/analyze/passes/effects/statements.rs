@@ -5,10 +5,16 @@ use super::super::super::collect::exceptions::exception_name;
 use super::Walker;
 
 impl Walker < '_ , '_ > {
+        /// The NESTED statement walk: every call site here is inside some compound statement's
+        /// body, so `depth` is incremented for the duration — see
+        /// `context::FunctionFacts::frozen_dominance`'s doc. `top_level_index` is left
+        /// untouched, inherited from the enclosing top-level statement (`Walker::run`).
         pub fn visit_body(&mut self, body: &[ast::Stmt]) {
+            self.facts.depth += 1;
             for stmt in body {
                 self.visit_stmt(stmt);
             }
+            self.facts.depth -= 1;
         }
 
         pub fn visit_stmt(&mut self, stmt: &ast::Stmt) {
@@ -51,6 +57,18 @@ impl Walker < '_ , '_ > {
                     if let Some(msg) = assert_stmt.msg.as_deref() {
                         self.visit_expr(msg);
                     }
+                }
+                Stmt::Import(_) | Stmt::ImportFrom(_) => {
+                    // An import statement *inside a function body* only runs when the function is
+                    // called (unlike a module-level import, which fails the whole module at load
+                    // time and is handled as uncallable) — so a missing module or submodule at
+                    // call time surfaces here as `ImportError`, or its more specific subclass
+                    // `ModuleNotFoundError` (raised when the module itself can't be found, as
+                    // opposed to a name within it). `validate` matches exception types exactly, not
+                    // by subclass, so both must be listed for a real `ModuleNotFoundError` at
+                    // runtime to be covered by this may-set.
+                    self.facts.sig.raises.implicit.push("ImportError".to_string());
+                    self.facts.sig.raises.implicit.push("ModuleNotFoundError".to_string());
                 }
                 Stmt::Global(g) => {
                     for name in &g.names {

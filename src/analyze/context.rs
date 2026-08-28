@@ -107,6 +107,19 @@ pub struct ImportCallSite {
     /// what it can map, but must keep the caller's `call_import` acknowledgment: unpacked
     /// arguments reach callee parameters the mapping can't attribute.
     pub has_unpack: bool,
+    /// This call has the unbound-superclass shape (`Base.method(self, ...)`): there's an
+    /// attribute (`attr.is_some()`) and the call's own first positional argument is literally
+    /// this function's own receiver (`self`/`cls`) — see `Walker::is_self_receiver`. `arg_roots`
+    /// still includes that receiver argument at position 0 (recorded the same way as any other
+    /// import call site — this flag doesn't change what's stored, only how the project layer's
+    /// cross-file resolution (`project::interproc`) is allowed to interpret it): when `Base`
+    /// resolves to a project-local class declaring `attr` as a method, the receiver argument is
+    /// this call's own caller-visible receiver, mirroring same-module `Base.method(self, ...)`
+    /// resolution (`passes::effects::calls`, `CallReceiver::CallerSelf`) — the callee's
+    /// `SelfAttr` mutations become the caller's own, and the position -> parameter mapping skips
+    /// this first argument. Left unused (always safely ignorable) for a call that doesn't
+    /// resolve to a method this way.
+    pub unbound_receiver: bool,
 }
 
 impl ImportCallSite {
@@ -131,6 +144,13 @@ pub(in crate::analyze) struct ModuleAnalysis {
     pub(in crate::analyze) imports: Vec<Import>,
     /// In-scope import binding -> the module it names. Built by the Imports pass.
     pub(in crate::analyze) bindings: HashMap<String, ModuleRef>,
+    /// In-scope import binding -> the original name it was imported as, for `from m import x as
+    /// y` bindings (`"y" -> "x"`). Built by the Imports pass. Lets a direct call through an
+    /// aliased from-import (`j(a, b)` for `from os.path import join as j`) resolve against the
+    /// model table under the real symbol name (`os.path.join`) instead of the local alias
+    /// (`os.path.j`, which never matches). Only from-import bindings are present; a plain
+    /// `import m as n` binds a module, never a directly callable symbol.
+    pub(in crate::analyze) import_names: HashMap<String, String>,
     /// A `from m import *` is in scope somewhere in the module. Built by the Imports pass.
     pub(in crate::analyze) has_star: bool,
     /// Function/method symbol table built by the Declarations pass; the enabler for intra-file
@@ -141,9 +161,26 @@ pub(in crate::analyze) struct ModuleAnalysis {
     /// call `C(...)`; an imported class isn't in this set, so it stays `Any`.
     pub(in crate::analyze) classes: HashSet<String>,
     /// Per-function name->shape environments (params and locals) built by the Shapes pass, one
-    /// entry per function/method in the same order as `declarations`. The Effects pass reads
-    /// the parameter shapes out of these; never serialized directly.
+    /// entry per function/method in the same order as `declarations`. Flow-insensitive: a
+    /// parameter unrelatedly rebound in the body (`x = Box()`) still carries its post-rebind
+    /// local evidence here (e.g. `Shape::Instance("Box")`) — that evidence is sound for
+    /// resolving calls made THROUGH the name after the rebind, exactly like any other local's
+    /// shape. It is NOT sound as the parameter's own declared/generated shape (a caller never
+    /// sees the rebind), so `ParamInfo::shape` is built from this map filtered through
+    /// `frozen_params`, not read from it directly — see `passes::effects::finalization::finish`.
     pub(in crate::analyze) shapes: Vec<HashMap<String, Shape>>,
+    /// Per-function set of parameter names unrelatedly rebound somewhere in the body (`x =
+    /// Box()`, `x = []`, `x = other`), one entry per function/method in the same order as
+    /// `shapes`. Built by the Shapes pass (see `passes::shapes::ShapeState::frozen_params`);
+    /// consumed only by `finish` to reset the reported `ParamInfo::shape` to `Any` for these
+    /// names — the general `shapes` map above is deliberately left unfrozen.
+    pub(in crate::analyze) frozen_params: Vec<HashSet<String>>,
+    /// Per-function map, one entry per function/method in the same order as `shapes`, from a
+    /// frozen parameter name to the top-level statement index of its dominance-qualifying
+    /// rebind — see `passes::shapes::ShapeState::frozen_dominance` for the full soundness
+    /// argument. Consumed by `FunctionFacts::env_shape` to gate the Effects pass's use of
+    /// `shapes`'s post-rebind evidence to call sites strictly after the rebind.
+    pub(in crate::analyze) frozen_dominance: Vec<HashMap<String, usize>>,
     /// Effect signatures produced by the Effects pass, enriched in place by the Interprocedural
     /// pass, and finalized by the Purity pass.
     pub(in crate::analyze) signatures: Vec<EffectSignature>,
@@ -164,15 +201,27 @@ impl ModuleAnalysis {
             line_index: LineIndex::from_source_text(src),
             imports: Vec::new(),
             bindings: HashMap::new(),
+            import_names: HashMap::new(),
             has_star: false,
             declarations: Vec::new(),
             classes: HashSet::new(),
             shapes: Vec::new(),
+            frozen_params: Vec::new(),
+            frozen_dominance: Vec::new(),
             signatures: Vec::new(),
             call_sites: Vec::new(),
             import_call_sites: Vec::new(),
         }
     }
+}
+
+/// The Shapes pass's three per-function outputs, bundled into one value so `FunctionFacts::new`/
+/// `passes::effects::analyze_function` don't take an overlong parameter list. See
+/// `ModuleAnalysis::shapes`/`frozen_params`/`frozen_dominance` for what each field means.
+pub(in crate::analyze) struct ShapeFacts {
+    pub(in crate::analyze) shapes: HashMap<String, Shape>,
+    pub(in crate::analyze) frozen_params: HashSet<String>,
+    pub(in crate::analyze) frozen_dominance: HashMap<String, usize>,
 }
 
 /// Read-only module-wide inputs every function's Effects walk needs but none of them mutate —
@@ -181,6 +230,9 @@ impl ModuleAnalysis {
 pub(in crate::analyze) struct ModuleCtx<'a> {
     /// In-scope import binding -> the module it names.
     pub(in crate::analyze) imports: &'a HashMap<String, ModuleRef>,
+    /// In-scope import binding -> the original name it was imported as, for aliased from-import
+    /// bindings. See `ModuleAnalysis::import_names`.
+    pub(in crate::analyze) import_names: &'a HashMap<String, String>,
     /// A `from m import *` is in scope.
     pub(in crate::analyze) has_star: bool,
     /// The module-wide function/method symbol table, for resolving local calls.
@@ -201,10 +253,31 @@ pub(in crate::analyze) struct FunctionFacts<'a> {
     pub(in crate::analyze) globals: HashSet<String>,
     pub(in crate::analyze) nonlocals: HashSet<String>,
     /// Final name -> shape environment settled by the Shapes pass (params and locals), read-only
-    /// here — the Effects walk looks shapes up but never mutates this map.
+    /// here — the Effects walk looks shapes up but never mutates this map. Flow-insensitive and
+    /// deliberately unfrozen for a rebound parameter — see `ModuleAnalysis::shapes`.
     pub(in crate::analyze) shapes: HashMap<String, Shape>,
+    /// Parameter names unrelatedly rebound somewhere in this function's body. See
+    /// `ModuleAnalysis::frozen_params`; consumed only by `finish` to reset `ParamInfo::shape`.
+    pub(in crate::analyze) frozen_params: HashSet<String>,
+    /// Frozen parameter name -> the top-level statement index of its dominance-qualifying
+    /// rebind. See `ModuleAnalysis::frozen_dominance`; consumed by `env_shape` to gate use of
+    /// `shapes`'s post-rebind evidence to call sites the Effects walk has determined are
+    /// strictly past the rebind — see `top_level_index`/`depth`.
+    pub(in crate::analyze) frozen_dominance: HashMap<String, usize>,
+    /// Current nesting depth relative to the function body, maintained by the Effects walk the
+    /// same way `passes::shapes::ShapeState` maintains its own copy: 0 while visiting a
+    /// top-level statement directly, incremented while inside any compound statement's nested
+    /// block(s). See `frozen_dominance`.
+    pub(in crate::analyze) depth: usize,
+    /// The top-level index of the top-level statement currently being visited (or being visited
+    /// by an ancestor, for nested traversal) — the value `frozen_dominance`'s indices are
+    /// compared against. See `frozen_dominance`.
+    pub(in crate::analyze) top_level_index: usize,
     /// In-scope import binding -> the module it names (e.g. `np` -> numpy).
     pub(in crate::analyze) imports: &'a HashMap<String, ModuleRef>,
+    /// In-scope import binding -> the original name it was imported as, for aliased from-import
+    /// bindings. See `ModuleAnalysis::import_names`.
+    pub(in crate::analyze) import_names: &'a HashMap<String, String>,
     /// A `from m import *` is in scope.
     pub(in crate::analyze) has_star: bool,
     /// Import bindings referenced in the body, in first-seen order.
@@ -243,7 +316,7 @@ impl<'a> FunctionFacts<'a> {
         self_param: Option<String>,
         params: &[String],
         module: ModuleCtx<'a>,
-        shapes: HashMap<String, Shape>,
+        shape_facts: ShapeFacts,
         sig: EffectSignature,
         owner: Option<String>,
     ) -> Self {
@@ -256,8 +329,13 @@ impl<'a> FunctionFacts<'a> {
             aliases,
             globals: HashSet::new(),
             nonlocals: HashSet::new(),
-            shapes,
+            shapes: shape_facts.shapes,
+            frozen_params: shape_facts.frozen_params,
+            frozen_dominance: shape_facts.frozen_dominance,
+            depth: 0,
+            top_level_index: 0,
             imports: module.imports,
+            import_names: module.import_names,
             has_star: module.has_star,
             used_imports: Vec::new(),
             may_use_star: false,
@@ -304,12 +382,35 @@ impl<'a> FunctionFacts<'a> {
     /// rebound local like `node = stack.pop()`) roots to itself, mirroring the Shapes pass's own
     /// alias-collapse on rebind. `None` for the method receiver (`self`/`cls`, not shape-tracked)
     /// or an expression with no leftmost name — the same exclusions `param_root` applies.
+    ///
+    /// **Dominance gate**: `shapes` is flow-insensitive — a rebound parameter's entry there is
+    /// evidence merged over the WHOLE function, including any post-rebind evidence (`x = Box()`
+    /// really is a `Box` from that statement on, but the SAME merged entry also reads at a call
+    /// site textually BEFORE the rebind, where `x` could still be the caller's original value of
+    /// any type). So for a root in `frozen_params`, this only returns the accumulated `shapes`
+    /// entry when the CURRENT call site (`self.top_level_index`) is strictly past the root's
+    /// `frozen_dominance` index — i.e. sits in a later top-level statement than a rebind that
+    /// itself sat directly in the top-level sequence (never inside a loop/branch/etc., since one
+    /// iteration/branch could execute the "later" use before the rebind runs). Anywhere that
+    /// gate isn't satisfied (no qualifying rebind at all, or the call site isn't past it), this
+    /// returns `Shape::Any` — full width, same as the parameter's own reported shape — instead of
+    /// the merged evidence. See `passes::shapes::state::ShapeState::frozen_dominance` for the
+    /// full argument.
     pub(in crate::analyze) fn env_shape(&self, expr: &ast::Expr) -> Option<Shape> {
         let name = leftmost_name(expr)?;
         if Some(name) == self.self_param.as_deref() {
             return None;
         }
         let root = self.aliases.get(name).cloned().unwrap_or_else(|| name.to_string());
+        if self.frozen_params.contains(&root) {
+            let dominated = self
+                .frozen_dominance
+                .get(&root)
+                .is_some_and(|&idx| self.top_level_index > idx);
+            if !dominated {
+                return Some(Shape::Any);
+            }
+        }
         Some(self.shapes.get(&root).cloned().unwrap_or(Shape::Any))
     }
 
