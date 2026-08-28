@@ -15,20 +15,28 @@ use crate::shrink::shrink_case;
 use crate::{analyze_source, imports_of};
 
 mod cover;
+mod stability;
 
 pub use cover::{BranchCoverage, BranchOutcomeReport, BranchReport};
+pub use stability::DroppedCases;
 
 /// One long-lived jailed worker, reused for the whole file (load probe + dependency probes +
 /// every case). Recording is sequential, so a single fork-server worker amortizes interpreter
 /// startup without idle jails; each request still runs in its own forked child.
 const POOL_SIZE: usize = 1;
 
-/// Bundles `--value-domain` and `--cover-branches` for [`record_with_signatures_replay`] — keeps
-/// its argument count down alongside `sandbox`/`src`/`imports`/`sigs`/`max_inputs`/`replay`.
+/// Bundles `--value-domain`, `--cover-branches`, and `--stability-runs` for
+/// [`record_with_signatures_replay`] — keeps its argument count down alongside
+/// `sandbox`/`src`/`imports`/`sigs`/`max_inputs`/`replay`.
 #[derive(Clone, Copy)]
 pub struct RecordFlags<'a> {
     pub domain: Option<&'a ValueDomain>,
     pub cover_branches: bool,
+    /// `--stability-runs <N>`: re-execute every case (generated, cover-loop, and replayed alike)
+    /// until it has run `N` times total, dropping any case whose runs disagree — see
+    /// [`stabilize_cases`]. `None` (the default) leaves `record`'s output unchanged, including
+    /// omitting `FunctionRecord::dropped_cases` entirely.
+    pub stability_runs: Option<usize>,
 }
 
 /// Generation settings threaded through the recording of one function or method: the
@@ -225,6 +233,10 @@ pub struct FunctionRecord {
     /// The rollup over every outcome in `branches`. Present exactly when `branches` is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_coverage: Option<BranchCoverage>,
+    /// The closed count of cases `--stability-runs` dropped — see [`DroppedCases`]. Omitted
+    /// entirely when `--stability-runs` wasn't passed, so plain `record` output is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dropped_cases: Option<DroppedCases>,
 }
 
 /// Whether a dependency's module resolves in the jail.
@@ -276,7 +288,7 @@ pub fn record_file_with_replay(
     replay: &ReplayMap,
 ) -> Result<ModuleRecord, String> {
     let sandbox = NsjailPool::new(POOL_SIZE)?;
-    record_with_replay(&sandbox, src, max_inputs, replay, None, false)
+    record_with_replay(&sandbox, src, max_inputs, replay, None, false, None)
 }
 
 /// Like [`record_file`], with generation restricted to a `--value-domain` profile (see
@@ -301,8 +313,21 @@ pub fn record_file_with_options(
     domain: Option<&ValueDomain>,
     cover_branches: bool,
 ) -> Result<ModuleRecord, String> {
+    record_file_with_options_and_stability(src, max_inputs, replay, domain, cover_branches, None)
+}
+
+/// Like [`record_file_with_options`], also opting into `--stability-runs` — see
+/// [`RecordFlags::stability_runs`].
+pub fn record_file_with_options_and_stability(
+    src: &str,
+    max_inputs: usize,
+    replay: &ReplayMap,
+    domain: Option<&ValueDomain>,
+    cover_branches: bool,
+    stability_runs: Option<usize>,
+) -> Result<ModuleRecord, String> {
     let sandbox = NsjailPool::new(POOL_SIZE)?;
-    record_with_replay(&sandbox, src, max_inputs, replay, domain, cover_branches)
+    record_with_replay(&sandbox, src, max_inputs, replay, domain, cover_branches, stability_runs)
 }
 
 /// Record a whole file's functions against an already-provisioned sandbox. Lets a caller
@@ -314,11 +339,12 @@ pub fn record_with(
     max_inputs: usize,
     domain: Option<&ValueDomain>,
 ) -> Result<ModuleRecord, String> {
-    record_with_replay(sandbox, src, max_inputs, &ReplayMap::new(), domain, false)
+    record_with_replay(sandbox, src, max_inputs, &ReplayMap::new(), domain, false, None)
 }
 
-/// Like [`record_with`], with externally supplied `--replay` input tuples and the
-/// `--cover-branches` opt-in — see [`record_file_with_replay`], [`record_file_with_options`].
+/// Like [`record_with`], with externally supplied `--replay` input tuples, the
+/// `--cover-branches` opt-in, and the `--stability-runs` opt-in — see
+/// [`record_file_with_replay`], [`record_file_with_options`], [`RecordFlags::stability_runs`].
 pub fn record_with_replay(
     sandbox: &dyn Sandbox,
     src: &str,
@@ -326,6 +352,7 @@ pub fn record_with_replay(
     replay: &ReplayMap,
     domain: Option<&ValueDomain>,
     cover_branches: bool,
+    stability_runs: Option<usize>,
 ) -> Result<ModuleRecord, String> {
     let imports = imports_of(src).map_err(|e| e.to_string())?;
     let sigs = analyze_source(src).map_err(|e| e.to_string())?;
@@ -336,7 +363,7 @@ pub fn record_with_replay(
         sigs,
         max_inputs,
         replay,
-        RecordFlags { domain, cover_branches },
+        RecordFlags { domain, cover_branches, stability_runs },
     )
 }
 
@@ -356,15 +383,28 @@ pub fn record_with_signatures(
     domain: Option<&ValueDomain>,
     cover_branches: bool,
 ) -> Result<ModuleRecord, String> {
-    record_with_signatures_replay(
+    record_with_signatures_flags(
         sandbox,
         src,
         imports,
         sigs,
         max_inputs,
-        &ReplayMap::new(),
-        RecordFlags { domain, cover_branches },
+        RecordFlags { domain, cover_branches, stability_runs: None },
     )
+}
+
+/// Like [`record_with_signatures`], taking a [`RecordFlags`] bundle so `--stability-runs` (see
+/// [`RecordFlags::stability_runs`]) can be threaded through without growing the argument count —
+/// used by `project::record_project` for project mode.
+pub fn record_with_signatures_flags(
+    sandbox: &dyn Sandbox,
+    src: &str,
+    imports: Vec<Import>,
+    sigs: Vec<EffectSignature>,
+    max_inputs: usize,
+    flags: RecordFlags,
+) -> Result<ModuleRecord, String> {
+    record_with_signatures_replay(sandbox, src, imports, sigs, max_inputs, &ReplayMap::new(), flags)
 }
 
 /// Like [`record_with_signatures`], with externally supplied `--replay` input tuples: each
@@ -381,7 +421,10 @@ pub fn record_with_signatures_replay(
     replay: &ReplayMap,
     flags: RecordFlags,
 ) -> Result<ModuleRecord, String> {
-    let RecordFlags { domain, cover_branches } = flags;
+    let RecordFlags { domain, cover_branches, stability_runs } = flags;
+    if let Some(runs) = stability_runs {
+        assert!(runs >= 2, "stability_runs must be >= 2 (checked by the CLI)");
+    }
     for name in replay.keys() {
         if !sigs.iter().any(|s| &s.name == name) {
             return Err(format!("replay: no function named {name:?} in this module"));
@@ -412,12 +455,13 @@ pub fn record_with_signatures_replay(
                 coverage: None,
                 branches: None,
                 branch_coverage: None,
+                dropped_cases: stability_runs.map(|_| DroppedCases::default()),
             });
             continue;
         }
         let replay_inputs: &[Vec<Value>] = replay.get(&sig.name).map(Vec::as_slice).unwrap_or(&[]);
         let opts = GenOptions { max_inputs, domain, cover_branches };
-        let (uncallable, cases, cover_ctx) = match sig.kind {
+        let (uncallable, mut cases, cover_ctx) = match sig.kind {
             DefKind::Function => {
                 let (cases, ctx) = function_cases(sandbox, src, sig, opts, replay_inputs)?;
                 (None, cases, ctx)
@@ -425,6 +469,16 @@ pub fn record_with_signatures_replay(
             DefKind::Method => {
                 method_record(sandbox, src, sig, &sigs, opts, &mut ctor_cache, replay_inputs)?
             }
+        };
+        let dropped_cases = match stability_runs {
+            Some(runs) if uncallable.is_none() => {
+                let (kept, dropped) =
+                    stability::stabilize_cases(sandbox, src, sig, std::mem::take(&mut cases), runs)?;
+                cases = kept;
+                Some(dropped)
+            }
+            Some(_) => Some(DroppedCases::default()),
+            None => None,
         };
         let coverage = if uncallable.is_some() {
             None
@@ -446,6 +500,7 @@ pub fn record_with_signatures_replay(
             coverage,
             branches,
             branch_coverage,
+            dropped_cases,
         });
     }
     Ok(ModuleRecord {
@@ -755,7 +810,7 @@ pub(super) fn build_case(
 
 /// Structural equality with float tolerance; sets/dict items are pre-sorted by the worker, so
 /// positional array comparison is order-insensitive for them.
-fn value_eq(a: &Value, b: &Value) -> bool {
+pub(super) fn value_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => match (x.as_f64(), y.as_f64()) {
             (Some(xa), Some(yb)) => (xa - yb).abs() <= 1e-9 * (1.0 + xa.abs().max(yb.abs())),

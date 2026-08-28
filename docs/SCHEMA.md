@@ -185,6 +185,14 @@ The signature fields, and also:
 - `branch_coverage` — `{ "covered": <int>, "uncovered": <int>, "unobservable": <int> }`, the
   rollup over every outcome in `branches` — a closed count, always present exactly when `branches`
   is.
+- `dropped_cases` — `{ "unstable": <int>, "resource": <int> }`, present only when `record
+  --stability-runs N` was passed. `record --stability-runs N` re-executes every case (generated,
+  cover-loop, and replayed alike — `N >= 2`) until it has run `N` times total, and drops any case
+  whose runs disagree on `outcome`/`return`/`raises`/`mutations`/`stdout`/`stderr` (`unstable`) or
+  whose outcome was already `error` (`resource` — a resource kill, or other harness failure, is an
+  artifact of the sandbox, never a stable observation, so it's dropped without re-execution).
+  `coverage`, `branches`, and `branch_coverage` are computed from the surviving `cases` only.
+  Omitted entirely when `--stability-runs` wasn't passed, so plain `record` output is unchanged.
 
 ### Case
 

@@ -3,7 +3,7 @@
 //!   pylens analyze  <file.py|dir> [--format json|summary|pyi|html]      static effect signatures
 //!   pylens record   <file.py|dir> [--inputs N] [--replay <cases.json>]
 //!                    [--value-domain <profile.json>] [--cover-branches]
-//!                    [--format json|summary|pyi|html]                 signatures + observed
+//!                    [--stability-runs N] [--format json|summary|pyi|html] signatures + observed
 //!                                                                       cases (runs the jail).
 //!                                                                       `--replay` additionally
 //!                                                                       executes externally
@@ -25,6 +25,15 @@
 //!                                                                       per-function case budget.
 //!                                                                       Off by default: plain
 //!                                                                       `record` is unaffected.
+//!                                                                       `--stability-runs N`
+//!                                                                       (N >= 2) re-executes
+//!                                                                       every case N times total
+//!                                                                       and drops any whose runs
+//!                                                                       disagree, adding
+//!                                                                       `dropped_cases` to each
+//!                                                                       function record. Off by
+//!                                                                       default; not available
+//!                                                                       on `validate`.
 //!   pylens validate <file.py|dir> [--inputs N] [--format json|summary|html] observed ⊆ static
 //!                                                                       soundness-defect report
 //!                                                                       (runs the jail); exits
@@ -60,7 +69,7 @@ fn main() {
             eprintln!(
                 "usage:\n  pylens analyze <file.py|dir> [--format json|summary|pyi|html]\n  \
                  pylens record <file.py|dir> [--inputs <N>] [--replay <cases.json>] \
-                 [--value-domain <profile.json>] [--cover-branches] \
+                 [--value-domain <profile.json>] [--cover-branches] [--stability-runs <N>] \
                  [--format json|summary|pyi|html]\n  \
                  pylens validate <file.py|dir> [--inputs <N>] [--format json|summary|html]"
             );
@@ -169,6 +178,15 @@ fn cmd_record(args: &[String]) {
         ValueDomain::parse(&text).unwrap_or_else(|e| fail(&format!("record error: {e}")))
     });
     let cover_branches = args.iter().any(|a| a == "--cover-branches");
+    let stability_runs: Option<usize> = flag(args, "--stability-runs").map(|s| {
+        let n: usize = s
+            .parse()
+            .unwrap_or_else(|_| fail(&format!("--stability-runs expects an integer, got {s:?}")));
+        if n < 2 {
+            fail("--stability-runs needs N >= 2");
+        }
+        n
+    });
 
     if std::path::Path::new(&path).is_dir() {
         if format == Format::Pyi {
@@ -177,7 +195,13 @@ fn cmd_record(args: &[String]) {
         if replay_path.is_some() {
             fail("--replay needs a single file, not a directory");
         }
-        match pylens::project::record_project(std::path::Path::new(&path), inputs, domain.as_ref(), cover_branches) {
+        match pylens::project::record_project(
+            std::path::Path::new(&path),
+            inputs,
+            domain.as_ref(),
+            cover_branches,
+            stability_runs,
+        ) {
             Ok(report) => match format {
                 Format::Summary => print!("{}", report::project_summary(&report)),
                 Format::Html => print!("{}", pylens::html::render("record", &report)),
@@ -196,8 +220,14 @@ fn cmd_record(args: &[String]) {
         }
         None => pylens::record::ReplayMap::new(),
     };
-    let record_result =
-        pylens::record::record_file_with_options(&src, inputs, &replay, domain.as_ref(), cover_branches);
+    let record_result = pylens::record::record_file_with_options_and_stability(
+        &src,
+        inputs,
+        &replay,
+        domain.as_ref(),
+        cover_branches,
+        stability_runs,
+    );
     match record_result {
         Ok(record) => {
             if format == Format::Pyi {
@@ -387,7 +417,8 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 /// follows a value-taking flag, so `analyze --format pyi file.py` and `analyze file.py --format
 /// pyi` both resolve the path correctly.
 fn positional(args: &[String]) -> Option<&String> {
-    const VALUE_FLAGS: [&str; 4] = ["--format", "--inputs", "--replay", "--value-domain"];
+    const VALUE_FLAGS: [&str; 5] =
+        ["--format", "--inputs", "--replay", "--value-domain", "--stability-runs"];
     let mut skip_next = false;
     for a in args {
         if skip_next {

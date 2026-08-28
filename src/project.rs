@@ -15,7 +15,7 @@ use crate::analyze::{analyze_module_with_call_sites, collect_imports};
 use crate::exec::{NsjailPool, Sandbox};
 use crate::generate::ValueDomain;
 use crate::model::{EffectSignature, Import, Purity};
-use crate::record::record_with_signatures;
+use crate::record::{RecordFlags, record_with_signatures, record_with_signatures_flags};
 use crate::validate::{Severity, validate_function};
 
 pub mod interproc;
@@ -369,9 +369,11 @@ fn record_file_entry(
     max_inputs: usize,
     domain: Option<&ValueDomain>,
     cover_branches: bool,
+    stability_runs: Option<usize>,
 ) -> FileEntry {
     let EnrichedFile { path, src, imports, signatures } = ef;
-    match record_with_signatures(sandbox, &src, imports, signatures, max_inputs, domain, cover_branches) {
+    let flags = RecordFlags { domain, cover_branches, stability_runs };
+    match record_with_signatures_flags(sandbox, &src, imports, signatures, max_inputs, flags) {
         Ok(record) => {
             let purities = record.functions.iter().map(|f| f.signature.purity).collect();
             let (coverage_executed, coverage_total) = record
@@ -416,12 +418,13 @@ pub fn record_project(
     max_inputs: usize,
     domain: Option<&ValueDomain>,
     cover_branches: bool,
+    stability_runs: Option<usize>,
 ) -> Result<Value, String> {
     let files = collect_py_files(root);
     let index = &ModuleIndex::build(root, &files);
     let (enriched, error_entries) = analyze_and_propagate(root, &files);
     let mut entries = record_files_parallel(enriched, |pool, ef| {
-        record_file_entry(pool, index, ef, max_inputs, domain, cover_branches)
+        record_file_entry(pool, index, ef, max_inputs, domain, cover_branches, stability_runs)
     })?;
     entries.extend(error_entries);
     Ok(build_report(root, entries, false))

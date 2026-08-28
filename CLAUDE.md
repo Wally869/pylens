@@ -21,7 +21,7 @@ cargo test                          # the sandbox tests skip if the sandbox is a
 cargo clippy --all-targets -- -D warnings
 
 pylens analyze  <file.py|dir> [--format json|summary|pyi|html]
-pylens record   <file.py|dir> [--inputs N] [--cover-branches] [--format json|summary|pyi|html]  # sandbox; pyi is for one file only
+pylens record   <file.py|dir> [--inputs N] [--cover-branches] [--stability-runs N] [--format json|summary|pyi|html]  # sandbox; pyi is for one file only
 pylens validate <file.py|dir> [--inputs N] [--format json|summary|html]      # exits non-zero on a hard defect
 ```
 
@@ -32,6 +32,11 @@ budget and runs a predicate-targeted loop after the initial batch: every uncover
 whose test expression `generate::predicate` can parse gets extra, targeted inputs, until every
 observable outcome is covered, an iteration adds none, or the budget runs out. Each still-
 uncovered outcome then carries a `reason` (see `docs/SCHEMA.md`).
+`record --stability-runs N` (N >= 2, off by default; not available on `validate`) re-executes
+every case (generated, cover-loop, and replayed alike) N times total and drops any whose runs
+disagree on outcome/return/raises/mutations/stdout/stderr, so a consumer building test pools gets
+only deterministic cases. Coverage and branch accounting run on the surviving cases only. See
+`dropped_cases` in `docs/SCHEMA.md`.
 
 `analyze` is static and needs no sandbox. `record` is `analyze` plus the dynamic layer, on one
 static core. A directory argument starts project mode.
@@ -82,7 +87,8 @@ and the
 - `src/record/` — `mod.rs` (the static signature and the sandboxed cases: `ModuleRecord`, `Case`,
   with the mutation difference before and after the call), `cover.rs` (the `--cover-branches`
   predicate-targeted coverage loop, and the `branches`/`branch_coverage` report it feeds a
-  `reason` into).
+  `reason` into), `stability.rs` (`--stability-runs`: re-executes each case N times and drops any
+  whose runs disagree, feeding `FunctionRecord::dropped_cases`).
 - `src/shrink.rs` — greedy input minimization for the cases that raise. An aid for the report
   only.
 - `src/validate.rs` — the `observed ⊆ static` harness. `Defect` severity is Hard if a may-set

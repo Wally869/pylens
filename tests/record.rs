@@ -534,7 +534,7 @@ fn replay_unmatched_function_name_is_an_error() {
         sigs,
         4,
         &replay,
-        RecordFlags { domain: None, cover_branches: false },
+        RecordFlags { domain: None, cover_branches: false, stability_runs: None },
     );
     let err = result.err().expect("an unmatched replay function name must be an error");
     assert!(err.contains("does_not_exist"), "unexpected message: {err}");
