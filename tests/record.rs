@@ -1,9 +1,14 @@
 //! Record tests: static signature + observed cases, executed in the jail. Skips (does not
 //! fall back to unsandboxed) when the sandbox isn't provisioned.
 
-use pylens::exec::probe;
+use pylens::exec::{CallResult, Sandbox, probe};
 use pylens::model::ReturnKind;
-use pylens::record::{DepStatus, record_file};
+use pylens::record::{
+    CaseSource, DepStatus, ReplayMap, parse_replay, record_file, record_file_with_replay,
+    record_with_signatures_replay,
+};
+use pylens::{analyze_source, imports_of};
+use serde_json::{Value, json};
 
 fn ready(test: &str) -> bool {
     match probe() {
@@ -471,4 +476,91 @@ fn stderr_write_is_captured() {
         .iter()
         .any(|c| c.stderr.as_deref().is_some_and(|s| s.contains("boom")));
     assert!(captured_stderr, "expected a case with captured stderr");
+}
+
+#[test]
+fn parse_replay_parses_valid_mapping() {
+    let text = r#"{"my_func": [[1, 2], ["a", null]], "other": [[[1, 2, 3]]]}"#;
+    let replay = parse_replay(text).expect("parse");
+    assert_eq!(
+        replay["my_func"],
+        vec![vec![json!(1), json!(2)], vec![json!("a"), Value::Null]]
+    );
+    assert_eq!(replay["other"], vec![vec![json!([1, 2, 3])]]);
+}
+
+#[test]
+fn parse_replay_rejects_non_object_top_level() {
+    let err = parse_replay("[1, 2, 3]").expect_err("must reject a non-object top level");
+    assert!(err.contains("object"), "unexpected message: {err}");
+}
+
+#[test]
+fn parse_replay_rejects_non_array_mapping_value() {
+    let err =
+        parse_replay(r#"{"f": "not-an-array"}"#).expect_err("must reject a non-array mapping value");
+    assert!(err.contains("f"), "unexpected message: {err}");
+}
+
+#[test]
+fn parse_replay_rejects_non_array_tuple() {
+    let err = parse_replay(r#"{"f": [1, 2]}"#).expect_err("must reject a tuple that isn't an array");
+    assert!(err.contains("f"), "unexpected message: {err}");
+}
+
+/// Never actually invoked in the tests that use it — replay validation (an unknown function
+/// name) must fail before any sandbox call happens.
+struct PanicSandbox;
+
+impl Sandbox for PanicSandbox {
+    fn transport(&self, _body: &[u8]) -> Result<CallResult, String> {
+        panic!("sandbox must not be reached when replay name validation already failed");
+    }
+}
+
+#[test]
+fn replay_unmatched_function_name_is_an_error() {
+    let src = "def f(a):\n    return a\n";
+    let imports = imports_of(src).expect("imports");
+    let sigs = analyze_source(src).expect("analyze");
+    let mut replay = ReplayMap::new();
+    replay.insert("does_not_exist".to_string(), vec![vec![json!(1)]]);
+
+    let result = record_with_signatures_replay(&PanicSandbox, src, imports, sigs, 4, &replay);
+    let err = result.err().expect("an unmatched replay function name must be an error");
+    assert!(err.contains("does_not_exist"), "unexpected message: {err}");
+}
+
+#[test]
+fn replay_input_executes_and_is_tagged_source_replay() {
+    if !ready("replay_input_executes_and_is_tagged_source_replay") {
+        return;
+    }
+    let src = "def add(a, b):\n    return a + b\n";
+    let mut replay = ReplayMap::new();
+    replay.insert("add".to_string(), vec![vec![json!(3), json!(4)]]);
+
+    let rec = record_file_with_replay(src, 4, &replay).expect("record");
+    let add = rec
+        .functions
+        .iter()
+        .find(|r| r.signature.name == "add")
+        .expect("add record");
+
+    let replay_case = add
+        .cases
+        .iter()
+        .find(|c| c.source == CaseSource::Replay)
+        .expect("expected a replayed case");
+    assert_eq!(replay_case.input, vec![json!(3), json!(4)]);
+    assert_eq!(replay_case.outcome, "returned");
+    assert_eq!(replay_case.ret, Some(json!(7)));
+    assert!(
+        replay_case.minimized.is_none(),
+        "replayed cases must never be shrunk"
+    );
+    assert!(
+        add.cases.iter().any(|c| c.source == CaseSource::Generated),
+        "generated cases must still be present alongside the replayed one"
+    );
 }

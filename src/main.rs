@@ -1,9 +1,14 @@
 //! pylens CLI.
 //!
 //!   pylens analyze  <file.py|dir> [--format json|summary|pyi|html]      static effect signatures
-//!   pylens record   <file.py|dir> [--inputs N] [--format json|summary|pyi|html] signatures +
-//!                                                                       observed cases (runs the
-//!                                                                       jail)
+//!   pylens record   <file.py|dir> [--inputs N] [--replay <cases.json>]
+//!                    [--format json|summary|pyi|html]                 signatures + observed
+//!                                                                       cases (runs the jail).
+//!                                                                       `--replay` additionally
+//!                                                                       executes externally
+//!                                                                       supplied input tuples
+//!                                                                       (single-file only; see
+//!                                                                       `pylens::record::parse_replay`)
 //!   pylens validate <file.py|dir> [--inputs N] [--format json|summary|html] observed ⊆ static
 //!                                                                       soundness-defect report
 //!                                                                       (runs the jail); exits
@@ -37,7 +42,8 @@ fn main() {
         _ => {
             eprintln!(
                 "usage:\n  pylens analyze <file.py|dir> [--format json|summary|pyi|html]\n  \
-                 pylens record <file.py|dir> [--inputs <N>] [--format json|summary|pyi|html]\n  \
+                 pylens record <file.py|dir> [--inputs <N>] [--replay <cases.json>] \
+                 [--format json|summary|pyi|html]\n  \
                  pylens validate <file.py|dir> [--inputs <N>] [--format json|summary|html]"
             );
             std::process::exit(2);
@@ -138,10 +144,14 @@ fn cmd_record(args: &[String]) {
     let inputs: usize = flag(args, "--inputs")
         .and_then(|s| s.parse().ok())
         .unwrap_or(12);
+    let replay_path = flag(args, "--replay");
 
     if std::path::Path::new(&path).is_dir() {
         if format == Format::Pyi {
             fail("--format pyi is not supported for a directory in record mode");
+        }
+        if replay_path.is_some() {
+            fail("--replay needs a single file, not a directory");
         }
         match pylens::project::record_project(std::path::Path::new(&path), inputs) {
             Ok(report) => match format {
@@ -155,7 +165,16 @@ fn cmd_record(args: &[String]) {
     }
 
     let src = read_file(&path);
-    match pylens::record::record_file(&src, inputs) {
+    let record_result = match replay_path {
+        Some(rp) => {
+            let replay_src = read_file(&rp);
+            let replay = pylens::record::parse_replay(&replay_src)
+                .unwrap_or_else(|e| fail(&format!("record error: {e}")));
+            pylens::record::record_file_with_replay(&src, inputs, &replay)
+        }
+        None => pylens::record::record_file(&src, inputs),
+    };
+    match record_result {
         Ok(record) => {
             if format == Format::Pyi {
                 print!("{}", stub::observed::render_record_stub(&record.functions));
@@ -344,7 +363,7 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 /// follows a value-taking flag, so `analyze --format pyi file.py` and `analyze file.py --format
 /// pyi` both resolve the path correctly.
 fn positional(args: &[String]) -> Option<&String> {
-    const VALUE_FLAGS: [&str; 2] = ["--format", "--inputs"];
+    const VALUE_FLAGS: [&str; 3] = ["--format", "--inputs", "--replay"];
     let mut skip_next = false;
     for a in args {
         if skip_next {

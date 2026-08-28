@@ -252,7 +252,7 @@ fn classify_return(v: &Value) -> ReturnKind {
 mod tests {
     use super::*;
     use crate::model::{DefKind, Mutation, MutationKind, MutationTarget};
-    use crate::record::ObservedMutation;
+    use crate::record::{CaseSource, ObservedMutation};
     use serde_json::json;
 
     fn sig(name: &str) -> EffectSignature {
@@ -264,6 +264,7 @@ mod tests {
             input: Vec::new(),
             kwargs: Default::default(),
             ctor_args: None,
+            source: CaseSource::Generated,
             outcome: "returned".to_string(),
             ret: Some(ret),
             raises: None,
@@ -282,6 +283,7 @@ mod tests {
             input: Vec::new(),
             kwargs: Default::default(),
             ctor_args: None,
+            source: CaseSource::Generated,
             outcome: "raised".to_string(),
             ret: None,
             raises: Some(ty.to_string()),
@@ -300,6 +302,7 @@ mod tests {
             input: Vec::new(),
             kwargs: Default::default(),
             ctor_args: None,
+            source: CaseSource::Generated,
             outcome: "error".to_string(),
             ret: None,
             raises: raises.map(str::to_string),

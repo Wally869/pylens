@@ -19,6 +19,47 @@ use crate::{analyze_source, imports_of};
 /// startup without idle jails; each request still runs in its own forked child.
 const POOL_SIZE: usize = 1;
 
+/// External input tuples supplied via `--replay`: function name → list of positional-argument
+/// tuples, each tuple a `Vec<Value>` ready to hand to the sandbox as-is (no shape-directed
+/// generation, no shrinking). See [`parse_replay`].
+pub type ReplayMap = HashMap<String, Vec<Vec<Value>>>;
+
+/// Parse a `--replay` file: a JSON object mapping function name → an array of input tuples,
+/// each tuple itself a JSON array of positional argument values. Malformed JSON, a non-object
+/// top level, or a mapping whose value isn't an array of arrays, is an error — surfaced to the
+/// caller rather than silently dropped.
+pub fn parse_replay(text: &str) -> Result<ReplayMap, String> {
+    let value: Value = serde_json::from_str(text).map_err(|e| format!("replay file: {e}"))?;
+    let obj = value.as_object().ok_or_else(|| {
+        "replay file: expected a JSON object mapping function name to input tuples".to_string()
+    })?;
+    let mut out = ReplayMap::new();
+    for (name, tuples) in obj {
+        let arr = tuples
+            .as_array()
+            .ok_or_else(|| format!("replay file: {name:?} must map to an array of input tuples"))?;
+        let mut parsed = Vec::with_capacity(arr.len());
+        for tuple in arr {
+            let t = tuple
+                .as_array()
+                .ok_or_else(|| format!("replay file: each input for {name:?} must be an array"))?;
+            parsed.push(t.clone());
+        }
+        out.insert(name.clone(), parsed);
+    }
+    Ok(out)
+}
+
+/// Where an executed case's input came from — see `Case::source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaseSource {
+    /// Sampled by [`crate::generate::gen_inputs`] from the inferred shapes.
+    Generated,
+    /// Supplied externally via `--replay` — see [`parse_replay`].
+    Replay,
+}
+
 /// A mutation observed by diffing a value before vs. after the call.
 #[derive(Serialize)]
 pub struct ObservedMutation {
@@ -48,6 +89,9 @@ pub struct Case {
     /// Constructor arguments used to build the receiver (methods only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ctor_args: Option<Vec<Value>>,
+    /// `generated` (sampled from the inferred shapes) or `replay` (supplied via `--replay`) —
+    /// see [`CaseSource`].
+    pub source: CaseSource,
     /// `returned` | `raised` | `error`. **`raised` means the function itself raised a semantic
     /// exception** (part of its behavior/spec) — `raises` carries the exception type. A
     /// **resource kill** (out-of-memory, recursion limit, timeout — an artifact of the sandbox,
@@ -189,13 +233,35 @@ pub fn record_file(src: &str, max_inputs: usize) -> Result<ModuleRecord, String>
     record_with(&sandbox, src, max_inputs)
 }
 
+/// Like [`record_file`], with externally supplied `--replay` input tuples executed in addition
+/// to the generated ones (see [`parse_replay`], [`ReplayMap`]).
+pub fn record_file_with_replay(
+    src: &str,
+    max_inputs: usize,
+    replay: &ReplayMap,
+) -> Result<ModuleRecord, String> {
+    let sandbox = NsjailPool::new(POOL_SIZE)?;
+    record_with_replay(&sandbox, src, max_inputs, replay)
+}
+
 /// Record a whole file's functions against an already-provisioned sandbox. Lets a caller
 /// processing many files (see `project.rs`) share one jail pool instead of paying nsjail
 /// startup per file; behavior is otherwise identical to [`record_file`].
 pub fn record_with(sandbox: &dyn Sandbox, src: &str, max_inputs: usize) -> Result<ModuleRecord, String> {
+    record_with_replay(sandbox, src, max_inputs, &ReplayMap::new())
+}
+
+/// Like [`record_with`], with externally supplied `--replay` input tuples — see
+/// [`record_file_with_replay`].
+pub fn record_with_replay(
+    sandbox: &dyn Sandbox,
+    src: &str,
+    max_inputs: usize,
+    replay: &ReplayMap,
+) -> Result<ModuleRecord, String> {
     let imports = imports_of(src).map_err(|e| e.to_string())?;
     let sigs = analyze_source(src).map_err(|e| e.to_string())?;
-    record_with_signatures(sandbox, src, imports, sigs, max_inputs)
+    record_with_signatures_replay(sandbox, src, imports, sigs, max_inputs, replay)
 }
 
 /// Record a whole file's functions against an already-provisioned sandbox, using precomputed
@@ -212,6 +278,27 @@ pub fn record_with_signatures(
     sigs: Vec<EffectSignature>,
     max_inputs: usize,
 ) -> Result<ModuleRecord, String> {
+    record_with_signatures_replay(sandbox, src, imports, sigs, max_inputs, &ReplayMap::new())
+}
+
+/// Like [`record_with_signatures`], with externally supplied `--replay` input tuples: each
+/// tuple is executed exactly like a generated one (same sandbox call, same mutation-diff
+/// machinery), tagged `CaseSource::Replay`, and never shrunk. A replay key that names no
+/// function in `sigs` is an error — the caller (see `pylens::main`) surfaces it and exits
+/// non-zero rather than silently dropping unmatched replay data.
+pub fn record_with_signatures_replay(
+    sandbox: &dyn Sandbox,
+    src: &str,
+    imports: Vec<Import>,
+    sigs: Vec<EffectSignature>,
+    max_inputs: usize,
+    replay: &ReplayMap,
+) -> Result<ModuleRecord, String> {
+    for name in replay.keys() {
+        if !sigs.iter().any(|s| &s.name == name) {
+            return Err(format!("replay: no function named {name:?} in this module"));
+        }
+    }
     let dependencies = probe_dependencies(sandbox, imports)?;
 
     // Ground truth for "can anything in this file run": exec the real source once. This
@@ -238,9 +325,15 @@ pub fn record_with_signatures(
             });
             continue;
         }
+        let replay_inputs: &[Vec<Value>] = replay.get(&sig.name).map(Vec::as_slice).unwrap_or(&[]);
         let (uncallable, cases) = match sig.kind {
-            DefKind::Function => (None, function_cases(sandbox, src, sig, max_inputs)?),
-            DefKind::Method => method_record(sandbox, src, sig, &sigs, max_inputs, &mut ctor_cache)?,
+            DefKind::Function => (
+                None,
+                function_cases(sandbox, src, sig, max_inputs, replay_inputs)?,
+            ),
+            DefKind::Method => {
+                method_record(sandbox, src, sig, &sigs, max_inputs, &mut ctor_cache, replay_inputs)?
+            }
         };
         let coverage = if uncallable.is_some() {
             None
@@ -312,17 +405,26 @@ fn function_cases(
     src: &str,
     sig: &EffectSignature,
     max_inputs: usize,
+    replay_inputs: &[Vec<Value>],
 ) -> Result<Vec<Case>, String> {
     let mut cases = Vec::new();
     for input in gen_inputs(sig, max_inputs) {
         let result = sandbox.call(src, &sig.name, &input.positional, &input.kwargs)?;
-        let mut case = build_case(sig, &input, None, &result);
+        let mut case = build_case(sig, &input, None, &result, CaseSource::Generated);
         if case.outcome == "raised" {
             case.minimized = minimize_raised(&case, &input, |pos, kw| {
                 sandbox.call(src, &sig.name, pos, kw)
             })?;
         }
         cases.push(case);
+    }
+    for tuple in replay_inputs {
+        let result = sandbox.call(src, &sig.name, tuple, &[])?;
+        let input = GenInput {
+            positional: tuple.clone(),
+            kwargs: Vec::new(),
+        };
+        cases.push(build_case(sig, &input, None, &result, CaseSource::Replay));
     }
     Ok(cases)
 }
@@ -355,6 +457,7 @@ fn method_record(
     all: &[EffectSignature],
     max_inputs: usize,
     ctor_cache: &mut HashMap<String, Option<HarnessError>>,
+    replay_inputs: &[Vec<Value>],
 ) -> Result<(Option<Uncallable>, Vec<Case>), String> {
     let class = sig
         .owner
@@ -381,13 +484,27 @@ fn method_record(
     for input in gen_inputs(sig, max_inputs) {
         let result =
             sandbox.call_method(src, class, &ctor_args, &sig.name, &input.positional, &input.kwargs)?;
-        let mut case = build_case(sig, &input, Some(ctor_args.clone()), &result);
+        let mut case = build_case(sig, &input, Some(ctor_args.clone()), &result, CaseSource::Generated);
         if case.outcome == "raised" {
             case.minimized = minimize_raised(&case, &input, |pos, kw| {
                 sandbox.call_method(src, class, &ctor_args, &sig.name, pos, kw)
             })?;
         }
         cases.push(case);
+    }
+    for tuple in replay_inputs {
+        let result = sandbox.call_method(src, class, &ctor_args, &sig.name, tuple, &[])?;
+        let input = GenInput {
+            positional: tuple.clone(),
+            kwargs: Vec::new(),
+        };
+        cases.push(build_case(
+            sig,
+            &input,
+            Some(ctor_args.clone()),
+            &result,
+            CaseSource::Replay,
+        ));
     }
     Ok((None, cases))
 }
@@ -416,6 +533,7 @@ fn build_case(
     input: &GenInput,
     ctor_args: Option<Vec<Value>>,
     r: &CallResult,
+    source: CaseSource,
 ) -> Case {
     let mut mutations = Vec::new();
 
@@ -470,6 +588,7 @@ fn build_case(
             input: input.positional.clone(),
             kwargs,
             ctor_args,
+            source,
             outcome: "error".to_string(),
             ret: None,
             raises: None,
@@ -487,6 +606,7 @@ fn build_case(
             input: input.positional.clone(),
             kwargs,
             ctor_args,
+            source,
             outcome: "returned".to_string(),
             ret: Some(r.ret.clone()),
             raises: None,
@@ -503,6 +623,7 @@ fn build_case(
             input: input.positional.clone(),
             kwargs,
             ctor_args,
+            source,
             outcome: "raised".to_string(),
             ret: None,
             raises: r.exception.as_ref().map(|e| e.ty.clone()),
