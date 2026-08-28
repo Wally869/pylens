@@ -90,7 +90,9 @@ For a field-by-field reference, refer to [SCHEMA.md](SCHEMA.md).
 ## record
 
 ```sh
-pylens record <file.py> [--inputs N] [--format json|summary|pyi|html]
+pylens record <file.py> [--inputs N] [--replay <cases.json>] [--value-domain <profile.json>]
+              [--cover-branches] [--stability-runs N] [--time-budget <s>]
+              [--format json|summary|pyi|html]
 ```
 
 `record` generates a maximum of N input vectors for each function (the default is 12), runs each
@@ -103,6 +105,21 @@ input in the sandbox, and adds the results to the report:
   `self` (before and after), and the captured stdout and stderr.
 - `coverage` — how many lines of the function the inputs reached: `executed`, `total`, and the
   `missed` line numbers.
+- `branches` and `branch_coverage` — the per-branch-outcome accounting: each outcome is
+  `covered`, `uncovered` (with a `reason`), or `unobservable_line_granularity`.
+
+The optional flags:
+
+- `--replay <cases.json>` executes externally supplied input tuples in addition to the
+  generated ones. These cases carry `source: "replay"`; pylens never shrinks them and never
+  filters them by the value domain.
+- `--value-domain <profile.json>` restricts the generated values to a declared domain: the
+  allowed scalar kinds, the allowed list elements, and size and depth caps.
+- `--cover-branches` turns `--inputs` into the total case budget and adds targeted inputs for
+  each uncovered branch outcome until the outcomes are covered or the budget ends.
+- `--stability-runs N` runs each case N times and drops the cases whose runs disagree. The
+  report then carries the `dropped_cases` count.
+- `--time-budget <seconds>` puts a soft wall-time cap on the generated work per function.
 
 pylens makes the inputs from the inferred shapes, then adds better candidates and tries them
 first:

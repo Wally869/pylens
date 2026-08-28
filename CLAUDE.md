@@ -21,7 +21,9 @@ cargo test                          # the sandbox tests skip if the sandbox is a
 cargo clippy --all-targets -- -D warnings
 
 pylens analyze  <file.py|dir> [--format json|summary|pyi|html]
-pylens record   <file.py|dir> [--inputs N] [--cover-branches] [--stability-runs N] [--format json|summary|pyi|html]  # sandbox; pyi is for one file only
+pylens record   <file.py|dir> [--inputs N] [--replay <cases.json>] [--value-domain <profile.json>]
+                [--cover-branches] [--stability-runs N] [--time-budget <s>]
+                [--format json|summary|pyi|html]                             # sandbox; pyi is for one file only
 pylens validate <file.py|dir> [--inputs N] [--format json|summary|html]      # exits non-zero on a hard defect
 ```
 
@@ -37,6 +39,12 @@ every case (generated, cover-loop, and replayed alike) N times total and drops a
 disagree on outcome/return/raises/mutations/stdout/stderr, so a consumer building test pools gets
 only deterministic cases. Coverage and branch accounting run on the surviving cases only. See
 `dropped_cases` in `docs/SCHEMA.md`.
+`record --replay <cases.json>` executes externally supplied input tuples through the sandbox
+(cases tagged `source:"replay"`, never shrunk, never domain-filtered). Single file:
+`{fn -> [[args]...]}`; directory: `{path -> {fn -> [[args]...]}}`. `record --value-domain
+<profile.json>` restricts generated and shrunk values to a declared domain (scalar kinds, list
+elements, size and depth caps); `validate` always generates unrestricted. `record --time-budget
+<seconds>` soft-caps generated work per function; replay cases always run.
 
 `analyze` is static and needs no sandbox. `record` is `analyze` plus the dynamic layer, on one
 static core. A directory argument starts project mode.

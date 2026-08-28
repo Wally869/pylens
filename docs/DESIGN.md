@@ -196,6 +196,14 @@ RustPython (insufficient fidelity), and Monty (insufficient maturity).
 - pylens uses true CPython, because the oracle needs full fidelity. A permanent fork-server
   worker pool decreases the cost of the interpreter start. Each call keeps its isolation,
   because each request runs in a new `fork()`.
+- **Batches:** the initial generated case set travels as one request. An intermediate child
+  execs the module once and forks one grandchild per case from that primed state. The serve
+  parent never execs untrusted source; a case's mutations die with its own grandchild; each
+  case keeps its own timeout. Measured cost structure per case: about two thirds is
+  fork/pipe/waitpid (the price of isolation), one fifth is the traced call itself.
+- **Tracing:** the worker records executed lines and `(prev_line, cur_line)` arcs, only for
+  frames of the module under test — foreign (stdlib) frames are not traced. The arcs feed the
+  per-branch-outcome accounting (`branches` in the record).
 - **How pylens sees the mutations:** it serializes the arguments to tagged JSON before and after
   the call. The difference is the observed mutation. The comparison is structural: it accepts a
   tolerance on floats and it ignores the order in sets and dicts. Tagged JSON also covers the

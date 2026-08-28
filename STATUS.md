@@ -48,14 +48,32 @@ clir-corpus pilot: exporter, driver, per-function results).
   27 functions (a clir-side finding). Runtime: median 1.3 s/function over 3 invocations,
   0.3 s/function wall at 6 workers.
 
+## Performance pass (T8b, 2026-08-29) — done except the closing measurement
+
+Landed: project-mode `--replay`; `--time-budget`; the record API collapsed to
+`record_file`/`record_with_signatures` behind `RecordFlags` (files split:
+`record/case.rs`, `analyze/proof.rs`); the worker no longer traces foreign
+frames (16x on stdlib-heavy functions); batched case execution over one IPC
+round trip; a primed-fork chain (the module execs once per batch, one
+grandchild per case, isolation proven by test); request-gated per-stage
+timing (`temp/bench/stage_profile.py` renders the exact breakdown).
+
+Measured cost structure per case (1,208 real cases): 1.33 ms median — 65%
+fork/pipe/waitpid (the price of per-case isolation), 20% the traced call,
+10% amortized module exec, 5% serde. Corpus workload: ~100-115 ms/function
+at 4 workers (WSL saturates near 4 jails; native Linux should scale further).
+Corpus arithmetic: 103k functions ≈ 3 h at 4 workers.
+
+In flight: `--base-inputs` (the seed batch split from the total budget, so
+`--cover-branches` spends the rest only where the accounting demands) and
+the module-load probe folded into the first batch. The final speed check
+and the closing numbers land here after that.
+
 ## Open work
 
-1. **Performance pass before any full-corpus run** (task T8b): extend `--replay` to project
-   mode, single-invocation pipeline, per-function wall budget. Corpus projection today: ~9 h
-   at 6 workers for 103k functions.
-2. Same-line constructs (`ternary`, boolops, inline `if`) stay `unobservable_line_granularity`;
+1. Same-line constructs (`ternary`, boolops, inline `if`) stay `unobservable_line_granularity`;
    upgrading observation needs finer-than-line tracing.
-3. The full 103k corpus run and the `SCHEMA_VERSION` 1.0 freeze — pending the user's GO.
+2. The full 103k corpus run and the `SCHEMA_VERSION` 1.0 freeze — pending the user's GO.
 
 ## Measurements to repeat after a change
 
