@@ -27,8 +27,8 @@ pylens record   examples/<file>.py --format html > report.html  # one HTML repor
 | `interproc.py` | The regression guard for the shape-narrowing bug: a callee whose parameter pins to `int`, called from a function whose parameter stays `any`. The caller must still predict the `TypeError`. |
 | `lazy_deps.py` | Imports **in function bodies**. The module loads, thus a missing import (`matplotlib`) raises `ModuleNotFoundError` at call time, but a true one (`json`) operates correctly. |
 
-The generated records for these files are in `../records/`. To make them again, run
-`pylens record`.
+The generated records are not in the repository. To make them, run `pylens record` on this
+directory; write the output to a local folder, for example `../records/`.
 
 Note: the generation uses the shapes, not a constraint solver. Thus some generated inputs have
 an incorrect type for a given function, and the case record shows this correctly (for example, a
