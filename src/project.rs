@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::analyze::{analyze_module_with_call_sites, collect_imports};
 use crate::exec::{NsjailPool, Sandbox};
+use crate::generate::ValueDomain;
 use crate::model::{EffectSignature, Import, Purity};
 use crate::record::record_with_signatures;
 use crate::validate::{Severity, validate_function};
@@ -361,9 +362,15 @@ pub fn analyze_project(root: &Path) -> Value {
     build_report(root, entries, false)
 }
 
-fn record_file_entry(sandbox: &dyn Sandbox, index: &ModuleIndex, ef: EnrichedFile, max_inputs: usize) -> FileEntry {
+fn record_file_entry(
+    sandbox: &dyn Sandbox,
+    index: &ModuleIndex,
+    ef: EnrichedFile,
+    max_inputs: usize,
+    domain: Option<&ValueDomain>,
+) -> FileEntry {
     let EnrichedFile { path, src, imports, signatures } = ef;
-    match record_with_signatures(sandbox, &src, imports, signatures, max_inputs) {
+    match record_with_signatures(sandbox, &src, imports, signatures, max_inputs, domain) {
         Ok(record) => {
             let purities = record.functions.iter().map(|f| f.signature.purity).collect();
             let (coverage_executed, coverage_total) = record
@@ -403,19 +410,20 @@ fn record_file_entry(sandbox: &dyn Sandbox, index: &ModuleIndex, ef: EnrichedFil
 /// so this parallelizes cleanly. Fails the whole run only if a worker's sandbox can't be
 /// provisioned at all; a per-file record failure becomes a `{path, error}` entry instead.
 /// Records against cross-file-propagated signatures, same as `analyze_project`.
-pub fn record_project(root: &Path, max_inputs: usize) -> Result<Value, String> {
+pub fn record_project(root: &Path, max_inputs: usize, domain: Option<&ValueDomain>) -> Result<Value, String> {
     let files = collect_py_files(root);
     let index = &ModuleIndex::build(root, &files);
     let (enriched, error_entries) = analyze_and_propagate(root, &files);
-    let mut entries =
-        record_files_parallel(enriched, |pool, ef| record_file_entry(pool, index, ef, max_inputs))?;
+    let mut entries = record_files_parallel(enriched, |pool, ef| {
+        record_file_entry(pool, index, ef, max_inputs, domain)
+    })?;
     entries.extend(error_entries);
     Ok(build_report(root, entries, false))
 }
 
 fn validate_file_entry(sandbox: &dyn Sandbox, ef: EnrichedFile, max_inputs: usize) -> FileEntry {
     let EnrichedFile { path, src, imports, signatures } = ef;
-    let record = match record_with_signatures(sandbox, &src, imports, signatures, max_inputs) {
+    let record = match record_with_signatures(sandbox, &src, imports, signatures, max_inputs, None) {
         Ok(r) => r,
         Err(e) => return error_entry(path, format!("record error: {e}")),
     };

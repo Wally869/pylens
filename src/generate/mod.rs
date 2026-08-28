@@ -16,7 +16,10 @@ use serde_json::{Value, Map, json};
 
 use crate::model::{EffectSignature, ParamInfo, ParamKind, Shape};
 
+mod domain;
 mod seeds;
+
+pub use domain::ValueDomain;
 
 /// One generated call: a positional-argument vector plus a keyword-argument map, ready to hand
 /// to the sandbox. `positional` lines up with `positional_params(sig)` by index; `kwargs` holds
@@ -68,7 +71,11 @@ pub enum Rank {
 /// exhausted, combination vectors spread evenly across the full cartesian product, so pairings
 /// across positional AND keyword-only arguments — not only matched positions — get exercised.
 /// Duplicate vectors (same positional values and same keyword pairs) are never emitted twice.
-pub fn gen_inputs(sig: &EffectSignature, max_vectors: usize) -> Vec<GenInput> {
+///
+/// `domain`, when given, restricts every produced value to [`ValueDomain::allows`] — see
+/// `pylens record --value-domain`. `None` means unrestricted generation (the default, and
+/// always the case for `pylens validate`, which must not weaken the soundness harness).
+pub fn gen_inputs(sig: &EffectSignature, max_vectors: usize, domain: Option<&ValueDomain>) -> Vec<GenInput> {
     let max = max_vectors.max(1);
     let positional = positional_params(sig);
     let kwonly = keyword_only_params(sig);
@@ -78,7 +85,15 @@ pub fn gen_inputs(sig: &EffectSignature, max_vectors: usize) -> Vec<GenInput> {
     let per: Vec<Vec<Candidate>> = positional
         .iter()
         .chain(kwonly.iter())
-        .map(|p| candidates_for(p))
+        .map(|p| candidates_for(p, domain))
+        .collect();
+    // A pathological domain (e.g. an empty `scalars` array with no `list_elements`) can admit
+    // no value at all; fall back to `Value::Null` rather than index an empty candidate list —
+    // this one vector may itself violate the domain, but an unsatisfiable domain has no
+    // in-domain vector to offer regardless.
+    let per: Vec<Vec<Candidate>> = per
+        .into_iter()
+        .map(|c| if c.is_empty() { vec![base(Value::Null)] } else { c })
         .collect();
 
     let to_input = |values: &[Value]| -> GenInput {
@@ -150,7 +165,14 @@ pub fn gen_inputs(sig: &EffectSignature, max_vectors: usize) -> Vec<GenInput> {
 /// `analyze::collect::hints`) — the union of the matching [`Rank::Hint`] corpora from
 /// `seeds::hint_candidates`. Stably sorted by rank so the parameter's [`Rank::Base`] candidate
 /// stays first.
-fn candidates_for(p: &ParamInfo) -> Vec<Candidate> {
+///
+/// When `domain` is given, every candidate from every source above is checked against
+/// [`ValueDomain::allows`] before it's returned — this is the one place all of a parameter's
+/// candidates converge, so filtering here covers shapes, guards, hints and defaults alike. If
+/// filtering empties the list (e.g. a `Dict`-shaped parameter under a scalars-only domain),
+/// [`ValueDomain::fallback_candidates`] fills it instead of leaving nothing for [`gen_inputs`]
+/// to sample.
+fn candidates_for(p: &ParamInfo, domain: Option<&ValueDomain>) -> Vec<Candidate> {
     let mut c = seeds::candidates(&generation_shape(p));
     // A defaulted parameter is likely Optional — exercise the None/default path.
     if p.has_default && !c.iter().any(|cand| cand.value.is_null()) {
@@ -175,6 +197,12 @@ fn candidates_for(p: &ParamInfo) -> Vec<Candidate> {
             if !c.iter().any(|cand| cand.value == value) {
                 c.push(Candidate { value, rank: Rank::Hint });
             }
+        }
+    }
+    if let Some(domain) = domain {
+        c.retain(|cand| domain.allows(&cand.value));
+        if c.is_empty() {
+            c = domain.fallback_candidates();
         }
     }
     c.sort_by_key(|cand| cand.rank);
@@ -226,14 +254,23 @@ fn property(value: Value) -> Candidate {
 /// per-kind measure (length, magnitude, member count); `value` itself is never returned.
 /// Containers additionally propose one candidate per element that is itself shrunk (holding
 /// container size fixed), so nested structure can shrink without dropping outer elements.
-pub fn shrink_candidates(value: &Value) -> Vec<Value> {
-    match value {
+///
+/// `domain`, when given, filters out any candidate [`ValueDomain::allows`] rejects — shrinking
+/// only ever makes a value structurally smaller (shorter, fewer elements, smaller magnitude) of
+/// the same kind, so an in-domain `value` almost always produces in-domain candidates already;
+/// this filter is the explicit guarantee, not a load-bearing narrowing.
+pub fn shrink_candidates(value: &Value, domain: Option<&ValueDomain>) -> Vec<Value> {
+    let raw = match value {
         Value::Null => Vec::new(),
         Value::Bool(_) => Vec::new(),
         Value::Number(n) => shrink_number(n),
         Value::String(s) => shrink_string(s),
-        Value::Array(items) => shrink_array(items),
-        Value::Object(map) => shrink_object(map),
+        Value::Array(items) => shrink_array(items, domain),
+        Value::Object(map) => shrink_object(map, domain),
+    };
+    match domain {
+        Some(d) => raw.into_iter().filter(|v| d.allows(v)).collect(),
+        None => raw,
     }
 }
 
@@ -281,7 +318,7 @@ fn tag_of(map: &Map<String, Value>) -> Option<&str> {
     map.get("__t__").and_then(Value::as_str)
 }
 
-fn shrink_array(items: &[Value]) -> Vec<Value> {
+fn shrink_array(items: &[Value], domain: Option<&ValueDomain>) -> Vec<Value> {
     if items.is_empty() {
         return Vec::new();
     }
@@ -291,7 +328,7 @@ fn shrink_array(items: &[Value]) -> Vec<Value> {
         out.push(Value::Array(items[..items.len() - 1].to_vec()));
     }
     for (i, item) in items.iter().enumerate() {
-        for shrunk in shrink_candidates(item) {
+        for shrunk in shrink_candidates(item, domain) {
             let mut variant = items.to_vec();
             variant[i] = shrunk;
             out.push(Value::Array(variant));
@@ -300,22 +337,22 @@ fn shrink_array(items: &[Value]) -> Vec<Value> {
     out
 }
 
-fn shrink_object(map: &Map<String, Value>) -> Vec<Value> {
+fn shrink_object(map: &Map<String, Value>, domain: Option<&ValueDomain>) -> Vec<Value> {
     match tag_of(map) {
-        Some("dict") | Some("set") => shrink_tagged_items(map),
+        Some("dict") | Some("set") => shrink_tagged_items(map, domain),
         Some(_) => Vec::new(),
-        None => shrink_plain_dict(map),
+        None => shrink_plain_dict(map, domain),
     }
 }
 
 /// Shrink a tagged `{"__t__": "dict"|"set", "items": [...]}` encoding by shrinking its `items`
 /// array (dropping/halving entries), preserving the tag.
-fn shrink_tagged_items(map: &Map<String, Value>) -> Vec<Value> {
+fn shrink_tagged_items(map: &Map<String, Value>, domain: Option<&ValueDomain>) -> Vec<Value> {
     let Some(Value::Array(items)) = map.get("items") else {
         return Vec::new();
     };
     let tag = map.get("__t__").cloned().unwrap_or(Value::Null);
-    shrink_array(items)
+    shrink_array(items, domain)
         .into_iter()
         .map(|shrunk_items| {
             let mut m = Map::new();
@@ -326,7 +363,7 @@ fn shrink_tagged_items(map: &Map<String, Value>) -> Vec<Value> {
         .collect()
 }
 
-fn shrink_plain_dict(map: &Map<String, Value>) -> Vec<Value> {
+fn shrink_plain_dict(map: &Map<String, Value>, domain: Option<&ValueDomain>) -> Vec<Value> {
     if map.is_empty() {
         return Vec::new();
     }
@@ -344,7 +381,7 @@ fn shrink_plain_dict(map: &Map<String, Value>) -> Vec<Value> {
         out.push(build(entries.len() - 1));
     }
     for (k, v) in &entries {
-        for shrunk in shrink_candidates(v) {
+        for shrunk in shrink_candidates(v, domain) {
             let mut variant = map.clone();
             variant.insert((*k).to_string(), shrunk);
             out.push(Value::Object(variant));

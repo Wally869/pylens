@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::exec::{CallResult, HarnessError, NsjailPool, Sandbox};
-use crate::generate::{GenInput, gen_inputs, keyword_only_params, positional_params};
+use crate::generate::{GenInput, ValueDomain, gen_inputs, keyword_only_params, positional_params};
 use crate::model::branch::OutcomeEvidence;
 use crate::model::{BranchKind, DefKind, EffectSignature, Import};
 use crate::shrink::shrink_case;
@@ -19,6 +19,15 @@ use crate::{analyze_source, imports_of};
 /// every case). Recording is sequential, so a single fork-server worker amortizes interpreter
 /// startup without idle jails; each request still runs in its own forked child.
 const POOL_SIZE: usize = 1;
+
+/// Generation settings threaded through the recording of one function or method: the
+/// `--inputs` budget and, when `--value-domain` restricts generation, the profile to enforce.
+/// Bundled to keep `function_cases`/`method_record`'s argument counts down.
+#[derive(Clone, Copy)]
+struct GenOptions<'a> {
+    max_inputs: usize,
+    domain: Option<&'a ValueDomain>,
+}
 
 /// External input tuples supplied via `--replay`: function name → list of positional-argument
 /// tuples, each tuple a `Vec<Value>` ready to hand to the sandbox as-is (no shape-directed
@@ -323,7 +332,7 @@ pub struct ModuleRecord {
 /// per-case setup errors.
 pub fn record_file(src: &str, max_inputs: usize) -> Result<ModuleRecord, String> {
     let sandbox = NsjailPool::new(POOL_SIZE)?;
-    record_with(&sandbox, src, max_inputs)
+    record_with(&sandbox, src, max_inputs, None)
 }
 
 /// Like [`record_file`], with externally supplied `--replay` input tuples executed in addition
@@ -334,14 +343,42 @@ pub fn record_file_with_replay(
     replay: &ReplayMap,
 ) -> Result<ModuleRecord, String> {
     let sandbox = NsjailPool::new(POOL_SIZE)?;
-    record_with_replay(&sandbox, src, max_inputs, replay)
+    record_with_replay(&sandbox, src, max_inputs, replay, None)
+}
+
+/// Like [`record_file`], with generation restricted to a `--value-domain` profile (see
+/// [`ValueDomain`]). `--replay` inputs bypass the filter — see [`record_file_with_options`].
+pub fn record_file_with_domain(
+    src: &str,
+    max_inputs: usize,
+    domain: Option<&ValueDomain>,
+) -> Result<ModuleRecord, String> {
+    let sandbox = NsjailPool::new(POOL_SIZE)?;
+    record_with(&sandbox, src, max_inputs, domain)
+}
+
+/// The general entry point combining `--replay` and `--value-domain`: replayed tuples are
+/// executed as-is (never filtered), generated ones are restricted to `domain` when given.
+pub fn record_file_with_options(
+    src: &str,
+    max_inputs: usize,
+    replay: &ReplayMap,
+    domain: Option<&ValueDomain>,
+) -> Result<ModuleRecord, String> {
+    let sandbox = NsjailPool::new(POOL_SIZE)?;
+    record_with_replay(&sandbox, src, max_inputs, replay, domain)
 }
 
 /// Record a whole file's functions against an already-provisioned sandbox. Lets a caller
 /// processing many files (see `project.rs`) share one jail pool instead of paying nsjail
 /// startup per file; behavior is otherwise identical to [`record_file`].
-pub fn record_with(sandbox: &dyn Sandbox, src: &str, max_inputs: usize) -> Result<ModuleRecord, String> {
-    record_with_replay(sandbox, src, max_inputs, &ReplayMap::new())
+pub fn record_with(
+    sandbox: &dyn Sandbox,
+    src: &str,
+    max_inputs: usize,
+    domain: Option<&ValueDomain>,
+) -> Result<ModuleRecord, String> {
+    record_with_replay(sandbox, src, max_inputs, &ReplayMap::new(), domain)
 }
 
 /// Like [`record_with`], with externally supplied `--replay` input tuples — see
@@ -351,10 +388,11 @@ pub fn record_with_replay(
     src: &str,
     max_inputs: usize,
     replay: &ReplayMap,
+    domain: Option<&ValueDomain>,
 ) -> Result<ModuleRecord, String> {
     let imports = imports_of(src).map_err(|e| e.to_string())?;
     let sigs = analyze_source(src).map_err(|e| e.to_string())?;
-    record_with_signatures_replay(sandbox, src, imports, sigs, max_inputs, replay)
+    record_with_signatures_replay(sandbox, src, imports, sigs, max_inputs, replay, domain)
 }
 
 /// Record a whole file's functions against an already-provisioned sandbox, using precomputed
@@ -370,8 +408,9 @@ pub fn record_with_signatures(
     imports: Vec<Import>,
     sigs: Vec<EffectSignature>,
     max_inputs: usize,
+    domain: Option<&ValueDomain>,
 ) -> Result<ModuleRecord, String> {
-    record_with_signatures_replay(sandbox, src, imports, sigs, max_inputs, &ReplayMap::new())
+    record_with_signatures_replay(sandbox, src, imports, sigs, max_inputs, &ReplayMap::new(), domain)
 }
 
 /// Like [`record_with_signatures`], with externally supplied `--replay` input tuples: each
@@ -386,6 +425,7 @@ pub fn record_with_signatures_replay(
     sigs: Vec<EffectSignature>,
     max_inputs: usize,
     replay: &ReplayMap,
+    domain: Option<&ValueDomain>,
 ) -> Result<ModuleRecord, String> {
     for name in replay.keys() {
         if !sigs.iter().any(|s| &s.name == name) {
@@ -421,13 +461,11 @@ pub fn record_with_signatures_replay(
             continue;
         }
         let replay_inputs: &[Vec<Value>] = replay.get(&sig.name).map(Vec::as_slice).unwrap_or(&[]);
+        let opts = GenOptions { max_inputs, domain };
         let (uncallable, cases) = match sig.kind {
-            DefKind::Function => (
-                None,
-                function_cases(sandbox, src, sig, max_inputs, replay_inputs)?,
-            ),
+            DefKind::Function => (None, function_cases(sandbox, src, sig, opts, replay_inputs)?),
             DefKind::Method => {
-                method_record(sandbox, src, sig, &sigs, max_inputs, &mut ctor_cache, replay_inputs)?
+                method_record(sandbox, src, sig, &sigs, opts, &mut ctor_cache, replay_inputs)?
             }
         };
         let coverage = if uncallable.is_some() {
@@ -509,15 +547,15 @@ fn function_cases(
     sandbox: &dyn Sandbox,
     src: &str,
     sig: &EffectSignature,
-    max_inputs: usize,
+    opts: GenOptions,
     replay_inputs: &[Vec<Value>],
 ) -> Result<Vec<Case>, String> {
     let mut cases = Vec::new();
-    for input in gen_inputs(sig, max_inputs) {
+    for input in gen_inputs(sig, opts.max_inputs, opts.domain) {
         let result = sandbox.call(src, &sig.name, &input.positional, &input.kwargs)?;
         let mut case = build_case(sig, &input, None, &result, CaseSource::Generated);
         if case.outcome == "raised" {
-            case.minimized = minimize_raised(&case, &input, |pos, kw| {
+            case.minimized = minimize_raised(&case, &input, opts.domain, |pos, kw| {
                 sandbox.call(src, &sig.name, pos, kw)
             })?;
         }
@@ -539,13 +577,14 @@ fn function_cases(
 fn minimize_raised(
     case: &Case,
     input: &GenInput,
+    domain: Option<&ValueDomain>,
     call: impl FnMut(&[Value], &[(String, Value)]) -> Result<CallResult, String>,
 ) -> Result<Option<MinimizedInput>, String> {
     let exc = case
         .raises
         .as_deref()
         .expect("a raised case always carries an exception type");
-    let shrunk = shrink_case(exc, &input.positional, &input.kwargs, call)?;
+    let shrunk = shrink_case(exc, &input.positional, &input.kwargs, domain, call)?;
     Ok(shrunk.map(|(pos, kw)| MinimizedInput {
         input: pos,
         kwargs: kw.into_iter().collect(),
@@ -560,7 +599,7 @@ fn method_record(
     src: &str,
     sig: &EffectSignature,
     all: &[EffectSignature],
-    max_inputs: usize,
+    opts: GenOptions,
     ctor_cache: &mut HashMap<String, Option<HarnessError>>,
     replay_inputs: &[Vec<Value>],
 ) -> Result<(Option<Uncallable>, Vec<Case>), String> {
@@ -568,7 +607,7 @@ fn method_record(
         .owner
         .as_deref()
         .ok_or_else(|| format!("method {:?} has no owning class", sig.name))?;
-    let ctor_args = constructor_args(all, class);
+    let ctor_args = constructor_args(all, class, opts.domain);
 
     if !ctor_cache.contains_key(class) {
         let probe = sandbox.probe_load(src, Some(class), Some(&ctor_args))?;
@@ -586,12 +625,12 @@ fn method_record(
     }
 
     let mut cases = Vec::new();
-    for input in gen_inputs(sig, max_inputs) {
+    for input in gen_inputs(sig, opts.max_inputs, opts.domain) {
         let result =
             sandbox.call_method(src, class, &ctor_args, &sig.name, &input.positional, &input.kwargs)?;
         let mut case = build_case(sig, &input, Some(ctor_args.clone()), &result, CaseSource::Generated);
         if case.outcome == "raised" {
-            case.minimized = minimize_raised(&case, &input, |pos, kw| {
+            case.minimized = minimize_raised(&case, &input, opts.domain, |pos, kw| {
                 sandbox.call_method(src, class, &ctor_args, &sig.name, pos, kw)
             })?;
         }
@@ -616,7 +655,7 @@ fn method_record(
 
 /// Constructor arguments for `class`: empty when `__init__` is absent or fully defaulted
 /// (so a no-arg receiver is valid), else the first generated vector's positional arguments.
-fn constructor_args(all: &[EffectSignature], class: &str) -> Vec<Value> {
+fn constructor_args(all: &[EffectSignature], class: &str, domain: Option<&ValueDomain>) -> Vec<Value> {
     let Some(init) = all
         .iter()
         .find(|s| s.name == "__init__" && s.owner.as_deref() == Some(class))
@@ -626,7 +665,7 @@ fn constructor_args(all: &[EffectSignature], class: &str) -> Vec<Value> {
     if init.params.iter().all(|p| p.has_default) {
         return Vec::new();
     }
-    gen_inputs(init, 1)
+    gen_inputs(init, 1, domain)
         .into_iter()
         .next()
         .map(|g| g.positional)

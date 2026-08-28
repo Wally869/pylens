@@ -2,10 +2,11 @@
 //! fall back to unsandboxed) when the sandbox isn't provisioned.
 
 use pylens::exec::{CallResult, Sandbox, probe};
+use pylens::generate::ValueDomain;
 use pylens::model::ReturnKind;
 use pylens::record::{
-    CaseSource, DepStatus, ReplayMap, parse_replay, record_file, record_file_with_replay,
-    record_with_signatures_replay,
+    CaseSource, DepStatus, ReplayMap, parse_replay, record_file, record_file_with_options,
+    record_file_with_replay, record_with_signatures_replay,
 };
 use pylens::{analyze_source, imports_of};
 use serde_json::{Value, json};
@@ -526,7 +527,7 @@ fn replay_unmatched_function_name_is_an_error() {
     let mut replay = ReplayMap::new();
     replay.insert("does_not_exist".to_string(), vec![vec![json!(1)]]);
 
-    let result = record_with_signatures_replay(&PanicSandbox, src, imports, sigs, 4, &replay);
+    let result = record_with_signatures_replay(&PanicSandbox, src, imports, sigs, 4, &replay, None);
     let err = result.err().expect("an unmatched replay function name must be an error");
     assert!(err.contains("does_not_exist"), "unexpected message: {err}");
 }
@@ -563,4 +564,40 @@ fn replay_input_executes_and_is_tagged_source_replay() {
         add.cases.iter().any(|c| c.source == CaseSource::Generated),
         "generated cases must still be present alongside the replayed one"
     );
+}
+
+#[test]
+fn value_domain_restricts_generated_cases_but_not_replay() {
+    if !ready("value_domain_restricts_generated_cases_but_not_replay") {
+        return;
+    }
+    let src = "def f(x):\n    return x\n";
+    let domain = ValueDomain::parse(r#"{"scalars": ["int"]}"#).expect("parse profile");
+    let mut replay = ReplayMap::new();
+    replay.insert("f".to_string(), vec![vec![json!("not an int")]]);
+
+    let rec = record_file_with_options(src, 8, &replay, Some(&domain)).expect("record");
+    let f = rec.functions.iter().find(|r| r.signature.name == "f").expect("f record");
+
+    let generated: Vec<_> = f.cases.iter().filter(|c| c.source == CaseSource::Generated).collect();
+    assert!(!generated.is_empty(), "the strict domain must not empty out generation entirely");
+    for case in &generated {
+        let x = case.input.first().expect("f takes one argument");
+        assert!(
+            x.as_i64().is_some() || x.as_u64().is_some(),
+            "every generated case must be an int under a scalars: [int] domain, got {x:?}"
+        );
+    }
+
+    let replay_case = f
+        .cases
+        .iter()
+        .find(|c| c.source == CaseSource::Replay)
+        .expect("expected a replayed case");
+    assert_eq!(
+        replay_case.input,
+        vec![json!("not an int")],
+        "replayed inputs must bypass the value-domain filter entirely"
+    );
+    assert_eq!(replay_case.outcome, "returned");
 }

@@ -5,7 +5,7 @@
 use serde_json::Value;
 
 use crate::exec::CallResult;
-use crate::generate::shrink_candidates;
+use crate::generate::{ValueDomain, shrink_candidates};
 
 /// Hard budget on extra jailed calls spent shrinking one failing case. Shrinking spends exactly
 /// one jailed call per candidate tried, so this caps the worst-case extra cost of minimizing a
@@ -25,10 +25,15 @@ type ShrunkArgs = (Vec<Value>, Vec<(String, Value)>);
 /// A resource-killed or otherwise-mismatched re-execution rejects the candidate — it is never
 /// treated as a new observation, only as "this candidate doesn't reproduce the same failure".
 /// Returns `None` if no candidate was ever accepted.
+///
+/// `domain`, when given, is the same profile that restricted the original generated input — see
+/// `pylens record --value-domain`. A minimized input must stay in-domain, so every shrink
+/// candidate is filtered through it (see [`shrink_candidates`]).
 pub fn shrink_case(
     original_exception: &str,
     positional: &[Value],
     kwargs: &[(String, Value)],
+    domain: Option<&ValueDomain>,
     mut call: impl FnMut(&[Value], &[(String, Value)]) -> Result<CallResult, String>,
 ) -> Result<Option<ShrunkArgs>, String> {
     let mut cur_pos = positional.to_vec();
@@ -37,10 +42,12 @@ pub fn shrink_case(
     let mut shrank = false;
 
     loop {
-        let pos_improved =
-            shrink_pass_positional(&mut cur_pos, &cur_kw, original_exception, &mut budget, &mut call)?;
-        let kw_improved =
-            shrink_pass_kwargs(&cur_pos, &mut cur_kw, original_exception, &mut budget, &mut call)?;
+        let pos_improved = shrink_pass_positional(
+            &mut cur_pos, &cur_kw, original_exception, domain, &mut budget, &mut call,
+        )?;
+        let kw_improved = shrink_pass_kwargs(
+            &cur_pos, &mut cur_kw, original_exception, domain, &mut budget, &mut call,
+        )?;
         let improved = pos_improved || kw_improved;
         shrank |= improved;
         if !improved || budget == 0 {
@@ -55,6 +62,7 @@ fn shrink_pass_positional(
     cur_pos: &mut [Value],
     cur_kw: &[(String, Value)],
     original_exception: &str,
+    domain: Option<&ValueDomain>,
     budget: &mut usize,
     call: &mut impl FnMut(&[Value], &[(String, Value)]) -> Result<CallResult, String>,
 ) -> Result<bool, String> {
@@ -63,7 +71,7 @@ fn shrink_pass_positional(
         if *budget == 0 {
             break;
         }
-        for cand in shrink_candidates(&cur_pos[i]) {
+        for cand in shrink_candidates(&cur_pos[i], domain) {
             if *budget == 0 {
                 break;
             }
@@ -84,6 +92,7 @@ fn shrink_pass_kwargs(
     cur_pos: &[Value],
     cur_kw: &mut [(String, Value)],
     original_exception: &str,
+    domain: Option<&ValueDomain>,
     budget: &mut usize,
     call: &mut impl FnMut(&[Value], &[(String, Value)]) -> Result<CallResult, String>,
 ) -> Result<bool, String> {
@@ -92,7 +101,7 @@ fn shrink_pass_kwargs(
         if *budget == 0 {
             break;
         }
-        for cand in shrink_candidates(&cur_kw[i].1) {
+        for cand in shrink_candidates(&cur_kw[i].1, domain) {
             if *budget == 0 {
                 break;
             }
