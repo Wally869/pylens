@@ -1,91 +1,64 @@
 # Status
 
-Tests: 236. `validate examples`: 0 hard defects, 33 soft, coverage 92/107 lines.
+Tests: 267. `validate examples`: 0 hard defects, 11 soft, coverage 90/107 lines.
 
-## Done in the last pass
+## Done in the last pass (2026-08-28/29 — the typing + test-pool readiness push)
 
-- Ranked input generation (Base, Guard, Hint, Edge, Property, Filler) with one-at-a-time
-  sampling. `--inputs` defaults to 12.
-- Property corpora (sorted, palindrome, all-equal, primes, float traps) and domain corpora
-  (URL, e-mail, path, JSON, date, numeric string, regular expression, HTML) driven by an
-  inferred `hints` tag per parameter.
-- Executed-line coverage from the jailed worker, reported per function and in the summaries.
-- `Shape::Instance`, with method and constructor resolution for same-module classes.
-- The standard-library effect table (`src/analyze/models.rs`).
-- Two soundness fixes: a parameter's inferred shape no longer narrows a raise may-set, and
-  `validate` now checks captured stderr.
-- Two worker fixes: non-finite floats no longer produce invalid JSON, and `sys.exit()` records
-  as a semantic raise instead of crashing the forked child.
-- The model table's return kind now feeds the Shapes pass (`models::return_kind`, queried
-  through `resolve_stdlib_return`, which shares `resolve_dotted` with `resolve_stdlib_call` so
-  both passes agree on which stdlib function a call refers to): `os.path.join(...)` and similar
-  calls now give the assigned local a `str`/`bool`/`int`/`float`/sequence shape instead of `any`.
-  Only entries whose return type is unambiguous across the whole raises/io group are modelled;
-  everything else stays `Any`.
-- Unbound superclass calls `Base.method(self, ...)` resolve when `Base` is a class declared in
-  the same module and the first positional argument is the caller's receiver (`calls.rs`, with
-  `positional_arg_roots_skip_first` for the argument mapping), AND across files in project mode
-  when `Base` is imported from a sibling project file and that file declares `Base` as a class
-  with `method` (`src/project/interproc.rs`'s `build_method_table` + `ResolvedReceiver::
-  CallerSelfSkipFirst`, driven by `ImportCallSite::unbound_receiver`). A builtin base
-  (`Exception`) still stays unresolved. On the stdlib corpus the same-module form converts 26
-  functions out of purity `unknown` (25 to `impure`, 1 to `pure`).
-- A parameter rebound to an unrelated value (`def f(x): x = []`) no longer reports the rebound
-  shape as its own declared/generated shape: the Shapes pass's name->shape env stays unfrozen
-  (a rebound name's post-rebind evidence is sound, exactly like any other local's), and
-  `ParamInfo::shape` alone is reset to `any` for a frozen parameter, in
-  `passes::effects::finalization::finish` (driven by `ModuleAnalysis::frozen_params`, which the
-  Shapes pass now returns alongside its env instead of baking the reset into it).
-  The env is flow-INSENSITIVE, though — one merged shape per name over the whole function body —
-  so resolving a call through that post-rebind evidence is only sound when the call is textually
-  guaranteed to run after the rebind. This is gated with a dominance check rather than a full CFG:
-  `ShapeState`/`FunctionFacts` each track the current statement's nesting depth and, for a
-  top-level (depth-0, directly-in-the-function-body) statement, its index in that top-level
-  sequence. A parameter's FIRST unrelated rebind only qualifies the name for the shortcut when
-  that rebind itself sits at depth 0 (`ModuleAnalysis::frozen_dominance`, name -> that rebind's
-  top-level index); a rebind nested inside ANY compound statement (`if`/`for`/`while`/`try`/
-  `with`/`match`) never qualifies — the name stays fully frozen for the whole function, because on
-  a loop's first iteration a later-looking use can run before that iteration's own rebind. For a
-  qualifying name, `FunctionFacts::env_shape` only returns the post-rebind evidence when the
-  current call site's own top-level index is STRICTLY GREATER than the rebind's — a later
-  top-level statement can never execute before an earlier one completes, so this needs no CFG.
-  Everywhere the gate isn't satisfied, `env_shape` returns `Shape::Any` (full width), matching the
-  original fully-frozen behavior exactly. Net effect: `def f(x): x = Box(); x.bump()` resolves
-  `bump()` (rebind at index 0, use at index 1 — dominated); `def f(x): x.bump(); x = Box();
-  x.bump()` resolves only the SECOND `bump()` (the first, textually before the rebind, keeps its
-  `call_method_unknown` acknowledgment — dropping it there was a soundness regression caught by
-  validate on `temp/probe_flow2.py` before this gate existed, since `f(3)` genuinely raises
-  `AttributeError` at that call and nothing acknowledged it); a rebind inside a loop body never
-  resolves at all. A self-referential rebind (`x = x.strip()`) still votes; locals are unaffected.
-- An aliased from-import resolves in the model table: `from os.path import join as j; j(a, b)`
-  now looks up `os.path.join`, not the miss `os.path.j`. `ModuleAnalysis::import_names` records
-  the original imported name next to the local alias binding; both `resolve_stdlib_call`
-  (Effects) and `resolve_stdlib_return` (Shapes) consult it before formatting the dotted lookup
-  key, so they stay in agreement.
-- An `import`/`from ... import ...` statement inside a function body now adds `ImportError` and
-  `ModuleNotFoundError` to the function's implicit raise may-set (a module-level import still
-  doesn't — it fails the whole module at load time, handled as uncallable). Closes the
-  `lazy_deps.py` soft-defect class; corpus soft defects dropped 44 -> 33 (0 hard, unchanged).
+Plan and bench artifacts: `temp/TYPING_TESTGEN_PLAN.md`, `temp/bench/` (500-function
+clir-corpus pilot: exporter, driver, per-function results).
 
-## Measurement note — the acknowledgment counts are no longer comparable
+- **Replay mode** — `record --replay <cases.json>` executes external input tuples through the
+  sandbox (`source: "replay"`, never shrunk). External inputs can now refute inferred types.
+- **Branch accounting** — the worker traces line arcs; `collect/branches.rs` enumerates every
+  branch point; records carry `branches`/`branch_coverage` with each outcome `covered`,
+  `uncovered` (with a `reason`), or `unobservable_line_granularity`. Closed accounting, no
+  silent gaps.
+- **`--cover-branches`** — predicate-targeted synthesis (`generate/predicate.rs`,
+  `record/cover.rs`): uncovered outcomes drive satisfying/violating inputs in a loop under the
+  `--inputs` total budget.
+- **`--value-domain`** — declarative restriction of generated and shrunk values.
+- **`--stability-runs N`** — drops nondeterministic cases (exact structural comparison — a
+  float-tolerant comparison swallowed `time_ns` jitter and was fixed); closed `dropped_cases`
+  count; coverage computed from survivors.
+- **Honesty flags** — `observable` on io claims, `validated: false` + summary count for
+  never-executed functions, `output_type_coverage: full|partial` with `unobserved_returns`.
+- **Precision batch** — aliased from-imports resolve in the model table; the rebind freeze is
+  flow-sensitive behind a top-level statement-order dominance gate (a pre-rebind call resolving
+  through the post-rebind shape was caught as hard defects by `temp/probe_flow2.py` and gated);
+  cross-file superclass resolution in project mode; in-body imports predict
+  `ImportError`/`ModuleNotFoundError`.
+- **Bench-driven implicit-raise rules** (500-function corpus pilot, hard defects 374 → 44,
+  every survivor a corpus export artifact): attribute loads predict `AttributeError` unless
+  proven (class-level name, method name, or `__init__` self-assignment; parameters never
+  proven); a builtin raise table (`analyze/builtin_raises.rs`); tuple-unpack `ValueError`;
+  iteration-protocol `TypeError`; negative-shift `ValueError`; argument-contract `TypeError`
+  on readonly method calls.
+- **Typing accuracy** — sequence-protocol evidence votes `union(seq, str)` for parameters
+  (locals and list-specific evidence keep `seq`); declared annotations rank generation
+  candidates first without narrowing inference.
 
-Interprocedural propagation inherits a callee's `unresolved_effects` into every caller. A
-change that resolves more calls therefore *raises* the flat site counts: one removed
-acknowledgment at the call site pulls in all of the callee's own acknowledgments, once per
-caller. After this pass the counts are `call_method_unknown` 16265, `call_unknown_callee`
-10168, `call_import` 9876 (baseline at the previous commit, same corpus and script: 16202,
-10088, 9742). Use the purity distribution as the precision gauge instead: `unknown` 8246
-(64.9%, was 8272 / 65.1%), `pure` 3238, `impure` 1221, over 12705 functions.
-`temp/remeasure.py` reproduces both tables.
+## Pilot results (500 clir functions, before → after the fixes)
+
+- Soundness: 374 hard defects → 44, all 44 `NameError` from truncated corpus exports.
+- Typing refutation by external inputs: 54.4% → 5.3% of checked values.
+- Branch outcomes covered: 76.9% → 80.6% observable (residual: 290 `no_synthesizer`).
+- Trivial-solver rejection: 75.5% → **89.1%** (the clir suites themselves: 77.4%).
+- Coverage dominance: pool ≥ clir suite on 362/371 functions.
+- Determinism: 0 unstable cases. Oracle census: 199 CLIR-interp-vs-CPython disagreements in
+  27 functions (a clir-side finding). Runtime: median 1.3 s/function over 3 invocations,
+  0.3 s/function wall at 6 workers.
 
 ## Open work
 
-None currently tracked here. The three items from the previous pass (flow-insensitive rebind
-freeze, aliased from-import missing the model table, same-module-only superclass resolution) are
-folded into "Done in the last pass" above.
+1. **Performance pass before any full-corpus run** (task T8b): extend `--replay` to project
+   mode, single-invocation pipeline, per-function wall budget. Corpus projection today: ~9 h
+   at 6 workers for 103k functions.
+2. Same-line constructs (`ternary`, boolops, inline `if`) stay `unobservable_line_granularity`;
+   upgrading observation needs finer-than-line tracing.
+3. The full 103k corpus run and the `SCHEMA_VERSION` 1.0 freeze — pending the user's GO.
 
 ## Measurements to repeat after a change
 
-`temp/callee_freq.md` holds the method and the baselines: the callee histogram, the purity
-distribution, and the counts for each unresolved reason over the standard library. Repeat them
-after any change to the analyzer that is intended to move precision.
+`temp/callee_freq.md` holds the stdlib method and baselines; `temp/bench/run_pilot.py` re-runs
+the 500-function corpus pilot (gates G1–G8). Repeat the pilot after any analyzer change that
+moves precision or soundness.
