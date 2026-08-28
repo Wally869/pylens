@@ -5,7 +5,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::exec::Sandbox;
+use crate::exec::{CallInput, Sandbox};
 use crate::generate::GenInput;
 use crate::model::EffectSignature;
 
@@ -50,6 +50,12 @@ pub(super) fn stabilize_cases(
 ) -> Result<(Vec<Case>, DroppedCases), String> {
     let mut kept = Vec::with_capacity(cases.len());
     let mut dropped = DroppedCases::default();
+    // Whether a case's re-runs have started is decided ONCE, up front, in original iteration
+    // order — exactly as the pre-batching per-case loop did (it never rechecked the deadline
+    // once a case's own `for _ in 1..runs` loop had begun). Round-batching below then runs
+    // every "started" case through every remaining round together, so this single up-front
+    // decision reproduces the old timing behavior instead of only approximating it.
+    let mut alive: Vec<Case> = Vec::with_capacity(cases.len());
     for case in cases {
         if case.outcome == "error" {
             dropped.resource += 1;
@@ -59,32 +65,47 @@ pub(super) fn stabilize_cases(
             kept.push(case);
             continue;
         }
-        let kwargs: Vec<(String, Value)> = case.kwargs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        let gen_input = GenInput { positional: case.input.clone(), kwargs: kwargs.clone() };
-        let mut stable = true;
-        for _ in 1..runs {
-            let result = match &case.ctor_args {
-                Some(ctor_args) => {
-                    let class = sig
-                        .owner
-                        .as_deref()
-                        .ok_or_else(|| format!("method {:?} has no owning class", sig.name))?;
-                    sandbox.call_method(src, class, ctor_args, &sig.name, &case.input, &kwargs)?
-                }
-                None => sandbox.call(src, &sig.name, &case.input, &kwargs)?,
-            };
-            let rerun = build_case(sig, &gen_input, case.ctor_args.clone(), &result, case.source);
-            if !cases_agree(&case, &rerun) {
-                stable = false;
-                break;
+        alive.push(case);
+    }
+
+    for _ in 1..runs {
+        if alive.is_empty() {
+            break;
+        }
+        let kwargs_owned: Vec<Vec<(String, Value)>> = alive
+            .iter()
+            .map(|c| c.kwargs.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .collect();
+        let call_inputs: Vec<CallInput> = alive
+            .iter()
+            .zip(&kwargs_owned)
+            .map(|(c, kw)| (c.input.as_slice(), kw.as_slice()))
+            .collect();
+        let ctor_args_for_batch = alive[0].ctor_args.clone();
+        let results = match &ctor_args_for_batch {
+            Some(ctor_args) => {
+                let class = sig
+                    .owner
+                    .as_deref()
+                    .ok_or_else(|| format!("method {:?} has no owning class", sig.name))?;
+                sandbox.call_batch(src, &sig.name, &call_inputs, Some(class), Some(ctor_args))?
+            }
+            None => sandbox.call_batch(src, &sig.name, &call_inputs, None, None)?,
+        };
+
+        let mut next_alive = Vec::with_capacity(alive.len());
+        for ((case, kwargs), result) in alive.into_iter().zip(kwargs_owned).zip(&results) {
+            let gen_input = GenInput { positional: case.input.clone(), kwargs };
+            let rerun = build_case(sig, &gen_input, case.ctor_args.clone(), result, case.source);
+            if cases_agree(&case, &rerun) {
+                next_alive.push(case);
+            } else {
+                dropped.unstable += 1;
             }
         }
-        if stable {
-            kept.push(case);
-        } else {
-            dropped.unstable += 1;
-        }
+        alive = next_alive;
     }
+    kept.extend(alive);
     Ok((kept, dropped))
 }
 

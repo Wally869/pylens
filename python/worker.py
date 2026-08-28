@@ -326,19 +326,22 @@ def oneshot():
     sys.stdout.write(json.dumps(run_request(req), allow_nan=False))
 
 
-def _handle_in_child(line, timeout):
-    """Fork a child to run one request; return its response bytes, or None on timeout.
+def _handle_in_child(req, timeout):
+    """Fork a child to run one prepared request dict; return its response bytes, or None on
+    timeout.
 
     Isolates untrusted state (the child inherits imports but its mutations die with it) and
     bounds each request independently — necessary because the --serve process is long-lived,
-    so the jail's wall time_limit cannot bound individual calls.
+    so the jail's wall time_limit cannot bound individual calls. Takes an already-parsed
+    request dict (not a raw line) so both a single request and each item of a `batch` request
+    can share this isolation/timeout machinery.
     """
     r, w = os.pipe()
     pid = os.fork()
     if pid == 0:  # child: run the untrusted request, write the response, never return
         os.close(r)
         try:
-            resp = run_request(json.loads(line))
+            resp = run_request(req)
         except Exception as e:
             resp = base_response()
             resp["error"] = exc_error("harness", e)
@@ -374,27 +377,88 @@ def _handle_in_child(line, timeout):
     return None if timed_out else b"".join(chunks)
 
 
+def _timeout_response(timeout):
+    # Wall-time exceeded: as much a resource kill as MemoryError/RecursionError, so it gets the
+    # same `stage="resource"` category (kind distinguishes the specific cause).
+    resp = base_response()
+    resp["error"] = make_error("resource", "timeout", f"request exceeded {timeout}s")
+    return resp
+
+
+def _no_output_response():
+    # The child produced nothing at all — most likely SIGKILLed by an rlimit (CPU/mem) or
+    # crashed outright. Either way this is a harness-side failure, never a semantic result, so
+    # it stays on the `error` channel (never `exception`).
+    resp = base_response()
+    resp["error"] = make_error("harness", "no_output", "child produced no output")
+    return resp
+
+
+def _run_one(req, timeout):
+    """Run one prepared request dict in a forked child; return the parsed response dict."""
+    out = _handle_in_child(req, timeout)
+    if out is None:
+        return _timeout_response(timeout)
+    if not out:
+        return _no_output_response()
+    try:
+        return json.loads(out)
+    except ValueError:
+        # A child killed mid-write (rlimit SIGKILL) leaves truncated JSON. That must fail this
+        # one item on the error channel, never crash the whole serve loop.
+        resp = base_response()
+        resp["error"] = make_error("harness", "partial_output", "child output was truncated")
+        return resp
+
+
+def _run_one_bytes(req, timeout):
+    """Run one prepared request dict in a forked child; return the raw response bytes, so a
+    single unbatched request's output never pays a parse/re-serialize round trip."""
+    out = _handle_in_child(req, timeout)
+    if out is None:
+        return json.dumps(_timeout_response(timeout), allow_nan=False).encode()
+    if not out:
+        return json.dumps(_no_output_response(), allow_nan=False).encode()
+    return out
+
+
 def serve():
-    """Fork-server loop: one forked child per newline-delimited request."""
+    """Fork-server loop: newline-delimited requests, one forked child per item.
+
+    A request may carry a `batch` field instead of `args`/`kwargs`:
+    `{"source":..., "fn":..., "class":..., "ctor_args":..., "batch": [{"args":[...],
+    "kwargs":{...}}, ...]}`. Each batch item is forked and timed exactly like a standalone
+    request (sequentially, one child at a time), and the whole batch gets ONE
+    newline-delimited response: `{"results": [<normal response>, ...]}`. A timed-out item
+    kills only its own child; the remaining items in the batch still run. Unbatched requests
+    (validate, probes, one-shot mode) are untouched and keep byte-identical output.
+    """
     timeout = float(os.environ.get("PYLENS_CALL_TIMEOUT", "10"))
     for raw in sys.stdin.buffer:
         line = raw.strip()
         if not line:
             continue
-        out = _handle_in_child(line, timeout)
-        if out is None:
-            # Wall-time exceeded: as much a resource kill as MemoryError/RecursionError, so it
-            # gets the same `stage="resource"` category (kind distinguishes the specific cause).
+        try:
+            req = json.loads(line)
+        except Exception as e:
             resp = base_response()
-            resp["error"] = make_error("resource", "timeout", f"request exceeded {timeout}s")
-            out = json.dumps(resp, allow_nan=False).encode()
-        elif not out:
-            # The child produced nothing at all — most likely SIGKILLed by an rlimit (CPU/mem)
-            # or crashed outright. Either way this is a harness-side failure, never a semantic
-            # result, so it stays on the `error` channel (never `exception`).
-            resp = base_response()
-            resp["error"] = make_error("harness", "no_output", "child produced no output")
-            out = json.dumps(resp, allow_nan=False).encode()
+            resp["error"] = make_error("bad_request", type(e).__name__, str(e))
+            sys.stdout.buffer.write(json.dumps(resp, allow_nan=False).encode() + b"\n")
+            sys.stdout.buffer.flush()
+            continue
+
+        batch = req.get("batch") if isinstance(req, dict) else None
+        if batch is not None:
+            base = {k: v for k, v in req.items() if k != "batch"}
+            results = []
+            for item in batch:
+                item_req = dict(base)
+                item_req["args"] = item.get("args", [])
+                item_req["kwargs"] = item.get("kwargs", {})
+                results.append(_run_one(item_req, timeout))
+            out = json.dumps({"results": results}, allow_nan=False).encode()
+        else:
+            out = _run_one_bytes(req, timeout)
         sys.stdout.buffer.write(out + b"\n")
         sys.stdout.buffer.flush()
 

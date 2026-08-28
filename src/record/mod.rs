@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::exec::{CallResult, HarnessError, NsjailPool, Sandbox};
+use crate::exec::{CallInput, CallResult, HarnessError, NsjailPool, Sandbox};
 use crate::generate::{GenInput, ValueDomain, gen_inputs};
 use crate::model::{DefKind, EffectSignature, Import};
 use crate::shrink::shrink_case;
@@ -30,6 +30,16 @@ use case::{build_case, coverage_for, io_observability, output_type_coverage_for}
 /// every case). Recording is sequential, so a single fork-server worker amortizes interpreter
 /// startup without idle jails; each request still runs in its own forked child.
 const POOL_SIZE: usize = 1;
+
+/// The chunk size for a batched round of generated-case execution. Keeping batches this small
+/// (rather than one giant batch of `max_inputs`) keeps `--time-budget`'s deadline check —
+/// evaluated once per dispatched batch, not once per case — close to the old per-case
+/// granularity, instead of only checking it once per function.
+const BATCH_SIZE: usize = 6;
+
+/// An empty, reusable kwargs slice for a batched call whose items carry no keyword arguments
+/// (e.g. `--replay` tuples, which are positional-only).
+const EMPTY_KWARGS: &[(String, Value)] = &[];
 
 /// Bundles `--value-domain`, `--cover-branches`, `--stability-runs`, and `--time-budget` for
 /// [`record_with_signatures`] — keeps its argument count down alongside
@@ -346,26 +356,39 @@ fn function_cases(
     replay_inputs: &[Vec<Value>],
 ) -> Result<(Vec<Case>, cover::CoverContext), String> {
     let mut cases = Vec::new();
-    for input in gen_inputs(sig, opts.max_inputs, opts.domain) {
+    let inputs = gen_inputs(sig, opts.max_inputs, opts.domain);
+    for chunk in inputs.chunks(BATCH_SIZE) {
         if deadline_passed(opts.deadline) {
             break;
         }
-        let result = sandbox.call(src, &sig.name, &input.positional, &input.kwargs)?;
-        let mut case = build_case(sig, &input, None, &result, CaseSource::Generated);
-        if case.outcome == "raised" {
-            case.minimized = minimize_raised(&case, &input, opts.domain, |pos, kw| {
-                sandbox.call(src, &sig.name, pos, kw)
-            })?;
+        let call_inputs: Vec<CallInput> = chunk
+            .iter()
+            .map(|input| (input.positional.as_slice(), input.kwargs.as_slice()))
+            .collect();
+        let results = sandbox.call_batch(src, &sig.name, &call_inputs, None, None)?;
+        for (input, result) in chunk.iter().zip(&results) {
+            let mut case = build_case(sig, input, None, result, CaseSource::Generated);
+            if case.outcome == "raised" {
+                case.minimized = minimize_raised(&case, input, opts.domain, |pos, kw| {
+                    sandbox.call(src, &sig.name, pos, kw)
+                })?;
+            }
+            cases.push(case);
         }
-        cases.push(case);
     }
-    for tuple in replay_inputs {
-        let result = sandbox.call(src, &sig.name, tuple, &[])?;
-        let input = GenInput {
-            positional: tuple.clone(),
-            kwargs: Vec::new(),
-        };
-        cases.push(build_case(sig, &input, None, &result, CaseSource::Replay));
+    if !replay_inputs.is_empty() {
+        let call_inputs: Vec<CallInput> = replay_inputs
+            .iter()
+            .map(|tuple| (tuple.as_slice(), EMPTY_KWARGS))
+            .collect();
+        let results = sandbox.call_batch(src, &sig.name, &call_inputs, None, None)?;
+        for (tuple, result) in replay_inputs.iter().zip(&results) {
+            let input = GenInput {
+                positional: tuple.clone(),
+                kwargs: Vec::new(),
+            };
+            cases.push(build_case(sig, &input, None, result, CaseSource::Replay));
+        }
     }
     let ctx = cover::run_loop(sandbox, src, sig, cover::CallTarget::Function, opts, &mut cases)?;
     Ok((cases, ctx))
@@ -425,33 +448,47 @@ fn method_record(
     }
 
     let mut cases = Vec::new();
-    for input in gen_inputs(sig, opts.max_inputs, opts.domain) {
+    let inputs = gen_inputs(sig, opts.max_inputs, opts.domain);
+    for chunk in inputs.chunks(BATCH_SIZE) {
         if deadline_passed(opts.deadline) {
             break;
         }
-        let result =
-            sandbox.call_method(src, class, &ctor_args, &sig.name, &input.positional, &input.kwargs)?;
-        let mut case = build_case(sig, &input, Some(ctor_args.clone()), &result, CaseSource::Generated);
-        if case.outcome == "raised" {
-            case.minimized = minimize_raised(&case, &input, opts.domain, |pos, kw| {
-                sandbox.call_method(src, class, &ctor_args, &sig.name, pos, kw)
-            })?;
+        let call_inputs: Vec<CallInput> = chunk
+            .iter()
+            .map(|input| (input.positional.as_slice(), input.kwargs.as_slice()))
+            .collect();
+        let results =
+            sandbox.call_batch(src, &sig.name, &call_inputs, Some(class), Some(&ctor_args))?;
+        for (input, result) in chunk.iter().zip(&results) {
+            let mut case = build_case(sig, input, Some(ctor_args.clone()), result, CaseSource::Generated);
+            if case.outcome == "raised" {
+                case.minimized = minimize_raised(&case, input, opts.domain, |pos, kw| {
+                    sandbox.call_method(src, class, &ctor_args, &sig.name, pos, kw)
+                })?;
+            }
+            cases.push(case);
         }
-        cases.push(case);
     }
-    for tuple in replay_inputs {
-        let result = sandbox.call_method(src, class, &ctor_args, &sig.name, tuple, &[])?;
-        let input = GenInput {
-            positional: tuple.clone(),
-            kwargs: Vec::new(),
-        };
-        cases.push(build_case(
-            sig,
-            &input,
-            Some(ctor_args.clone()),
-            &result,
-            CaseSource::Replay,
-        ));
+    if !replay_inputs.is_empty() {
+        let call_inputs: Vec<CallInput> = replay_inputs
+            .iter()
+            .map(|tuple| (tuple.as_slice(), EMPTY_KWARGS))
+            .collect();
+        let results =
+            sandbox.call_batch(src, &sig.name, &call_inputs, Some(class), Some(&ctor_args))?;
+        for (tuple, result) in replay_inputs.iter().zip(&results) {
+            let input = GenInput {
+                positional: tuple.clone(),
+                kwargs: Vec::new(),
+            };
+            cases.push(build_case(
+                sig,
+                &input,
+                Some(ctor_args.clone()),
+                result,
+                CaseSource::Replay,
+            ));
+        }
     }
     let ctx = cover::run_loop(
         sandbox,

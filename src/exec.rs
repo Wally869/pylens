@@ -45,6 +45,36 @@ struct Request<'a> {
     ctor_args: Option<&'a [Value]>,
 }
 
+/// One item of a batched request: positional and keyword-only arguments for a single call
+/// sharing the batch's `source`/`fn`/`class`/`ctor_args`.
+#[derive(Serialize)]
+struct BatchItem<'a> {
+    args: &'a [Value],
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    kwargs: Map<String, Value>,
+}
+
+/// A batched request: many calls to the same `fn` (or method), sharing one `source` and one
+/// `class`/`ctor_args`, sent (and answered) in a single round trip. See `worker.py`'s `serve`
+/// docstring for the wire shape and response envelope (`{"results": [...]}`).
+#[derive(Serialize)]
+struct BatchRequest<'a> {
+    source: &'a str,
+    #[serde(rename = "fn")]
+    fn_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    class: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ctor_args: Option<&'a [Value]>,
+    batch: Vec<BatchItem<'a>>,
+}
+
+/// The wire shape of a batched response: one [`CallResult`] per batch item, in the same order.
+#[derive(Deserialize)]
+struct BatchResponse {
+    results: Vec<CallResult>,
+}
+
 /// A raised exception observed at runtime.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Exc {
@@ -125,6 +155,10 @@ pub struct CallResult {
     pub arcs: Vec<(u32, u32)>,
 }
 
+/// One `(positional args, keyword-only args)` pair for a batched call — see
+/// [`Sandbox::call_batch`].
+pub type CallInput<'a> = (&'a [Value], &'a [(String, Value)]);
+
 /// A jailed Python execution → observed effects. Implementors provide [`Sandbox::transport`]
 /// (send one encoded request, get the result); `call` / `call_method` are built on top.
 pub trait Sandbox {
@@ -170,6 +204,29 @@ pub trait Sandbox {
         let body = encode_request(source, None, &[], &[], class, ctor_args)?;
         self.transport(&body)
     }
+
+    /// Execute every `(args, kwargs)` pair in `inputs` against the same `fn_name` (and, if
+    /// `class` is given, the same receiver built from `ctor_args`), returning one [`CallResult`]
+    /// per input in order. The default implementation just loops over [`Sandbox::call`] /
+    /// [`Sandbox::call_method`] — one round trip per input, as before — so [`Nsjail`] and any
+    /// test double keep working unchanged. [`NsjailPool`] overrides this with a single batched
+    /// round trip, amortizing the per-request IPC cost across the whole batch.
+    fn call_batch(
+        &self,
+        source: &str,
+        fn_name: &str,
+        inputs: &[CallInput],
+        class: Option<&str>,
+        ctor_args: Option<&[Value]>,
+    ) -> Result<Vec<CallResult>, String> {
+        inputs
+            .iter()
+            .map(|(args, kwargs)| match class {
+                Some(c) => self.call_method(source, c, ctor_args.unwrap_or(&[]), fn_name, args, kwargs),
+                None => self.call(source, fn_name, args, kwargs),
+            })
+            .collect()
+    }
 }
 
 fn encode_request(
@@ -198,6 +255,47 @@ fn parse_response(bytes: &[u8]) -> Result<CallResult, String> {
             String::from_utf8_lossy(bytes)
         )
     })
+}
+
+fn encode_batch_request(
+    source: &str,
+    fn_name: &str,
+    inputs: &[CallInput],
+    class: Option<&str>,
+    ctor_args: Option<&[Value]>,
+) -> Result<Vec<u8>, String> {
+    let req = BatchRequest {
+        source,
+        fn_name,
+        class,
+        ctor_args,
+        batch: inputs
+            .iter()
+            .map(|(args, kwargs)| BatchItem {
+                args,
+                kwargs: kwargs.iter().cloned().collect(),
+            })
+            .collect(),
+    };
+    serde_json::to_vec(&req).map_err(|e| e.to_string())
+}
+
+/// Parse a batched response, requiring `results.len() == expected_len` — a mismatch is an
+/// error, never silently truncated or padded.
+fn parse_batch_response(bytes: &[u8], expected_len: usize) -> Result<Vec<CallResult>, String> {
+    let resp: BatchResponse = serde_json::from_slice(bytes).map_err(|e| {
+        format!(
+            "bad worker batch output: {e}\n{}",
+            String::from_utf8_lossy(bytes)
+        )
+    })?;
+    if resp.results.len() != expected_len {
+        return Err(format!(
+            "worker batch mismatch: sent {expected_len} item(s), got {} result(s)",
+            resp.results.len()
+        ));
+    }
+    Ok(resp.results)
 }
 
 /// The in-distro shell script that launches the jailed worker. `$HOME` is expanded by the
@@ -359,6 +457,20 @@ impl ServeWorker {
         }
         parse_response(line.trim_end().as_bytes())
     }
+
+    /// Send one batched request, read one newline-delimited `{"results": [...]}` response.
+    fn exchange_batch(&mut self, body: &[u8], expected_len: usize) -> Result<Vec<CallResult>, String> {
+        self.stdin.write_all(body).map_err(|e| e.to_string())?;
+        self.stdin.write_all(b"\n").map_err(|e| e.to_string())?;
+        self.stdin.flush().map_err(|e| e.to_string())?;
+
+        let mut line = String::new();
+        let n = self.stdout.read_line(&mut line).map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("serve worker closed its output".to_string());
+        }
+        parse_batch_response(line.trim_end().as_bytes(), expected_len)
+    }
 }
 
 impl Drop for ServeWorker {
@@ -408,12 +520,13 @@ impl NsjailPool {
         drop(idle);
         self.available.notify_one();
     }
-}
 
-impl Sandbox for NsjailPool {
-    fn transport(&self, body: &[u8]) -> Result<CallResult, String> {
+    /// Acquire a worker, run `f` against it, and either return it to the pool (on success) or
+    /// drop it and spawn a replacement (on failure) — the shared recovery logic behind both
+    /// [`Sandbox::transport`] and [`Sandbox::call_batch`] for [`NsjailPool`].
+    fn with_worker<T>(&self, f: impl FnOnce(&mut ServeWorker) -> Result<T, String>) -> Result<T, String> {
         let mut worker = self.acquire();
-        match worker.exchange(body) {
+        match f(&mut worker) {
             Ok(result) => {
                 self.release(worker);
                 Ok(result)
@@ -436,9 +549,92 @@ impl Sandbox for NsjailPool {
     }
 }
 
+impl Sandbox for NsjailPool {
+    fn transport(&self, body: &[u8]) -> Result<CallResult, String> {
+        self.with_worker(|w| w.exchange(body))
+    }
+
+    fn call_batch(
+        &self,
+        source: &str,
+        fn_name: &str,
+        inputs: &[CallInput],
+        class: Option<&str>,
+        ctor_args: Option<&[Value]>,
+    ) -> Result<Vec<CallResult>, String> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body = encode_batch_request(source, fn_name, inputs, class, ctor_args)?;
+        let expected_len = inputs.len();
+        self.with_worker(|w| w.exchange_batch(&body, expected_len))
+    }
+}
+
 impl NsjailPool {
     /// The configured pool size.
     pub fn size(&self) -> usize {
         self.size
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn batch_request_encodes_one_item_per_input() {
+        let args_a = [json!(1), json!(2)];
+        let args_b = [json!(3)];
+        let kwargs_b = [("flag".to_string(), json!(true))];
+        let inputs: [CallInput; 2] = [(&args_a, &[]), (&args_b, &kwargs_b)];
+        let body = encode_batch_request("SRC", "f", &inputs, None, None).unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(value["source"], json!("SRC"));
+        assert_eq!(value["fn"], json!("f"));
+        assert!(value.get("class").is_none());
+        assert!(value.get("ctor_args").is_none());
+        let batch = value["batch"].as_array().unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0]["args"], json!([1, 2]));
+        assert!(batch[0].get("kwargs").is_none());
+        assert_eq!(batch[1]["args"], json!([3]));
+        assert_eq!(batch[1]["kwargs"], json!({"flag": true}));
+    }
+
+    #[test]
+    fn batch_request_carries_class_and_ctor_args() {
+        let args = [json!(1)];
+        let ctor_args = [json!("x")];
+        let inputs: [CallInput; 1] = [(&args, &[])];
+        let body = encode_batch_request("SRC", "m", &inputs, Some("Widget"), Some(&ctor_args)).unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(value["class"], json!("Widget"));
+        assert_eq!(value["ctor_args"], json!(["x"]));
+    }
+
+    #[test]
+    fn batch_response_parses_results_in_order() {
+        let body = br#"{"results": [{"ok": true, "return": 1, "args_post": null,
+            "kwargs_post": null, "exception": null, "return_aliases_arg": null, "error": null,
+            "lines": [], "arcs": []}, {"ok": false, "return": null, "args_post": null,
+            "kwargs_post": null, "exception": null, "return_aliases_arg": null,
+            "error": {"stage": "resource", "kind": "timeout", "message": "x"}, "lines": [],
+            "arcs": []}]}"#;
+        let results = parse_batch_response(body, 2).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].ok);
+        assert!(!results[1].ok);
+        assert_eq!(results[1].error.as_ref().unwrap().stage, "resource");
+    }
+
+    #[test]
+    fn batch_response_length_mismatch_is_an_error() {
+        let body = br#"{"results": []}"#;
+        let err = parse_batch_response(body, 2).unwrap_err();
+        assert!(err.contains("mismatch"), "unexpected error: {err}");
     }
 }
