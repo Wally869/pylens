@@ -216,6 +216,12 @@ def run_request(req, ns=None):
         resp["error"] = make_error("bad_request", type(e).__name__, str(e))
         return resp
 
+    # Stage timing, requested per call (`"timing": true`): exact perf_counter_ns spans per
+    # stage, attached as `resp["timings"]` (µs). The Rust client ignores unknown fields, so
+    # production output is unaffected; only the successful-call path is stamped.
+    timing = bool(req.get("timing"))
+    tm = {}
+
     # Load/ctor probe: exec the module, optionally build the receiver, report load status.
     if fn_name is None:
         try:
@@ -240,9 +246,15 @@ def run_request(req, ns=None):
     receiver = None
     try:
         if ns is None:
+            t0 = time.perf_counter_ns()
             ns = _load_module(source)
+            if timing:
+                tm["module_exec_us"] = (time.perf_counter_ns() - t0) // 1000
+        t0 = time.perf_counter_ns()
         args = [deserialize(a) for a in args_in]
         kwargs = {k: deserialize(v) for k, v in kwargs_in.items()}
+        if timing:
+            tm["deser_us"] = (time.perf_counter_ns() - t0) // 1000
         if class_name is not None:
             cls = ns.get(class_name)
             if cls is None:
@@ -265,8 +277,12 @@ def run_request(req, ns=None):
 
     # Snapshot the arguments in the SAME tagged encoding used for args_post, so mutation
     # detection compares like-with-like (not the raw plain-JSON input against tagged output).
+    t0 = time.perf_counter_ns()
     resp["args_pre"] = [serialize(a) for a in args]
     resp["kwargs_pre"] = {k: serialize(v) for k, v in kwargs.items()}
+    if timing:
+        tm["pre_ser_us"] = (time.perf_counter_ns() - t0) // 1000
+    t_call = time.perf_counter_ns()
 
     # Capture the function's stdout/stderr on SEPARATE buffers so they can't corrupt the JSON
     # protocol channel and so each is recorded as the channel it actually is.
@@ -291,8 +307,13 @@ def run_request(req, ns=None):
                     ret = collected
             finally:
                 sys.settrace(None)
+        if timing:
+            tm["call_us"] = (time.perf_counter_ns() - t_call) // 1000
         resp["ok"] = True
+        t0 = time.perf_counter_ns()
         resp["return"] = serialize(ret)
+        if timing:
+            tm["ret_ser_us"] = (time.perf_counter_ns() - t0) // 1000
         alias = None
         if isinstance(ret, (list, dict, set)):
             for i, a in enumerate(args):
@@ -327,11 +348,16 @@ def run_request(req, ns=None):
             resp["error"] = exc_error("serialize", e)
 
     try:
+        t0 = time.perf_counter_ns()
         resp["args_post"] = [serialize(a) for a in args]
         resp["kwargs_post"] = {k: serialize(v) for k, v in kwargs.items()}
+        if timing:
+            tm["post_ser_us"] = (time.perf_counter_ns() - t0) // 1000
     except Exception as e:
         resp["error"] = exc_error("serialize", e)
 
+    if timing and tm:
+        resp["timings"] = tm
     return resp
 
 
@@ -468,6 +494,8 @@ def _run_batch_primed(base_req, batch, timeout):
     assembled `{"results": [...]}` bytes; a module-load failure here is reported as the same
     `stage="setup"` error, once per item, that a per-case exec would have produced.
     """
+    timing = bool(base_req.get("timing"))
+    t0 = time.perf_counter_ns()
     try:
         ns = _load_module(base_req["source"])
     except Exception as e:
@@ -479,16 +507,24 @@ def _run_batch_primed(base_req, batch, timeout):
             results.append(resp)
         return json.dumps({"results": results}, allow_nan=False).encode()
 
+    module_exec_us = (time.perf_counter_ns() - t0) // 1000
     results = []
     for item in batch:
         item_req = dict(base_req)
         item_req["args"] = item.get("args", [])
         item_req["kwargs"] = item.get("kwargs", {})
+        t_item = time.perf_counter_ns()
         out = _fork_bytes(
             lambda item_req=item_req: json.dumps(run_request(item_req, ns), allow_nan=False).encode(),
             timeout,
         )
-        results.append(_collect_result(out, timeout))
+        r = _collect_result(out, timeout)
+        if timing:
+            # Stamp what the child can't see: its own fork+pipe+scheduling wall, and the
+            # batch's one-time module exec (amortized over the batch by the consumer).
+            r.setdefault("timings", {})["item_wall_us"] = (time.perf_counter_ns() - t_item) // 1000
+            r["timings"]["module_exec_once_us"] = module_exec_us
+        results.append(r)
     return json.dumps({"results": results}, allow_nan=False).encode()
 
 
