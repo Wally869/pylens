@@ -6,6 +6,8 @@ use std::path::Path;
 
 use pylens::exec::probe;
 use pylens::project::{analyze_project, record_project, validate_project};
+use pylens::record::{ProjectReplayMap, ReplayMap};
+use serde_json::json;
 
 fn ready(test: &str) -> bool {
     match probe() {
@@ -262,7 +264,7 @@ fn record_project_parallelizes_across_files_with_stable_output_order() {
     if !ready("record_project_parallelizes_across_files_with_stable_output_order") {
         return;
     }
-    let report = record_project(Path::new("tests/fixtures/project"), 4, None, false, None)
+    let report = record_project(Path::new("tests/fixtures/project"), 4, None, false, None, None, None)
         .expect("record_project");
 
     let files = report["files"].as_array().expect("files array");
@@ -316,4 +318,59 @@ fn validate_project_over_examples_aggregates_the_observed_defect_count() {
     assert_eq!(expected, 0, "expected zero hard defects across the whole examples/ tree");
     assert_eq!(hard_total as u64, expected);
     assert_eq!(report["summary"]["hard_defects"], expected);
+}
+
+#[test]
+fn record_project_replay_unmatched_path_is_an_error() {
+    let mut replay = ProjectReplayMap::new();
+    replay.insert("does_not_exist.py".to_string(), ReplayMap::new());
+
+    let err = record_project(Path::new("tests/fixtures/project"), 4, None, false, None, None, Some(&replay))
+        .expect_err("a replay path matching no analyzed file must be an error");
+    assert!(err.contains("does_not_exist.py"), "unexpected message: {err}");
+}
+
+#[test]
+fn record_project_replay_executes_each_files_own_cases() {
+    if !ready("record_project_replay_executes_each_files_own_cases") {
+        return;
+    }
+    let mut replay = ProjectReplayMap::new();
+    let mut a_replay = ReplayMap::new();
+    a_replay.insert("add".to_string(), vec![vec![json!(3), json!(4)]]);
+    replay.insert("a.py".to_string(), a_replay);
+    let mut b_replay = ReplayMap::new();
+    b_replay.insert("mutate".to_string(), vec![vec![json!([1, 2])]]);
+    replay.insert("b.py".to_string(), b_replay);
+
+    let report = record_project(Path::new("tests/fixtures/project"), 4, None, false, None, None, Some(&replay))
+        .expect("record_project");
+    let files = report["files"].as_array().expect("files array");
+
+    let a = files.iter().find(|f| f["path"] == "a.py").expect("a.py entry");
+    let add_fn = a["functions"].as_array().unwrap().iter().find(|f| f["name"] == "add").expect("add fn");
+    let add_replay_case = add_fn["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["source"] == "replay")
+        .expect("a.py's add must have a replayed case");
+    assert_eq!(add_replay_case["input"], json!([3, 4]));
+    assert_eq!(add_replay_case["return"], json!(7));
+
+    let b = files.iter().find(|f| f["path"] == "b.py").expect("b.py entry");
+    let mutate_fn = b["functions"].as_array().unwrap().iter().find(|f| f["name"] == "mutate").expect("mutate fn");
+    let mutate_replay_case = mutate_fn["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["source"] == "replay")
+        .expect("b.py's mutate must have a replayed case");
+    assert_eq!(mutate_replay_case["input"], json!([[1, 2]]));
+    assert_eq!(mutate_replay_case["return"], json!([1, 2, 1]));
+
+    assert!(
+        add_fn["cases"].as_array().unwrap().iter().any(|c| c["source"] == "generated"),
+        "generated cases must still be present alongside the replayed one"
+    );
 }

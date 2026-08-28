@@ -193,6 +193,15 @@ The signature fields, and also:
   artifact of the sandbox, never a stable observation, so it's dropped without re-execution).
   `coverage`, `branches`, and `branch_coverage` are computed from the surviving `cases` only.
   Omitted entirely when `--stability-runs` wasn't passed, so plain `record` output is unchanged.
+- `time_budget_hit` — `true`, present only when `record --time-budget <seconds>` was passed and
+  that function's deadline had already passed by the time recording finished. `record
+  --time-budget` is a soft per-function wall cap covering generated-case execution, the
+  `--cover-branches` loop, and `--stability-runs` re-runs of *generated* cases: once the deadline
+  passes, no new generated work starts for that function, but everything already recorded is
+  kept, and still-uncovered branch outcomes are marked with the existing `"budget"` reason (see
+  `branches` above). Replayed cases (`--replay`) always execute in full regardless of the
+  deadline — external evidence must not silently vanish. Omitted (not `false`) whenever
+  `--time-budget` wasn't passed or wasn't hit, so plain `record` output is unchanged.
 - `io_observability` — one entry per `io` may-set token: `{ "kind": <str>, "observable": <bool>
   }`. `observable: true` for `"stdout"`/`"stderr"` (captured and checked against the may-set by
   `validate`'s `check_io` — see below); `observable: false` for `"filesystem"` (the jail's

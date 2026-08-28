@@ -26,7 +26,7 @@ pub use stability::DroppedCases;
 /// startup without idle jails; each request still runs in its own forked child.
 const POOL_SIZE: usize = 1;
 
-/// Bundles `--value-domain`, `--cover-branches`, and `--stability-runs` for
+/// Bundles `--value-domain`, `--cover-branches`, `--stability-runs`, and `--time-budget` for
 /// [`record_with_signatures_replay`] — keeps its argument count down alongside
 /// `sandbox`/`src`/`imports`/`sigs`/`max_inputs`/`replay`.
 #[derive(Clone, Copy)]
@@ -38,18 +38,28 @@ pub struct RecordFlags<'a> {
     /// [`stabilize_cases`]. `None` (the default) leaves `record`'s output unchanged, including
     /// omitting `FunctionRecord::dropped_cases` entirely.
     pub stability_runs: Option<usize>,
+    /// `--time-budget <seconds>`: a soft per-function wall cap covering generated-case
+    /// execution, the `--cover-branches` loop, and `--stability-runs` re-runs of generated
+    /// cases. Replayed cases (see [`ReplayMap`]) always execute in full regardless of the
+    /// budget — external evidence must not silently vanish. `None` (the default) leaves
+    /// `record`'s behavior and timing unchanged.
+    pub time_budget: Option<std::time::Duration>,
 }
 
 /// Generation settings threaded through the recording of one function or method: the
 /// `--inputs` budget (interpreted as the TOTAL per-function case budget once `cover_branches` is
-/// set — see `cover::run_loop`), the `--value-domain` profile to enforce (if any), and whether
-/// `--cover-branches` opted into the predicate-targeted coverage loop. Bundled to keep
-/// `function_cases`/`method_record`'s argument counts down.
+/// set — see `cover::run_loop`), the `--value-domain` profile to enforce (if any), whether
+/// `--cover-branches` opted into the predicate-targeted coverage loop, and the per-function
+/// `--time-budget` deadline (if any). Bundled to keep `function_cases`/`method_record`'s
+/// argument counts down.
 #[derive(Clone, Copy)]
 pub(super) struct GenOptions<'a> {
     pub(super) max_inputs: usize,
     pub(super) domain: Option<&'a ValueDomain>,
     pub(super) cover_branches: bool,
+    /// Once `std::time::Instant::now() >= deadline`, generation loops stop starting new
+    /// generated work — see [`RecordFlags::time_budget`].
+    pub(super) deadline: Option<std::time::Instant>,
 }
 
 /// External input tuples supplied via `--replay`: function name → list of positional-argument
@@ -79,6 +89,46 @@ pub fn parse_replay(text: &str) -> Result<ReplayMap, String> {
             parsed.push(t.clone());
         }
         out.insert(name.clone(), parsed);
+    }
+    Ok(out)
+}
+
+/// External input tuples supplied via project-mode `--replay`: file path (relative to the
+/// project root, forward slashes, exactly as project output's `path` field renders it) → that
+/// file's [`ReplayMap`]. See [`parse_project_replay`].
+pub type ProjectReplayMap = HashMap<String, ReplayMap>;
+
+/// Parse a project-mode `--replay` file: a JSON object mapping a file path to a nested object of
+/// function name → input tuples (the single-file [`parse_replay`] shape, one level deeper).
+/// Malformed JSON, a non-object top level, or a per-file value that isn't an object of
+/// function-name → array-of-arrays, is an error surfaced to the caller. Does not check paths
+/// against the project's actual files — that requires knowing which files were analyzed, so it's
+/// the caller's job (see `project::record_project`).
+pub fn parse_project_replay(text: &str) -> Result<ProjectReplayMap, String> {
+    let value: Value = serde_json::from_str(text).map_err(|e| format!("replay file: {e}"))?;
+    let obj = value.as_object().ok_or_else(|| {
+        "replay file: expected a JSON object mapping file path to per-function input tuples".to_string()
+    })?;
+    let mut out = ProjectReplayMap::new();
+    for (path, per_fn) in obj {
+        let fn_obj = per_fn.as_object().ok_or_else(|| {
+            format!("replay file: {path:?} must map to an object of function name to input tuples")
+        })?;
+        let mut replay = ReplayMap::new();
+        for (name, tuples) in fn_obj {
+            let arr = tuples.as_array().ok_or_else(|| {
+                format!("replay file: {path:?}.{name:?} must map to an array of input tuples")
+            })?;
+            let mut parsed = Vec::with_capacity(arr.len());
+            for tuple in arr {
+                let t = tuple.as_array().ok_or_else(|| {
+                    format!("replay file: each input for {path:?}.{name:?} must be an array")
+                })?;
+                parsed.push(t.clone());
+            }
+            replay.insert(name.clone(), parsed);
+        }
+        out.insert(path.clone(), replay);
     }
     Ok(out)
 }
@@ -272,6 +322,13 @@ pub struct FunctionRecord {
     /// case ever executed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unobserved_returns: Option<UnobservedReturns>,
+    /// `true` when `--time-budget` was set and this function's deadline had passed by the time
+    /// recording finished — a hint that its cases, coverage, and branch accounting may be
+    /// thinner than an unbudgeted run would have produced. Omitted (not just `false`) whenever
+    /// the budget wasn't set or wasn't hit, so plain `record` output is unchanged — see
+    /// [`RecordFlags::time_budget`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_budget_hit: Option<bool>,
 }
 
 /// `"full"` when [`output_type_coverage_for`]'s two conditions both hold; `"partial"` otherwise,
@@ -386,7 +443,13 @@ pub fn record_file_with_replay(
     replay: &ReplayMap,
 ) -> Result<ModuleRecord, String> {
     let sandbox = NsjailPool::new(POOL_SIZE)?;
-    record_with_replay(&sandbox, src, max_inputs, replay, None, false, None)
+    record_with_replay(
+        &sandbox,
+        src,
+        max_inputs,
+        replay,
+        RecordFlags { domain: None, cover_branches: false, stability_runs: None, time_budget: None },
+    )
 }
 
 /// Like [`record_file`], with generation restricted to a `--value-domain` profile (see
@@ -424,8 +487,36 @@ pub fn record_file_with_options_and_stability(
     cover_branches: bool,
     stability_runs: Option<usize>,
 ) -> Result<ModuleRecord, String> {
+    record_file_with_options_and_stability_and_budget(
+        src,
+        max_inputs,
+        replay,
+        domain,
+        cover_branches,
+        stability_runs,
+        None,
+    )
+}
+
+/// Like [`record_file_with_options_and_stability`], also opting into `--time-budget` — see
+/// [`RecordFlags::time_budget`]. The CLI's single-file `record` entry point.
+pub fn record_file_with_options_and_stability_and_budget(
+    src: &str,
+    max_inputs: usize,
+    replay: &ReplayMap,
+    domain: Option<&ValueDomain>,
+    cover_branches: bool,
+    stability_runs: Option<usize>,
+    time_budget: Option<std::time::Duration>,
+) -> Result<ModuleRecord, String> {
     let sandbox = NsjailPool::new(POOL_SIZE)?;
-    record_with_replay(&sandbox, src, max_inputs, replay, domain, cover_branches, stability_runs)
+    record_with_replay(
+        &sandbox,
+        src,
+        max_inputs,
+        replay,
+        RecordFlags { domain, cover_branches, stability_runs, time_budget },
+    )
 }
 
 /// Record a whole file's functions against an already-provisioned sandbox. Lets a caller
@@ -437,32 +528,28 @@ pub fn record_with(
     max_inputs: usize,
     domain: Option<&ValueDomain>,
 ) -> Result<ModuleRecord, String> {
-    record_with_replay(sandbox, src, max_inputs, &ReplayMap::new(), domain, false, None)
+    record_with_replay(
+        sandbox,
+        src,
+        max_inputs,
+        &ReplayMap::new(),
+        RecordFlags { domain, cover_branches: false, stability_runs: None, time_budget: None },
+    )
 }
 
-/// Like [`record_with`], with externally supplied `--replay` input tuples, the
-/// `--cover-branches` opt-in, and the `--stability-runs` opt-in — see
-/// [`record_file_with_replay`], [`record_file_with_options`], [`RecordFlags::stability_runs`].
+/// Like [`record_with`], with externally supplied `--replay` input tuples plus the
+/// `--cover-branches`/`--stability-runs`/`--time-budget` opt-ins bundled in `flags` — see
+/// [`record_file_with_replay`], [`record_file_with_options`], [`RecordFlags`].
 pub fn record_with_replay(
     sandbox: &dyn Sandbox,
     src: &str,
     max_inputs: usize,
     replay: &ReplayMap,
-    domain: Option<&ValueDomain>,
-    cover_branches: bool,
-    stability_runs: Option<usize>,
+    flags: RecordFlags,
 ) -> Result<ModuleRecord, String> {
     let imports = imports_of(src).map_err(|e| e.to_string())?;
     let sigs = analyze_source(src).map_err(|e| e.to_string())?;
-    record_with_signatures_replay(
-        sandbox,
-        src,
-        imports,
-        sigs,
-        max_inputs,
-        replay,
-        RecordFlags { domain, cover_branches, stability_runs },
-    )
+    record_with_signatures_replay(sandbox, src, imports, sigs, max_inputs, replay, flags)
 }
 
 /// Record a whole file's functions against an already-provisioned sandbox, using precomputed
@@ -487,7 +574,7 @@ pub fn record_with_signatures(
         imports,
         sigs,
         max_inputs,
-        RecordFlags { domain, cover_branches, stability_runs: None },
+        RecordFlags { domain, cover_branches, stability_runs: None, time_budget: None },
     )
 }
 
@@ -519,7 +606,7 @@ pub fn record_with_signatures_replay(
     replay: &ReplayMap,
     flags: RecordFlags,
 ) -> Result<ModuleRecord, String> {
-    let RecordFlags { domain, cover_branches, stability_runs } = flags;
+    let RecordFlags { domain, cover_branches, stability_runs, time_budget } = flags;
     if let Some(runs) = stability_runs {
         assert!(runs >= 2, "stability_runs must be >= 2 (checked by the CLI)");
     }
@@ -557,11 +644,13 @@ pub fn record_with_signatures_replay(
                 dropped_cases: stability_runs.map(|_| DroppedCases::default()),
                 output_type_coverage: None,
                 unobserved_returns: None,
+                time_budget_hit: None,
             });
             continue;
         }
         let replay_inputs: &[Vec<Value>] = replay.get(&sig.name).map(Vec::as_slice).unwrap_or(&[]);
-        let opts = GenOptions { max_inputs, domain, cover_branches };
+        let deadline = time_budget.map(|d| std::time::Instant::now() + d);
+        let opts = GenOptions { max_inputs, domain, cover_branches, deadline };
         let (uncallable, mut cases, cover_ctx) = match sig.kind {
             DefKind::Function => {
                 let (cases, ctx) = function_cases(sandbox, src, sig, opts, replay_inputs)?;
@@ -574,7 +663,7 @@ pub fn record_with_signatures_replay(
         let dropped_cases = match stability_runs {
             Some(runs) if uncallable.is_none() => {
                 let (kept, dropped) =
-                    stability::stabilize_cases(sandbox, src, sig, std::mem::take(&mut cases), runs)?;
+                    stability::stabilize_cases(sandbox, src, sig, std::mem::take(&mut cases), runs, deadline)?;
                 cases = kept;
                 Some(dropped)
             }
@@ -602,6 +691,7 @@ pub fn record_with_signatures_replay(
                 None => (None, None),
             }
         };
+        let time_budget_hit = deadline.is_some_and(|dl| std::time::Instant::now() >= dl);
         functions.push(FunctionRecord {
             io_observability: io_observability(&sig.io),
             signature: sig.clone(),
@@ -613,6 +703,7 @@ pub fn record_with_signatures_replay(
             dropped_cases,
             output_type_coverage,
             unobserved_returns,
+            time_budget_hit: time_budget_hit.then_some(true),
         });
     }
     Ok(ModuleRecord {
@@ -668,6 +759,13 @@ fn probe_import(sandbox: &dyn Sandbox, module: &str) -> Result<Option<HarnessErr
     }
 }
 
+/// Whether `opts.deadline` (the `--time-budget` cap) has already passed — generation loops stop
+/// starting new *generated* work once this is true, but replayed cases (see [`ReplayMap`]) never
+/// check it: external evidence must not silently vanish.
+pub(super) fn deadline_passed(deadline: Option<std::time::Instant>) -> bool {
+    deadline.is_some_and(|dl| std::time::Instant::now() >= dl)
+}
+
 fn function_cases(
     sandbox: &dyn Sandbox,
     src: &str,
@@ -677,6 +775,9 @@ fn function_cases(
 ) -> Result<(Vec<Case>, cover::CoverContext), String> {
     let mut cases = Vec::new();
     for input in gen_inputs(sig, opts.max_inputs, opts.domain) {
+        if deadline_passed(opts.deadline) {
+            break;
+        }
         let result = sandbox.call(src, &sig.name, &input.positional, &input.kwargs)?;
         let mut case = build_case(sig, &input, None, &result, CaseSource::Generated);
         if case.outcome == "raised" {
@@ -753,6 +854,9 @@ fn method_record(
 
     let mut cases = Vec::new();
     for input in gen_inputs(sig, opts.max_inputs, opts.domain) {
+        if deadline_passed(opts.deadline) {
+            break;
+        }
         let result =
             sandbox.call_method(src, class, &ctor_args, &sig.name, &input.positional, &input.kwargs)?;
         let mut case = build_case(sig, &input, Some(ctor_args.clone()), &result, CaseSource::Generated);

@@ -298,7 +298,7 @@ pub(super) fn run_loop(
     };
 
     loop {
-        if cases.len() >= opts.max_inputs {
+        if cases.len() >= opts.max_inputs || super::deadline_passed(opts.deadline) {
             break;
         }
         let before_covered = covered_count(sig, cases);
@@ -310,7 +310,7 @@ pub(super) fn run_loop(
         'outer: for (line, kind, outcome_name) in &uncovered {
             let Some(want) = outcome_polarity(*kind, outcome_name) else { continue };
             for (param_name, value) in candidate_values(sig, &predicates, *line, want, opts.domain) {
-                if cases.len() >= opts.max_inputs {
+                if cases.len() >= opts.max_inputs || super::deadline_passed(opts.deadline) {
                     break 'outer;
                 }
                 let Some(gi) = build_targeted_input(sig, &template, &param_name, value) else { continue };

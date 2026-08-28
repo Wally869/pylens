@@ -9,7 +9,7 @@ use crate::exec::Sandbox;
 use crate::generate::GenInput;
 use crate::model::EffectSignature;
 
-use super::{Case, build_case};
+use super::{Case, CaseSource, build_case, deadline_passed};
 
 /// The closed count of cases `--stability-runs` dropped from a function's `cases` — see
 /// [`stabilize_cases`]. Present on [`super::FunctionRecord`] exactly when `--stability-runs` was
@@ -33,18 +33,30 @@ pub struct DroppedCases {
 /// itself ran on. Line/arc data from a stable case's re-runs is discarded — the kept case is the
 /// original, whose arcs already contributed to coverage/branch accounting; re-run traces are
 /// diagnostics, not observations, and value-level agreement is what stability checks.
+///
+/// `deadline` (the `--time-budget` cap, if any) applies only to `CaseSource::Generated` cases: a
+/// generated case whose stability re-runs haven't started yet when the deadline has already
+/// passed is kept as-is, unverified, rather than dropped — the case itself was already recorded
+/// before the deadline tripped, and "stop starting new generated work" means the re-run checks,
+/// not discarding what's already there. A replayed case's re-runs always execute in full,
+/// regardless of the deadline: external evidence must not silently vanish.
 pub(super) fn stabilize_cases(
     sandbox: &dyn Sandbox,
     src: &str,
     sig: &EffectSignature,
     cases: Vec<Case>,
     runs: usize,
+    deadline: Option<std::time::Instant>,
 ) -> Result<(Vec<Case>, DroppedCases), String> {
     let mut kept = Vec::with_capacity(cases.len());
     let mut dropped = DroppedCases::default();
     for case in cases {
         if case.outcome == "error" {
             dropped.resource += 1;
+            continue;
+        }
+        if case.source == CaseSource::Generated && deadline_passed(deadline) {
+            kept.push(case);
             continue;
         }
         let kwargs: Vec<(String, Value)> = case.kwargs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();

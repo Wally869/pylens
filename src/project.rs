@@ -15,7 +15,7 @@ use crate::analyze::{analyze_module_with_call_sites, collect_imports};
 use crate::exec::{NsjailPool, Sandbox};
 use crate::generate::ValueDomain;
 use crate::model::{EffectSignature, Import, Purity};
-use crate::record::{RecordFlags, record_with_signatures, record_with_signatures_flags};
+use crate::record::{ProjectReplayMap, RecordFlags, ReplayMap, record_with_signatures, record_with_signatures_replay};
 use crate::validate::{Severity, validate_function};
 
 pub mod interproc;
@@ -375,13 +375,11 @@ fn record_file_entry(
     index: &ModuleIndex,
     ef: EnrichedFile,
     max_inputs: usize,
-    domain: Option<&ValueDomain>,
-    cover_branches: bool,
-    stability_runs: Option<usize>,
+    flags: RecordFlags,
+    replay: &ReplayMap,
 ) -> FileEntry {
     let EnrichedFile { path, src, imports, signatures } = ef;
-    let flags = RecordFlags { domain, cover_branches, stability_runs };
-    match record_with_signatures_flags(sandbox, &src, imports, signatures, max_inputs, flags) {
+    match record_with_signatures_replay(sandbox, &src, imports, signatures, max_inputs, replay, flags) {
         Ok(record) => {
             let purities = record.functions.iter().map(|f| f.signature.purity).collect();
             let (coverage_executed, coverage_total) = record
@@ -422,18 +420,41 @@ fn record_file_entry(
 /// so this parallelizes cleanly. Fails the whole run only if a worker's sandbox can't be
 /// provisioned at all; a per-file record failure becomes a `{path, error}` entry instead.
 /// Records against cross-file-propagated signatures, same as `analyze_project`.
+/// `replay`, if given, maps each file's project-relative path (see [`relative_path`], the same
+/// rendering as a project report's `path` field) to that file's [`ReplayMap`] — see
+/// [`crate::record::parse_project_replay`]. A key matching no analyzed file is an error listing
+/// every unmatched key, checked up front before any file is recorded; a file with no matching key
+/// simply gets no replay cases.
 pub fn record_project(
     root: &Path,
     max_inputs: usize,
     domain: Option<&ValueDomain>,
     cover_branches: bool,
     stability_runs: Option<usize>,
+    time_budget: Option<std::time::Duration>,
+    replay: Option<&ProjectReplayMap>,
 ) -> Result<Value, String> {
     let files = collect_py_files(root);
     let index = &ModuleIndex::build(root, &files);
     let (enriched, error_entries) = analyze_and_propagate(root, &files);
+
+    if let Some(replay) = replay {
+        let known: std::collections::HashSet<&str> = enriched.iter().map(|ef| ef.path.as_str()).collect();
+        let mut unmatched: Vec<&str> = replay.keys().map(String::as_str).filter(|k| !known.contains(k)).collect();
+        if !unmatched.is_empty() {
+            unmatched.sort_unstable();
+            return Err(format!(
+                "replay: no such file(s) in this project: {}",
+                unmatched.join(", ")
+            ));
+        }
+    }
+
+    let empty_replay = ReplayMap::new();
+    let flags = RecordFlags { domain, cover_branches, stability_runs, time_budget };
     let mut entries = record_files_parallel(enriched, |pool, ef| {
-        record_file_entry(pool, index, ef, max_inputs, domain, cover_branches, stability_runs)
+        let file_replay = replay.and_then(|r| r.get(&ef.path)).unwrap_or(&empty_replay);
+        record_file_entry(pool, index, ef, max_inputs, flags, file_replay)
     })?;
     entries.extend(error_entries);
     Ok(build_report(root, entries, false))

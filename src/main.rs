@@ -3,13 +3,33 @@
 //!   pylens analyze  <file.py|dir> [--format json|summary|pyi|html]      static effect signatures
 //!   pylens record   <file.py|dir> [--inputs N] [--replay <cases.json>]
 //!                    [--value-domain <profile.json>] [--cover-branches]
-//!                    [--stability-runs N] [--format json|summary|pyi|html] signatures + observed
+//!                    [--stability-runs N] [--time-budget <seconds>]
+//!                    [--format json|summary|pyi|html]                  signatures + observed
 //!                                                                       cases (runs the jail).
 //!                                                                       `--replay` additionally
 //!                                                                       executes externally
-//!                                                                       supplied input tuples
-//!                                                                       (single-file only; see
-//!                                                                       `pylens::record::parse_replay`).
+//!                                                                       supplied input tuples;
+//!                                                                       against a single file
+//!                                                                       it's function name →
+//!                                                                       tuples (see
+//!                                                                       `pylens::record::parse_replay`);
+//!                                                                       against a directory it's
+//!                                                                       project-relative file
+//!                                                                       path → that file's
+//!                                                                       function-name → tuples
+//!                                                                       mapping (the target's
+//!                                                                       being a directory is what
+//!                                                                       selects this nested
+//!                                                                       shape — see
+//!                                                                       `pylens::record::
+//!                                                                       parse_project_replay`). A
+//!                                                                       project-replay path that
+//!                                                                       matches no analyzed file
+//!                                                                       is an error, checked
+//!                                                                       before any file runs; a
+//!                                                                       file absent from the
+//!                                                                       mapping simply gets no
+//!                                                                       replay cases.
 //!                                                                       `--value-domain` restricts
 //!                                                                       every *generated* input to
 //!                                                                       a declared value domain
@@ -34,6 +54,33 @@
 //!                                                                       function record. Off by
 //!                                                                       default; not available
 //!                                                                       on `validate`.
+//!                                                                       `--time-budget <seconds>`
+//!                                                                       is a soft per-function
+//!                                                                       wall cap covering
+//!                                                                       generated-case execution,
+//!                                                                       the `--cover-branches`
+//!                                                                       loop, and
+//!                                                                       `--stability-runs`
+//!                                                                       re-runs of generated
+//!                                                                       cases: once it trips, no
+//!                                                                       new generated work starts
+//!                                                                       for that function, but
+//!                                                                       everything already
+//!                                                                       recorded is kept, and
+//!                                                                       still-uncovered branch
+//!                                                                       outcomes are marked with
+//!                                                                       the existing `"budget"`
+//!                                                                       reason. Replayed cases
+//!                                                                       always execute in full
+//!                                                                       regardless — a tripped
+//!                                                                       budget never drops
+//!                                                                       externally supplied
+//!                                                                       evidence. A function
+//!                                                                       whose budget tripped
+//!                                                                       carries
+//!                                                                       `time_budget_hit: true`.
+//!                                                                       Off by default; not
+//!                                                                       available on `validate`.
 //!   pylens validate <file.py|dir> [--inputs N] [--format json|summary|html] observed ⊆ static
 //!                                                                       soundness-defect report
 //!                                                                       (runs the jail); exits
@@ -70,7 +117,7 @@ fn main() {
                 "usage:\n  pylens analyze <file.py|dir> [--format json|summary|pyi|html]\n  \
                  pylens record <file.py|dir> [--inputs <N>] [--replay <cases.json>] \
                  [--value-domain <profile.json>] [--cover-branches] [--stability-runs <N>] \
-                 [--format json|summary|pyi|html]\n  \
+                 [--time-budget <seconds>] [--format json|summary|pyi|html]\n  \
                  pylens validate <file.py|dir> [--inputs <N>] [--format json|summary|html]"
             );
             std::process::exit(2);
@@ -187,20 +234,33 @@ fn cmd_record(args: &[String]) {
         }
         n
     });
+    let time_budget: Option<std::time::Duration> = flag(args, "--time-budget").map(|s| {
+        let secs: f64 = s
+            .parse()
+            .unwrap_or_else(|_| fail(&format!("--time-budget expects a number of seconds, got {s:?}")));
+        if secs <= 0.0 {
+            fail("--time-budget needs a positive number of seconds");
+        }
+        std::time::Duration::from_secs_f64(secs)
+    });
 
     if std::path::Path::new(&path).is_dir() {
         if format == Format::Pyi {
             fail("--format pyi is not supported for a directory in record mode");
         }
-        if replay_path.is_some() {
-            fail("--replay needs a single file, not a directory");
-        }
+        let replay = replay_path.as_deref().map(|rp| {
+            let replay_src = read_file(rp);
+            pylens::record::parse_project_replay(&replay_src)
+                .unwrap_or_else(|e| fail(&format!("record error: {e}")))
+        });
         match pylens::project::record_project(
             std::path::Path::new(&path),
             inputs,
             domain.as_ref(),
             cover_branches,
             stability_runs,
+            time_budget,
+            replay.as_ref(),
         ) {
             Ok(report) => match format {
                 Format::Summary => print!("{}", report::project_summary(&report)),
@@ -220,13 +280,14 @@ fn cmd_record(args: &[String]) {
         }
         None => pylens::record::ReplayMap::new(),
     };
-    let record_result = pylens::record::record_file_with_options_and_stability(
+    let record_result = pylens::record::record_file_with_options_and_stability_and_budget(
         &src,
         inputs,
         &replay,
         domain.as_ref(),
         cover_branches,
         stability_runs,
+        time_budget,
     );
     match record_result {
         Ok(record) => {
@@ -423,8 +484,8 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 /// follows a value-taking flag, so `analyze --format pyi file.py` and `analyze file.py --format
 /// pyi` both resolve the path correctly.
 fn positional(args: &[String]) -> Option<&String> {
-    const VALUE_FLAGS: [&str; 5] =
-        ["--format", "--inputs", "--replay", "--value-domain", "--stability-runs"];
+    const VALUE_FLAGS: [&str; 6] =
+        ["--format", "--inputs", "--replay", "--value-domain", "--stability-runs", "--time-budget"];
     let mut skip_next = false;
     for a in args {
         if skip_next {

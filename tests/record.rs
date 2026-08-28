@@ -5,9 +5,11 @@ use pylens::exec::{CallResult, Sandbox, probe};
 use pylens::generate::ValueDomain;
 use pylens::model::ReturnKind;
 use pylens::record::{
-    CaseSource, DepStatus, RecordFlags, ReplayMap, parse_replay, record_file,
-    record_file_with_options, record_file_with_replay, record_with_signatures_replay,
+    CaseSource, DepStatus, RecordFlags, ReplayMap, parse_project_replay, parse_replay, record_file,
+    record_file_with_options, record_file_with_options_and_stability_and_budget,
+    record_file_with_replay, record_with_signatures_replay,
 };
+use std::time::Duration;
 use pylens::{analyze_source, imports_of};
 use serde_json::{Value, json};
 
@@ -627,6 +629,55 @@ fn parse_replay_rejects_non_array_tuple() {
     assert!(err.contains("f"), "unexpected message: {err}");
 }
 
+#[test]
+fn parse_project_replay_parses_valid_mapping() {
+    let text = r#"{
+        "a.py": {"add": [[1, 2]]},
+        "sub/mod.py": {"f": [[1], [2, 3]], "g": []}
+    }"#;
+    let replay = parse_project_replay(text).expect("parse");
+    assert_eq!(replay["a.py"]["add"], vec![vec![json!(1), json!(2)]]);
+    assert_eq!(
+        replay["sub/mod.py"]["f"],
+        vec![vec![json!(1)], vec![json!(2), json!(3)]]
+    );
+    assert!(replay["sub/mod.py"]["g"].is_empty());
+}
+
+#[test]
+fn parse_project_replay_rejects_non_object_top_level() {
+    let err = parse_project_replay("[1, 2, 3]").expect_err("must reject a non-object top level");
+    assert!(err.contains("object"), "unexpected message: {err}");
+}
+
+#[test]
+fn parse_project_replay_rejects_non_object_per_file_value() {
+    let err = parse_project_replay(r#"{"a.py": [[1, 2]]}"#)
+        .expect_err("must reject a per-file value that isn't the nested object shape");
+    assert!(err.contains("a.py"), "unexpected message: {err}");
+}
+
+#[test]
+fn parse_project_replay_rejects_non_array_mapping_value() {
+    let err = parse_project_replay(r#"{"a.py": {"f": "not-an-array"}}"#)
+        .expect_err("must reject a non-array mapping value");
+    assert!(err.contains("f"), "unexpected message: {err}");
+}
+
+#[test]
+fn parse_project_replay_rejects_non_array_tuple() {
+    let err = parse_project_replay(r#"{"a.py": {"f": [1, 2]}}"#)
+        .expect_err("must reject a tuple that isn't an array");
+    assert!(err.contains("f"), "unexpected message: {err}");
+}
+
+#[test]
+fn single_file_replay_format_still_parses_via_parse_replay() {
+    let text = r#"{"my_func": [[1, 2]]}"#;
+    let replay = parse_replay(text).expect("single-file format is unaffected by the project format");
+    assert_eq!(replay["my_func"], vec![vec![json!(1), json!(2)]]);
+}
+
 /// Never actually invoked in the tests that use it — replay validation (an unknown function
 /// name) must fail before any sandbox call happens.
 struct PanicSandbox;
@@ -652,7 +703,7 @@ fn replay_unmatched_function_name_is_an_error() {
         sigs,
         4,
         &replay,
-        RecordFlags { domain: None, cover_branches: false, stability_runs: None },
+        RecordFlags { domain: None, cover_branches: false, stability_runs: None, time_budget: None },
     );
     let err = result.err().expect("an unmatched replay function name must be an error");
     assert!(err.contains("does_not_exist"), "unexpected message: {err}");
@@ -726,4 +777,89 @@ fn value_domain_restricts_generated_cases_but_not_replay() {
         "replayed inputs must bypass the value-domain filter entirely"
     );
     assert_eq!(replay_case.outcome, "returned");
+}
+
+/// A `time.sleep`-based body: deterministic wall-clock cost per call (unlike an iteration count,
+/// which varies with machine speed), so a tight `--time-budget` reliably trips after one case.
+const SLOW_SRC: &str = "\
+import time
+
+def slow(x: int) -> int:
+    time.sleep(0.1)
+    return x
+";
+
+#[test]
+fn tight_time_budget_trips_and_keeps_already_recorded_cases() {
+    if !ready("tight_time_budget_trips_and_keeps_already_recorded_cases") {
+        return;
+    }
+    let rec = record_file_with_options_and_stability_and_budget(
+        SLOW_SRC,
+        20,
+        &ReplayMap::new(),
+        None,
+        false,
+        None,
+        Some(Duration::from_secs_f64(0.05)),
+    )
+    .expect("record");
+    let f = rec.functions.iter().find(|r| r.signature.name == "slow").expect("slow record");
+
+    assert!(
+        f.cases.len() < 20,
+        "the tight budget must have stopped generation well before the full {} inputs, got {}",
+        20,
+        f.cases.len()
+    );
+    assert!(!f.cases.is_empty(), "the case executed before the deadline tripped must be kept");
+    assert_eq!(f.time_budget_hit, Some(true), "the budget must be reported as tripped");
+}
+
+#[test]
+fn plain_record_has_no_time_budget_hit_field() {
+    if !ready("plain_record_has_no_time_budget_hit_field") {
+        return;
+    }
+    let rec = record_file_with_options(SLOW_SRC, 1, &ReplayMap::new(), None, false).expect("record");
+    let f = rec.functions.iter().find(|r| r.signature.name == "slow").expect("slow record");
+    assert!(f.time_budget_hit.is_none(), "time_budget_hit must be omitted when --time-budget wasn't set");
+
+    let json = serde_json::to_value(&rec.functions).expect("serialize");
+    let entry = json.as_array().unwrap().iter().find(|v| v["name"] == "slow").expect("slow entry");
+    assert!(
+        !entry.as_object().unwrap().contains_key("time_budget_hit"),
+        "the JSON output must not carry a time_budget_hit key at all"
+    );
+}
+
+#[test]
+fn time_budget_never_drops_replay_cases() {
+    if !ready("time_budget_never_drops_replay_cases") {
+        return;
+    }
+    let mut replay = ReplayMap::new();
+    replay.insert("slow".to_string(), vec![vec![json!(7)]]);
+
+    let rec = record_file_with_options_and_stability_and_budget(
+        SLOW_SRC,
+        20,
+        &replay,
+        None,
+        false,
+        None,
+        Some(Duration::from_secs_f64(0.05)),
+    )
+    .expect("record");
+    let f = rec.functions.iter().find(|r| r.signature.name == "slow").expect("slow record");
+
+    assert_eq!(f.time_budget_hit, Some(true), "the tight budget must still trip for the generated cases");
+    let replay_case = f
+        .cases
+        .iter()
+        .find(|c| c.source == CaseSource::Replay)
+        .expect("the replay case must execute despite the tripped budget");
+    assert_eq!(replay_case.input, vec![json!(7)]);
+    assert_eq!(replay_case.outcome, "returned");
+    assert_eq!(replay_case.ret, Some(json!(7)));
 }
