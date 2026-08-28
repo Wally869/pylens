@@ -14,7 +14,7 @@ use super::state::ShapeState;
 /// `Shape::Any` at the boundary. See the module doc's "Depth cap" section.
 const MAX_DEPTH: usize = 4;
 
-impl ShapeState {
+impl ShapeState<'_> {
     /// Merge `shape` into `name`'s root's accumulated evidence via `Shape::join`, clamped by
     /// the depth cap.
     pub(super) fn refine(&mut self, name: &str, shape: Shape) {
@@ -127,7 +127,12 @@ pub(super) fn refine_for(state: &mut ShapeState, target: &ast::Expr, iter: &ast:
 
 fn bind_for_target(target: &ast::Expr, elem: Shape, state: &mut ShapeState) {
     match target {
-        ast::Expr::Name(n) => state.refine(n.id.as_str(), elem),
+        ast::Expr::Name(n) => {
+            // Each iteration rebinds `n` to a fresh, unrelated element — never the caller's
+            // original argument — so a loop target that is a parameter always freezes it.
+            state.freeze_if_param(n.id.as_str());
+            state.refine(n.id.as_str(), elem);
+        }
         ast::Expr::Tuple(t) => {
             for el in &t.elts {
                 bind_for_target(el, Shape::Any, state);
@@ -147,8 +152,15 @@ pub(super) fn assign_target(target: &ast::Expr, value: &ast::Expr, state: &mut S
         ast::Expr::Name(n) => {
             let x = n.id.as_str();
             if let ast::Expr::Name(y) = value {
+                let unrelated = state.root(y.id.as_str()) != state.root(x);
                 state.alias(x, y.id.as_str());
+                if unrelated {
+                    state.freeze_if_param(x);
+                }
             } else {
+                if !references_name(value, x) {
+                    state.freeze_if_param(x);
+                }
                 state.rebind(x);
                 let sh = shape_of(value, state);
                 state.refine(x, sh);
@@ -158,6 +170,62 @@ pub(super) fn assign_target(target: &ast::Expr, value: &ast::Expr, state: &mut S
         ast::Expr::List(l) => destructure(&l.elts, value, state),
         _ => {}
     }
+}
+
+/// True if `expr`'s subtree contains a bare reference to the name `name` — used to tell a
+/// self-referential rebind (`x = x.strip()`, `x = x + 1`) from an unrelated one (`x = []`,
+/// `x = Box()`, `x = other`). Unmatched variants conservatively return `false` (treated as
+/// unrelated), which only errs toward dropping votes, never toward keeping a wrong one.
+fn references_name(expr: &ast::Expr, name: &str) -> bool {
+    use ast::Expr;
+    match expr {
+        Expr::Name(n) => n.id.as_str() == name,
+        Expr::Yield(y) => y.value.as_deref().is_some_and(|v| references_name(v, name)),
+        Expr::YieldFrom(y) => references_name(&y.value, name),
+        Expr::Await(a) => references_name(&a.value, name),
+        Expr::Call(c) => {
+            references_name(&c.func, name)
+                || c.arguments.args.iter().any(|a| references_name(a, name))
+                || c.arguments.keywords.iter().any(|k| references_name(&k.value, name))
+        }
+        Expr::Attribute(a) => references_name(&a.value, name),
+        Expr::Subscript(s) => references_name(&s.value, name) || references_name(&s.slice, name),
+        Expr::BinOp(b) => references_name(&b.left, name) || references_name(&b.right, name),
+        Expr::BoolOp(b) => b.values.iter().any(|v| references_name(v, name)),
+        Expr::UnaryOp(u) => references_name(&u.operand, name),
+        Expr::Compare(c) => {
+            references_name(&c.left, name) || c.comparators.iter().any(|v| references_name(v, name))
+        }
+        Expr::If(i) => {
+            references_name(&i.test, name)
+                || references_name(&i.body, name)
+                || references_name(&i.orelse, name)
+        }
+        Expr::Named(n) => references_name(&n.value, name),
+        Expr::Starred(s) => references_name(&s.value, name),
+        Expr::List(l) => l.elts.iter().any(|e| references_name(e, name)),
+        Expr::Tuple(t) => t.elts.iter().any(|e| references_name(e, name)),
+        Expr::Set(s) => s.elts.iter().any(|e| references_name(e, name)),
+        Expr::Dict(d) => d.items.iter().any(|it| {
+            it.key.as_ref().is_some_and(|k| references_name(k, name)) || references_name(&it.value, name)
+        }),
+        Expr::ListComp(c) => references_comprehensions(&c.generators, name) || references_name(&c.elt, name),
+        Expr::SetComp(c) => references_comprehensions(&c.generators, name) || references_name(&c.elt, name),
+        Expr::DictComp(c) => {
+            references_comprehensions(&c.generators, name)
+                || c.key.as_ref().is_some_and(|k| references_name(k, name))
+                || references_name(&c.value, name)
+        }
+        Expr::Generator(c) => references_comprehensions(&c.generators, name) || references_name(&c.elt, name),
+        Expr::Lambda(l) => references_name(&l.body, name),
+        _ => false,
+    }
+}
+
+fn references_comprehensions(generators: &[ast::Comprehension], name: &str) -> bool {
+    generators.iter().any(|g| {
+        references_name(&g.iter, name) || g.ifs.iter().any(|cond| references_name(cond, name))
+    })
 }
 
 /// Tuple/list-unpacking assignment (`a, b = ...`): pairs elementwise when the RHS is itself a
@@ -178,6 +246,7 @@ fn destructure(targets: &[ast::Expr], value: &ast::Expr, state: &mut ShapeState)
         _ => {
             for t in targets {
                 if let ast::Expr::Name(n) = t {
+                    state.freeze_if_param(n.id.as_str());
                     state.rebind(n.id.as_str());
                 }
             }

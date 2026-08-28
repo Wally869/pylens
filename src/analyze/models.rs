@@ -7,9 +7,14 @@
 //! Every entry here removes the `unresolved_effects` acknowledgment from the callers that use
 //! it: a missed effect that was a soft `validate` defect before the entry becomes a hard one
 //! after. So every entry over-approximates on purpose — see `temp/effect_models.md` for the
-//! measurement and the full per-entry rationale. Only `raises` and `io` are modelled; the
-//! return kind is deliberately not fed into the Shapes pass in this pass (Shapes runs before
-//! Effects) — a follow-up.
+//! measurement and the full per-entry rationale.
+//!
+//! [`return_kind`] is a separate, independent table (rather than a field on [`ModelEntry`])
+//! because the raises/io entries above are grouped by shared profile, not by shared return
+//! type — `os.path.isabs` and `os.path.join` share [`OS_PATH_PURE`]'s raises/io but return a
+//! `bool` and a `str` respectively. It's queried by the Shapes pass through
+//! [`resolve_stdlib_return`], which shares [`resolve_dotted`] with [`resolve_stdlib_call`] so
+//! both passes resolve a call to the same stdlib path.
 
 /// One modelled call's known raises/io profile.
 pub(in crate::analyze) struct ModelEntry {
@@ -120,10 +125,12 @@ fn namespace_default(resolved: &str) -> Option<&'static ModelEntry> {
     }
 }
 
-/// Resolve an attribute-chain call (`base.suffix...(...)`) to the model entry for its
-/// **resolved** module path: `module` is the binding's already-resolved [`crate::model::ModuleRef`],
-/// `base` the bound name as it appears at the call site, `full` the full dotted callee text
-/// (`dotted_attr` of the call expression, e.g. `"p.join"` or `"os.path.join"`).
+/// Resolve an attribute-chain call's (`base.suffix...(...)`) callee text to its true dotted
+/// stdlib path: `module` is the binding's already-resolved [`crate::model::ModuleRef`], `base`
+/// the bound name as it appears at the call site, `full` the full dotted callee text
+/// (`dotted_attr` of the call expression, e.g. `"p.join"` or `"os.path.join"`). Shared by
+/// [`resolve_stdlib_call`] and [`resolve_stdlib_return`] so every pass that resolves a stdlib
+/// call agrees on which function it names.
 ///
 /// `base == module.package` means `base` is written as the real top-level package name, not an
 /// alias — e.g. `import os.path; os.path.join(...)` binds `"os"` to `ModuleRef{os, path}` (the
@@ -132,14 +139,66 @@ fn namespace_default(resolved: &str) -> Option<&'static ModelEntry> {
 /// (which would double up the `path` segment). Only a genuine alias (`import os.path as p`,
 /// `import os as o`) needs the substitution: `base` then differs from `module.package`, and the
 /// call-site text after `base.` is appended to `module.dotted()` instead.
+fn resolve_dotted(module: &crate::model::ModuleRef, base: &str, full: &str) -> Option<String> {
+    if base == module.package {
+        return Some(full.to_string());
+    }
+    let suffix = full.strip_prefix(base)?.strip_prefix('.')?;
+    Some(format!("{}.{}", module.dotted(), suffix))
+}
+
+/// Resolve an attribute-chain call to the model entry for its resolved module path — see
+/// [`resolve_dotted`].
 pub(in crate::analyze) fn resolve_stdlib_call(
     module: &crate::model::ModuleRef,
     base: &str,
     full: &str,
 ) -> Option<&'static ModelEntry> {
-    if base == module.package {
-        return lookup(full);
+    lookup(&resolve_dotted(module, base, full)?)
+}
+
+/// Resolve an attribute-chain call to its modelled return kind — see [`resolve_dotted`]. Used
+/// only by the Shapes pass; `None` means either the call isn't resolvable or its return type
+/// isn't modelled, and the caller must fall back to `Shape::Any`.
+pub(in crate::analyze) fn resolve_stdlib_return(
+    module: &crate::model::ModuleRef,
+    base: &str,
+    full: &str,
+) -> Option<crate::model::ReturnKind> {
+    return_kind(&resolve_dotted(module, base, full)?)
+}
+
+/// The modelled return kind for a resolved dotted stdlib path, e.g. `"os.path.join"` ->
+/// [`crate::model::ReturnKind::Str`]. Deliberately conservative and far smaller than the
+/// raises/io table above: only entries whose return type is unambiguous across the whole group
+/// are listed, everything else stays `None` (⇒ `Shape::Any`, never a guess).
+pub(in crate::analyze) fn return_kind(resolved: &str) -> Option<crate::model::ReturnKind> {
+    use crate::model::ReturnKind;
+    match resolved {
+        // `os.fspath` is deliberately excluded: it returns whatever `__fspath__` returns (`str`
+        // or `bytes` depending on the input), so a single return kind would be a guess.
+        "os.path.join" | "os.path.basename" | "os.path.dirname" | "os.path.normcase"
+        | "os.path.normpath" | "os.path.relpath" | "os.path.commonprefix"
+        | "os.path.abspath" | "os.path.realpath" | "os.path.expanduser" | "os.path.expandvars"
+        | "os.getcwd" => Some(ReturnKind::Str),
+
+        "os.path.splitext" | "os.path.split" | "os.path.splitdrive" => Some(ReturnKind::Sequence),
+
+        "os.path.isabs" | "os.path.exists" | "os.path.lexists" | "os.path.isdir"
+        | "os.path.isfile" | "os.path.islink" | "os.path.samefile" => Some(ReturnKind::Bool),
+
+        "os.path.getmtime" | "os.path.getatime" | "os.path.getctime" => Some(ReturnKind::Float),
+        "os.path.getsize" | "os.getpid" => Some(ReturnKind::Int),
+
+        "sys.getsizeof" | "sys.getrecursionlimit" => Some(ReturnKind::Int),
+        "sys.intern" => Some(ReturnKind::Str),
+
+        "time.time" | "time.monotonic" | "time.perf_counter" => Some(ReturnKind::Float),
+        "time.strftime" => Some(ReturnKind::Str),
+        "time.sleep" => Some(ReturnKind::None),
+
+        "json.dumps" => Some(ReturnKind::Str),
+
+        _ => None,
     }
-    let suffix = full.strip_prefix(base)?.strip_prefix('.')?;
-    lookup(&format!("{}.{}", module.dotted(), suffix))
 }

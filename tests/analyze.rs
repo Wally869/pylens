@@ -389,6 +389,58 @@ fn nested_numeric_container_shape_is_inferred_from_subscript_division() {
 }
 
 #[test]
+fn param_rebound_to_a_list_literal_stops_voting_as_a_sequence() {
+    // `x` is reassigned to a brand-new list, unrelated to the caller's argument — the
+    // subsequent `.append` describes the new object, not what the caller passed, so `x`'s
+    // declared shape must not become `Seq`.
+    let s = analyze("def f(x):\n    x = []\n    x.append(1)\n");
+    let f = sig(&s, "f");
+    let x = f.params.iter().find(|p| p.name == "x").unwrap();
+    assert_eq!(x.shape, Shape::Any);
+}
+
+#[test]
+fn param_rebound_to_a_constructor_call_stops_voting_as_an_instance() {
+    let s = analyze(
+        "class Box:\n    pass\n\ndef f(x):\n    x = Box()\n    x.open()\n",
+    );
+    let f = sig(&s, "f");
+    let x = f.params.iter().find(|p| p.name == "x").unwrap();
+    assert_eq!(x.shape, Shape::Any);
+}
+
+#[test]
+fn param_rebound_to_an_unrelated_name_stops_voting() {
+    let s = analyze("def f(x, other):\n    x = other\n    x.append(1)\n    return other\n");
+    let f = sig(&s, "f");
+    let x = f.params.iter().find(|p| p.name == "x").unwrap();
+    assert_eq!(x.shape, Shape::Any);
+}
+
+#[test]
+fn self_referential_param_rebind_still_votes() {
+    // `x = x.strip()` reads the original `x` before rebinding — the read still describes the
+    // caller's argument, so it may still vote (here, toward `Str`).
+    let s = analyze("def f(x):\n    x = x.strip()\n    return x\n");
+    let f = sig(&s, "f");
+    let x = f.params.iter().find(|p| p.name == "x").unwrap();
+    assert_eq!(x.shape, Shape::Str);
+}
+
+#[test]
+fn local_rebound_to_a_list_literal_still_infers_a_sequence() {
+    // The rebind rule is about parameters, whose caller-supplied value the rebind severs from —
+    // a plain local really is what it was last assigned, so `xs = []` still infers `Seq`: the
+    // param model has no `shape` field to check directly, so this proves it indirectly the same
+    // way `subscript_on_local_list_literal_does_not_gain_key_error` does — a `Seq`-shaped base
+    // narrows the subscript's implicit raise to `IndexError` alone, never `KeyError`.
+    let s = analyze("def f(i):\n    xs = []\n    xs.append(1)\n    return xs[i]\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"IndexError".to_string()));
+    assert!(!f.raises.implicit.contains(&"KeyError".to_string()));
+}
+
+#[test]
 fn local_helper_mutation_propagates_to_caller() {
     let s = analyze(
         "def helper(xs):\n\
@@ -602,20 +654,16 @@ fn equality_guard_records_literal_sample() {
 }
 
 #[test]
-fn conflicting_param_shapes_join_to_union_and_render_pep604() {
-    // `x` is pinned `Int` via the `> 0` comparison against a numeric literal, then rebound to
-    // `None` on the else branch — two disjoint pieces of evidence for the same param, so the
-    // fixpoint join must produce `Union([Int, None])` rather than collapsing to `Any`.
+fn branch_local_rebind_of_a_param_drops_its_shape_rather_than_unioning() {
+    // `x` is pinned `Int` via the `> 0` comparison, then rebound to `None` (an unrelated value)
+    // on the else branch — the rebind isn't a caller-observed fact, so it must not be unioned
+    // into the param's declared shape either; the whole hypothesis is dropped to `Any`. (PEP 604
+    // union rendering itself is covered directly in `src/stub/mod.rs`'s
+    // `union_shape_param_renders_pep604`.)
     let s = analyze("def f(x):\n    if x > 0:\n        pass\n    else:\n        x = None\n    return x\n");
     let f = sig(&s, "f");
     let x = f.params.iter().find(|p| p.name == "x").unwrap();
-    assert_eq!(x.shape, Shape::Union(vec![Shape::Int, Shape::None]));
-
-    let stub = pylens::stub::render_stub(&s);
-    assert!(
-        stub.contains("x: int | None"),
-        "expected PEP 604 union rendering in stub: {stub}"
-    );
+    assert_eq!(x.shape, Shape::Any);
 }
 
 #[test]
@@ -773,6 +821,72 @@ fn inherited_method_does_not_resolve() {
         f.unresolved_effects
             .iter()
             .any(|u| u.reason == "call_method_unknown" && u.callee.as_deref() == Some("run"))
+    );
+}
+
+#[test]
+fn unbound_superclass_call_on_a_locally_declared_class_resolves() {
+    let s = analyze(
+        "class BaseError(Exception):\n\
+         \x20   def __init__(self, code):\n\
+         \x20       if code < 0:\n\
+         \x20           raise ValueError('bad code')\n\
+         \x20       self.code = code\n\
+         class SpecificError(BaseError):\n\
+         \x20   def __init__(self, code, msg):\n\
+         \x20       BaseError.__init__(self, code)\n\
+         \x20       self.msg = msg\n",
+    );
+    let sub_init = s
+        .iter()
+        .find(|f| f.name == "__init__" && f.owner.as_deref() == Some("SpecificError"))
+        .expect("SpecificError.__init__ signature");
+    // `BaseError.__init__(self, code)` is the unbound-superclass form: `BaseError` is a
+    // class declared in this module and the receiver argument is the caller's own `self`, so
+    // it resolves like `self.__init__(...)` would — `BaseError.__init__`'s `ValueError`
+    // propagates, and the call leaves no `call_method_unknown` acknowledgment.
+    assert!(sub_init.raises.implicit.contains(&"ValueError".to_string()));
+    assert!(!sub_init.unresolved_effects.iter().any(|u| u.reason == "call_method_unknown"));
+}
+
+#[test]
+fn unbound_call_on_an_undeclared_class_stays_unresolved() {
+    let s = analyze(
+        "class SpecificError(Exception):\n\
+         \x20   def __init__(self, code):\n\
+         \x20       Exception.__init__(self, code)\n",
+    );
+    // `Exception` is a builtin, not declared in this module, so the unbound-superclass form
+    // must NOT resolve — it stays an opaque, acknowledged call.
+    let init = sig(&s, "__init__");
+    assert!(
+        init.unresolved_effects
+            .iter()
+            .any(|u| u.reason == "call_method_unknown" && u.callee.as_deref() == Some("__init__"))
+    );
+}
+
+#[test]
+fn unbound_call_with_a_non_receiver_first_arg_stays_unresolved() {
+    let s = analyze(
+        "class BaseError(Exception):\n\
+         \x20   def __init__(self, code):\n\
+         \x20       self.code = code\n\
+         class SpecificError(BaseError):\n\
+         \x20   def __init__(self, other, code):\n\
+         \x20       BaseError.__init__(other, code)\n",
+    );
+    // The first positional argument is `other`, not this method's own receiver `self` — the
+    // unbound-superclass form must not resolve on a mismatched receiver.
+    let sub_init = s
+        .iter()
+        .find(|f| f.name == "__init__" && f.owner.as_deref() == Some("SpecificError"))
+        .expect("SpecificError.__init__ signature");
+    assert!(
+        sub_init
+            .unresolved_effects
+            .iter()
+            .any(|u| u.reason == "call_method_unknown" && u.callee.as_deref() == Some("__init__"))
     );
 }
 

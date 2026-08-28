@@ -35,6 +35,27 @@ pub enum ReturnKind {
     Opaque,
 }
 
+impl ReturnKind {
+    /// The conservative [`Shape`] a value of this return kind carries. Used to feed a resolved
+    /// stdlib model-table return kind into the Shapes pass — `Opaque` (and every container kind,
+    /// since the element type is unknown) maps to the widest shape in its constructor rather
+    /// than guessing an element type.
+    pub fn to_shape(self) -> Shape {
+        match self {
+            ReturnKind::None => Shape::None,
+            ReturnKind::Bool => Shape::Bool,
+            ReturnKind::Int => Shape::Int,
+            ReturnKind::Float => Shape::Float,
+            ReturnKind::Str => Shape::Str,
+            ReturnKind::Bytes => Shape::Bytes,
+            ReturnKind::Sequence => Shape::any_seq(),
+            ReturnKind::Mapping => Shape::any_map(),
+            ReturnKind::Set => Shape::any_set(),
+            ReturnKind::Opaque => Shape::Any,
+        }
+    }
+}
+
 /// A contradiction between an untrusted declared annotation and the statically inferred
 /// may-set. See `analyze::passes::type_check` for the conservative flagging rule (only raised
 /// on full disjointness, never on a mere subset mismatch).

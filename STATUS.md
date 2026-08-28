@@ -1,6 +1,6 @@
 # Status
 
-Tests: 165. `validate examples`: 0 hard defects, 44 soft, coverage 92/107 lines.
+Tests: 177. `validate examples`: 0 hard defects, 44 soft, coverage 92/107 lines.
 
 ## Done in the last pass
 
@@ -16,34 +16,54 @@ Tests: 165. `validate examples`: 0 hard defects, 44 soft, coverage 92/107 lines.
   `validate` now checks captured stderr.
 - Two worker fixes: non-finite floats no longer produce invalid JSON, and `sys.exit()` records
   as a semantic raise instead of crashing the forked child.
+- The model table's return kind now feeds the Shapes pass (`models::return_kind`, queried
+  through `resolve_stdlib_return`, which shares `resolve_dotted` with `resolve_stdlib_call` so
+  both passes agree on which stdlib function a call refers to): `os.path.join(...)` and similar
+  calls now give the assigned local a `str`/`bool`/`int`/`float`/sequence shape instead of `any`.
+  Only entries whose return type is unambiguous across the whole raises/io group are modelled;
+  everything else stays `Any`.
+- Unbound superclass calls `Base.method(self, ...)` resolve when `Base` is a class declared in
+  the same module and the first positional argument is the caller's receiver (`calls.rs`, with
+  `positional_arg_roots_skip_first` for the argument mapping). Same-module only; a builtin or
+  imported base (`Exception`) stays unresolved. On the stdlib corpus this converts 26 functions
+  out of purity `unknown` (25 to `impure`, 1 to `pure`).
+- A parameter rebound to an unrelated value (`def f(x): x = []`) no longer reports the rebound
+  shape. The Shapes pass freezes the parameter on the rebind and resets it to `any` after the
+  fixpoint. A self-referential rebind (`x = x.strip()`) still votes; locals are unaffected.
+
+## Measurement note — the acknowledgment counts are no longer comparable
+
+Interprocedural propagation inherits a callee's `unresolved_effects` into every caller. A
+change that resolves more calls therefore *raises* the flat site counts: one removed
+acknowledgment at the call site pulls in all of the callee's own acknowledgments, once per
+caller. After this pass the counts are `call_method_unknown` 16265, `call_unknown_callee`
+10168, `call_import` 9876 (baseline at the previous commit, same corpus and script: 16202,
+10088, 9742). Use the purity distribution as the precision gauge instead: `unknown` 8246
+(64.9%, was 8272 / 65.1%), `pure` 3238, `impure` 1221, over 12705 functions.
+`temp/remeasure.py` reproduces both tables.
 
 ## Open work
 
-### 1. Resolve unbound superclass calls — `Base.method(self, ...)`
+### 1. The rebind freeze is flow-insensitive and drops sound facts
 
-`call_method_unknown` is now the largest unresolved category: 16202 sites over the CPython 3.13
-standard library, against 9742 for `call_import`. A large part is the unbound superclass form,
-which is common in exception hierarchies. `calls.rs` already resolves `self.method(...)`; the
-same resolution applies when the attribute base is a declared class name and the first
-positional argument is the receiver of the caller.
+The conservative fix for the rebound parameter discards the shape entirely. But after
+`x = Box()` the name really is a `Box` — that is a local binding fact, and method resolution
+through it was sound. Measured cost on the stdlib corpus: about 24 `call_method_unknown` sites
+that previously resolved. A flow-sensitive treatment would keep the parameter *annotation* at
+`any` while the post-rebind *local* shape keeps resolving calls.
 
-Note that the count went from 8756 to 16202 because of the fix that stopped these
-acknowledgments disappearing when the receiver was not trackable. They are newly visible blind
-spots, not new ones.
+### 2. An aliased from-import misses the model table
 
-### 2. A rebound parameter reports the rebound shape
+`from os.path import join as j; j(...)` looks up `os.path.j`, which fails, and safely falls
+back to unresolved/`any`. The Effects and Shapes passes share the miss identically (both go
+through `resolve_dotted`), so they stay consistent — just imprecise for this one form. Fix in
+the import-binding table: record the original name next to the local alias.
 
-`def f(x): x = []` reports `x` as a sequence, and `def f(x): x = Box()` reports it as an
-instance of `Box`, which the `.pyi` stub then writes as an annotation. The caller can give
-anything. `validate` cannot catch this, because it concerns a declared shape and not an effect.
-Confirmed to be older than the instance work. Fix: the shape of a parameter must stop
-accumulating votes after the name is rebound to an unrelated value.
+### 3. Superclass resolution across files
 
-### 3. Feed the model table's return kinds into the Shapes pass
-
-`src/analyze/models.rs` records a return kind for each entry, but nothing reads it. Shapes runs
-before Effects, so this needs its own wiring. It would give `os.path.join(...)` a `str` shape
-instead of `any`, which improves both the inference and the generated inputs.
+The `Base.method(self, ...)` resolution is same-module only. Most stdlib bases are imported or
+builtin (`Exception`), so project mode (`src/project/interproc.rs`) is where the remaining
+volume is.
 
 ## Measurements to repeat after a change
 

@@ -6,6 +6,8 @@ use ruff_python_ast as ast;
 
 use crate::model::Shape;
 
+use super::super::super::collect::aliases::{dotted_attr, leftmost_name};
+use super::super::super::models;
 use super::state::ShapeState;
 
 /// `element_of(Seq(e)) = e`, `element_of(Set(e)) = e`, `element_of(Map(k,_)) = k` (iterating a
@@ -74,10 +76,22 @@ fn join_all(iter: impl Iterator<Item = Shape>) -> Shape {
 }
 
 fn shape_of_call(call: &ast::ExprCall, state: &ShapeState) -> Shape {
-    let ast::Expr::Name(n) = call.func.as_ref() else {
-        return Shape::Any;
-    };
-    match n.id.as_str() {
+    match call.func.as_ref() {
+        ast::Expr::Name(n) => shape_of_name_call(n.id.as_str(), state),
+        ast::Expr::Attribute(attr) => shape_of_attribute_call(call, attr, state),
+        _ => Shape::Any,
+    }
+}
+
+fn shape_of_name_call(name: &str, state: &ShapeState) -> Shape {
+    // A directly-imported callable (`from os.path import join; join(...)`) takes priority over
+    // the builtin names below, mirroring the Effects pass's own call resolution order.
+    if let Some(module) = state.bindings.get(name) {
+        return models::return_kind(&format!("{}.{name}", module.dotted()))
+            .map(crate::model::ReturnKind::to_shape)
+            .unwrap_or(Shape::Any);
+    }
+    match name {
         "int" => Shape::Int,
         "float" => Shape::Float,
         "bool" => Shape::Bool,
@@ -86,7 +100,26 @@ fn shape_of_call(call: &ast::ExprCall, state: &ShapeState) -> Shape {
         "list" | "tuple" | "sorted" | "reversed" => Shape::any_seq(),
         "dict" => Shape::any_map(),
         "set" | "frozenset" => Shape::any_set(),
-        name if state.classes.contains(name) => Shape::Instance(name.to_string()),
+        _ if state.classes.contains(name) => Shape::Instance(name.to_string()),
         _ => Shape::Any,
     }
+}
+
+/// `base.suffix...(...)` where `base` is an imported module binding (`os.path.join(...)`,
+/// `p.join(...)` for `import os.path as p`) — resolved to the model table's return kind through
+/// the same [`models::resolve_stdlib_return`] the Effects pass uses for raises/io, so both
+/// passes agree on which stdlib function the call names.
+fn shape_of_attribute_call(call: &ast::ExprCall, attr: &ast::ExprAttribute, state: &ShapeState) -> Shape {
+    let Some(base) = leftmost_name(&attr.value) else {
+        return Shape::Any;
+    };
+    let Some(module) = state.bindings.get(base) else {
+        return Shape::Any;
+    };
+    let Some(full) = dotted_attr(call.func.as_ref()) else {
+        return Shape::Any;
+    };
+    models::resolve_stdlib_return(module, base, &full)
+        .map(crate::model::ReturnKind::to_shape)
+        .unwrap_or(Shape::Any)
 }

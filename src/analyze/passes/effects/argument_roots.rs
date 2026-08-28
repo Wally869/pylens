@@ -19,6 +19,21 @@ impl Walker < '_ , '_ > {
                 .collect()
         }
 
+        /// Same as [`Self::positional_arg_roots`], but for the unbound-superclass call form
+        /// (`Base.method(self, ...)`), whose first positional argument is the receiver written
+        /// explicitly rather than implicit in the attribute access. The callee's own parameter
+        /// list is already receiver-less (`self` never appears in `EffectSignature::params`), so
+        /// the position->parameter mapping must skip that first argument too.
+        pub fn positional_arg_roots_skip_first(&self, arguments: &ast::Arguments) -> Vec<Option<MutationTarget>> {
+            arguments
+                .args
+                .iter()
+                .skip(1)
+                .take_while(|arg| !matches!(arg, ast::Expr::Starred(_)))
+                .map(|arg| self.facts.resolve_target(arg, None))
+                .collect()
+        }
+
         /// The caller-side root each keyword argument resolves to, paired with its name — for a
         /// [`CallSite`]/[`ImportCallSite`]. A `**kwargs`-unpacking keyword (no name) is skipped: it
         /// can't be matched to a single callee parameter (its roots travel via

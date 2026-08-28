@@ -44,7 +44,7 @@ use std::collections::HashMap;
 
 use ruff_python_ast as ast;
 
-use crate::model::Shape;
+use crate::model::{ModuleRef, Shape};
 
 use super::super::collect::shapes::{numeric_literal_shape, shape_for_method};
 use super::super::context::ModuleAnalysis;
@@ -74,13 +74,13 @@ impl Pass for ShapesPass {
             match stmt {
                 ast::Stmt::FunctionDef(def) => {
                     let receiver = receivers.next().unwrap_or(ReceiverKind::None);
-                    ctx.shapes.push(infer_function(def, receiver, &ctx.classes));
+                    ctx.shapes.push(infer_function(def, receiver, &ctx.classes, &ctx.bindings));
                 }
                 ast::Stmt::ClassDef(class) => {
                     for member in &class.body {
                         if let ast::Stmt::FunctionDef(def) = member {
                             let receiver = receivers.next().unwrap_or(ReceiverKind::None);
-                            ctx.shapes.push(infer_function(def, receiver, &ctx.classes));
+                            ctx.shapes.push(infer_function(def, receiver, &ctx.classes, &ctx.bindings));
                         }
                     }
                 }
@@ -96,6 +96,7 @@ fn infer_function(
     def: &ast::StmtFunctionDef,
     receiver: ReceiverKind,
     classes: &std::collections::HashSet<String>,
+    bindings: &HashMap<String, ModuleRef>,
 ) -> HashMap<String, Shape> {
     let params = param_names(&def.parameters);
     let self_param = match receiver {
@@ -107,13 +108,20 @@ fn infer_function(
         .filter(|p| Some(p.as_str()) != self_param.as_deref())
         .collect();
 
-    let mut state = ShapeState::new(&tracked, classes.clone());
+    let mut state = ShapeState::new(&tracked, classes.clone(), bindings);
     for _ in 0..MAX_ITERATIONS {
         let before = state.env.clone();
         visit_body(&def.body, &mut state);
         if state.env == before {
             break;
         }
+    }
+    // A parameter rebound to an unrelated value anywhere in the body has its accumulated
+    // evidence discarded entirely: the rebind severs the shape from the caller's argument, and
+    // the walk has no ordering model that would let it keep only the pre-rebind votes. See
+    // `ShapeState::frozen_params`.
+    for name in &state.frozen_params {
+        state.env.insert(name.clone(), Shape::Any);
     }
     state.env
 }
@@ -366,5 +374,53 @@ fn visit_call(call: &ast::ExprCall, state: &mut ShapeState) {
     }
     for kw in call.arguments.keywords.iter() {
         visit_expr(&kw.value, state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::declarations::DeclarationsPass;
+    use super::super::imports::ImportsPass;
+    use super::*;
+
+    /// Run just Imports -> Declarations -> Shapes and return the name->shape env for the
+    /// module's first (and only) function.
+    fn shapes_of(src: &str) -> HashMap<String, Shape> {
+        let parsed = crate::parse::parse_source(src).expect("parse");
+        let module = parsed.syntax();
+        let mut ctx = ModuleAnalysis::new(src);
+        ImportsPass.run(module, &mut ctx);
+        DeclarationsPass.run(module, &mut ctx);
+        ShapesPass.run(module, &mut ctx);
+        ctx.shapes.into_iter().next().expect("one function")
+    }
+
+    #[test]
+    fn stdlib_call_via_import_gives_local_the_modelled_return_shape() {
+        let env = shapes_of("import os.path\ndef f(a, b):\n    p = os.path.join(a, b)\n    return p\n");
+        assert_eq!(env.get("p"), Some(&Shape::Str));
+    }
+
+    #[test]
+    fn stdlib_call_via_aliased_import_gives_local_the_modelled_return_shape() {
+        let env =
+            shapes_of("import os.path as p\ndef f(a, b):\n    r = p.join(a, b)\n    return r\n");
+        assert_eq!(env.get("r"), Some(&Shape::Str));
+    }
+
+    #[test]
+    fn stdlib_call_via_from_import_gives_local_the_modelled_return_shape() {
+        let env = shapes_of(
+            "from os.path import join\ndef f(a, b):\n    p = join(a, b)\n    return p\n",
+        );
+        assert_eq!(env.get("p"), Some(&Shape::Str));
+    }
+
+    #[test]
+    fn stdlib_call_absent_from_the_return_kind_table_stays_any() {
+        let env = shapes_of(
+            "import os.path\ndef f(a, b):\n    p = os.path.samestat(a, b)\n    return p\n",
+        );
+        assert_eq!(env.get("p"), Some(&Shape::Any));
     }
 }

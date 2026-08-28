@@ -129,6 +129,35 @@ impl Walker < '_ , '_ > {
                         if has_unpack {
                             self.acknowledge_unpacked_call(attr.attr.as_str(), &call.arguments);
                         }
+                    } else if let ast::Expr::Name(base_name) = attr.value.as_ref()
+                        && self.facts.classes.contains(base_name.id.as_str())
+                        && call.arguments.args.first().is_some_and(|a| self.is_self_receiver(a))
+                        && let Some(callee) = resolve_unique(
+                            self.facts.declarations,
+                            Some(base_name.id.as_str()),
+                            attr.attr.as_str(),
+                        )
+                    {
+                        // `Base.method(self, ...)`: the unbound-superclass call form, common in
+                        // exception hierarchies (`Exception.__init__(self, msg)`). `Base` is a
+                        // class declared in this module and the first positional argument is
+                        // literally this method's own receiver, so it resolves exactly like
+                        // `self.method(...)` — the callee's `SelfAttr` mutations are the caller's
+                        // own receiver's mutations too. The call's own positional arguments
+                        // include that receiver at position 0, which the callee's own
+                        // (receiver-less) parameter list has no slot for, so the
+                        // position->parameter mapping skips it.
+                        let arg_roots = self.positional_arg_roots_skip_first(&call.arguments);
+                        let kwarg_roots = self.keyword_arg_roots(&call.arguments);
+                        self.facts.call_sites.push(CallSite {
+                            callee,
+                            receiver: CallReceiver::CallerSelf,
+                            arg_roots,
+                            kwarg_roots,
+                        });
+                        if has_unpack {
+                            self.acknowledge_unpacked_call(attr.attr.as_str(), &call.arguments);
+                        }
                     } else {
                         let method = attr.attr.as_str();
                         if is_mutating_method(method) {
