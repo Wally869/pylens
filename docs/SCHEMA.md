@@ -14,8 +14,11 @@ Each top-level output has a `schema_version` field (the `SCHEMA_VERSION` constan
   consumers), the version stays at **`0.1`**. Each change, additive or breaking, goes into that
   version. The first release makes the contract fixed as `1.0`.
 - **How to increase the version (after the first release):** increase the **major** number for
-  each change that can break an existing parser — you remove or rename a field, you change the
-  type, the tag, or the value shape of a field, or you change a closed set of enum strings.
+  each change that can break an existing parser, for example:
+  - you remove or rename a field;
+  - you change the type, the tag, or the value shape of a field; or
+  - you change a closed set of enum strings.
+
   Increase the **minor** number for an additive change only — a new optional field, or a new
   value in a field that this document specifies as an open set.
 - **Compatibility rules (after the first release):** in one major version, each field keeps its
@@ -112,12 +115,18 @@ wrote.
 
 `{ "reason": <str>, "callee": <str?>, "may_affect": [<MutationTarget>...] }`
 
-The `reason` values are an open set: `call_import` (a call through an imported binding),
-`call_unknown_callee`, `call_method_unknown` (an unknown method on a tracked root),
-`call_unpacked_args` (a resolved call that unpacks `*xs` or `**kw` — the mapping cannot assign
-those roots), `dynamic_setattr`, `dynamic_delattr`, `dynamic_exec`, `dynamic_eval`, and
-`decorator` (an unknown decorator can replace the function). `may_affect` lists each tracked
-root that goes to the opaque call: positional, keyword, and unpacked.
+The `reason` values are an open set:
+
+- `call_import` — a call through an imported binding.
+- `call_unknown_callee`
+- `call_method_unknown` — an unknown method on a tracked root.
+- `call_unpacked_args` — a resolved call that unpacks `*xs` or `**kw`; the mapping cannot assign
+  those roots.
+- `dynamic_setattr`, `dynamic_delattr`, `dynamic_exec`, `dynamic_eval`
+- `decorator` — an unknown decorator can replace the function.
+
+`may_affect` lists each tracked root that goes to the opaque call: positional, keyword, and
+unpacked.
 
 ### TypeMismatch (advisory only — it never changes the may-set or the purity)
 

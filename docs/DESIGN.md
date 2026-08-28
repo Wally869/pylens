@@ -3,10 +3,16 @@
 ## Purpose
 
 pylens examines Python functions and methods statically, in Rust. It extracts their **effects**
-— the returns, the in-place mutations of the arguments and of `self`, the raised exceptions, the
-I/O, and the generator property — as a normalized **effect signature**. Then it runs each
-function in a sandbox on generated inputs and records the actual effects. The signature and the
-observed cases together are the **behavioral record** of the function.
+as a normalized **effect signature**:
+
+- the returns;
+- the in-place mutations of the arguments and of `self`;
+- the raised exceptions;
+- the I/O; and
+- the generator property.
+
+Then it runs each function in a sandbox on generated inputs and records the actual effects. The
+signature and the observed cases together are the **behavioral record** of the function.
 
 pylens stops at the record. The consumer does the subsequent work: it gives scores, it compares
 a candidate against a reference, and it changes records into a training reward.
@@ -22,9 +28,10 @@ that gap to get an incorrect reward. Thus the analyzer records each of its limit
 
 Each observed effect that the static side did not predict is a **soundness bug**. The count must
 go to zero. `pylens validate` measures this. A gap in a signature that said that it was complete
-is a **hard** defect. A gap that an acknowledged unresolved effect covers is **soft**. The
-opposite condition — pylens predicts an effect that never occurs — is imprecision. This is
-tolerable and stays low. Dynamic tests can disprove soundness, but they cannot prove it.
+is a **hard** defect. A gap that an acknowledged unresolved effect covers is **soft**.
+
+The opposite condition is imprecision: pylens predicts an effect that never occurs. This is
+tolerable, and it stays low. Dynamic tests can disprove soundness, but they cannot prove it.
 
 Two consequences:
 
@@ -36,16 +43,16 @@ Two consequences:
   the value level.
 
 A third rule, learned from a bug: **a parameter's inferred shape is a hypothesis, not a
-guarantee.** pylens infers it from the operations inside the function, and Python lets a caller
-pass anything, so the shape must never narrow a may-set. The implicit-raise set once used it
-that way: `x < 0` was the only evidence that `x` is an integer, and that conclusion then proved
-`x < 0` could not raise `TypeError`. A local's shape can narrow a may-set — `xs = []` really is
-a list at that point — but a parameter's cannot.
+guarantee.** pylens infers the shape from the operations inside the function. Python lets a
+caller pass anything, so the shape must never narrow a may-set. The implicit-raise set once used
+it that way: `x < 0` was the only evidence that `x` is an integer, and that conclusion then
+proved `x < 0` could not raise `TypeError`. A local's shape can narrow a may-set — `xs = []`
+really is a list at that point — but a parameter's shape cannot.
 
 That bug also shows a limit of the harness. Input generation draws its candidates from the same
-inferred shapes, so analysis and generation shared the assumption and no generated input could
-contradict it. Only a caller with a broader shape broke the symmetry. When a claim is justified
-by what pylens itself will generate, it is unfalsifiable, not true.
+inferred shapes. Analysis and generation thus shared the assumption, and no generated input
+could contradict it. Only a caller with a broader shape broke the symmetry. When a claim is
+justified by what pylens itself will generate, it is unfalsifiable, not true.
 
 ## Effect types (from the point of view of the caller)
 
@@ -63,8 +70,8 @@ by what pylens itself will generate, it is unfalsifiable, not true.
    operators and the calls).
 8. **Generator and async.**
 
-pylens does not trust the annotations at any point. It records them, it compares them against
-the inferred side (`type_mismatches`, advisory only), and it never uses them for inference.
+pylens does not trust the annotations at any point. It records them and compares them against
+the inferred side (`type_mismatches`, advisory only). It never uses them for inference.
 
 ## Architecture
 
@@ -85,21 +92,23 @@ parse (ruff) → pass pipeline → effect signatures → input generation → ja
   one collector for each subject (aliases, mutations, exceptions, shapes, returns, guards,
   hints, body lines):
   **Imports → Declarations → Shapes → Effects → Interprocedural → TypeCheck → Purity**. Shapes
-  runs to a fixpoint before Effects, thus the walk reads the final shapes. Interprocedural
-  propagates the effects of the local callees to the callers, to a fixpoint (recursion
-  included). It maps the arguments by position and by keyword name. If a call unpacks
-  (`f(*xs)` or `f(**kw)`), pylens keeps an acknowledged `call_unpacked_args` limit and an
-  implicit `TypeError` — the unpack operation itself can raise before the callee runs. pylens
-  does not remove the effects. TypeCheck is advisory. Purity runs last, thus it sees the
+  runs to a fixpoint before Effects, so the walk reads the final shapes.
+
+  Interprocedural propagates the effects of the local callees to the callers, to a fixpoint
+  (recursion included). It maps the arguments by position and by keyword name. If a call
+  unpacks (`f(*xs)` or `f(**kw)`), pylens keeps an acknowledged `call_unpacked_args` limit and
+  an implicit `TypeError`, because the unpack operation itself can raise before the callee runs.
+  pylens does not remove the effects. TypeCheck is advisory. Purity runs last, so it sees the
   complete effect sets.
 
   Effects also resolves a method call on a local instance. If a local's shape is exactly one
-  `Instance(C)` and `C.m` is declared in the module, `x.m(...)` resolves like any intra-module
-  call, and the constructor call `C(...)` resolves to `C.__init__`. A local bound to two
-  different classes joins to a union and stays unresolved, because a choice between the members
-  would under-approximate the other one. An inherited method stays unresolved. A fresh local's
-  self-attribute mutations are dropped, not reported: the taxonomy is from the point of view of
-  the caller, and the caller cannot see an object that the function just built.
+  `Instance(C)`, and `C.m` is declared in the module, `x.m(...)` resolves like any intra-module
+  call. The constructor call `C(...)` resolves to `C.__init__`. A local bound to two different
+  classes joins to a union and stays unresolved, because a choice between the members would
+  under-approximate the other one. An inherited method stays unresolved.
+
+  A fresh local's self-attribute mutations are dropped, not reported. The taxonomy is from the
+  point of view of the caller, and the caller cannot see an object that the function just built.
 - **`analyze/models.rs`** — the effect model table for the standard library. The key is the
   resolved module path, thus an aliased import finds the same entry. The table gives the raises
   and the io, and it removes the `call_import` acknowledgment. That is the reason each entry
@@ -129,14 +138,14 @@ parse (ruff) → pass pipeline → effect signatures → input generation → ja
   There is no constraint solver: if a shape stays `Any`, pylens gives values of different types,
   and some of them do not agree with the true expectation of the function. This module also
   supplies the candidates for the shrink operation.
-- **`record.rs`** (with `shrink.rs`) — connects the static signatures to the sandboxed execution: the probes for the
-  dependencies, the module load, and the constructor (if a module cannot load, pylens marks each
-  function `uncallable` one time), the construction of the cases, and the greedy **input
-  minimization** for the cases that raise (it shrinks the input while the same exception type
-  occurs, with a limited budget; this is an aid for the report only, and validate never uses
-  it). If the sandbox stops the code (out of memory, recursion, or timeout), this is an artifact
-  of the sandbox: `outcome:"error"` with `error.stage:"resource"`. pylens never records it as a
-  semantic `raised`.
+- **`record.rs`** (with `shrink.rs`) — connects the static signatures to the sandboxed execution.
+  It runs the probes for the dependencies, for the module load, and for the constructor. If a
+  module cannot load, pylens marks each function `uncallable` one time. It then constructs the
+  cases and runs the greedy **input minimization** for the cases that raise: it shrinks the
+  input while the same exception type occurs, with a limited budget. This minimization is an aid
+  for the report only; validate never uses it. If the sandbox stops the code (out of memory,
+  recursion, or timeout), this is an artifact of the sandbox: `outcome:"error"` with
+  `error.stage:"resource"`. pylens never records it as a semantic `raised`.
 - **`exec.rs`** — the `Sandbox` trait, the nsjail launchers (direct and through WSL), the
   JSON-over-stdio worker protocol, and the structured `HarnessError`. **There is no unsandboxed
   launcher.**
@@ -174,12 +183,13 @@ The host system only changes how pylens reaches a Linux kernel:
 | Windows | `wsl -d <distro> -- nsjail <policy> -- python worker.py` |
 
 The policy, the worker, and the protocol are the same. **There is no Docker.** On Windows, the
-untrusted code is already behind nsjail and the WSL2 virtual machine. A container adds a third
-layer and a dependency on a daemon, with no increase in security. A container has one advantage,
-hermetic provisioning for CI, and you can add it later behind the same `Sandbox` trait. pylens
-rejects these interpreters (refer to the research in `docs/research/python-execution.md`):
-CPython-WASI (slow cold start, missing stdlib modules), RustPython (insufficient fidelity), and
-Monty (insufficient maturity).
+untrusted code is already behind nsjail and the WSL2 virtual machine. A container would add a
+third layer and a dependency on a daemon, with no increase in security. A container has one
+advantage: hermetic provisioning for CI. You can add it later behind the same `Sandbox` trait.
+
+pylens rejects these interpreters (refer to the research in
+`docs/research/python-execution.md`): CPython-WASI (slow cold start, missing stdlib modules),
+RustPython (insufficient fidelity), and Monty (insufficient maturity).
 
 **Execution mechanics:**
 

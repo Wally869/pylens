@@ -2,11 +2,17 @@
 
 pylens examines the behavior of Python code. It has two engines with one shared core:
 
-- **`analyze`** — static analysis of effects and shapes. It is written in Rust and it uses the
+- **`analyze`** — static analysis of effects and shapes. It is written in Rust and uses the
   [ruff](https://github.com/astral-sh/ruff) parser. For each function, it infers an **effect
-  signature**: the return kinds, the mutations of the arguments and of `self`, the raised
-  exceptions (explicit and implicit), the I/O, the recursive parameter shapes, and the calls
-  that it cannot examine. It is immediate, it needs no sandbox, and it accepts a full directory.
+  signature**:
+  - the return kinds;
+  - the mutations of the arguments and of `self`;
+  - the raised exceptions (explicit and implicit);
+  - the I/O;
+  - the recursive parameter shapes; and
+  - the calls that it cannot examine.
+
+  `analyze` gives an immediate result. It needs no sandbox, and it accepts a full directory.
 - **`record`** — runs the function on generated inputs in an
   [nsjail](https://github.com/google/nsjail) sandbox. It records the actual behavior: the
   outcome, the return value, the mutation differences, and the raised exceptions.

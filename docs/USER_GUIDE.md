@@ -68,9 +68,13 @@ def normalize(items, scale=1.0):
     return items
 ```
 
-the signature shows this: the function uses `items` as a sequence of floats; it changes `items`
-in place; it raises `ValueError` explicitly; it can raise `IndexError`, `ZeroDivisionError`, or
-`TypeError`; and it is `impure`.
+the signature shows this:
+
+- the function uses `items` as a sequence of floats;
+- it changes `items` in place;
+- it raises `ValueError` explicitly;
+- it can raise `IndexError`, `ZeroDivisionError`, or `TypeError`; and
+- it is `impure`.
 
 Read a report with this data in mind:
 
