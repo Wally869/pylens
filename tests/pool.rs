@@ -68,3 +68,35 @@ fn call_batch_matches_the_same_calls_made_one_at_a_time() {
         );
     }
 }
+
+#[test]
+fn call_batch_isolates_sibling_grandchildren_from_a_module_level_mutation() {
+    if let Err(e) = probe() {
+        eprintln!(
+            "SKIP call_batch_isolates_sibling_grandchildren_from_a_module_level_mutation: {e}"
+        );
+        return;
+    }
+
+    // The primed-fork batch path execs the module once in an intermediate child, then forks
+    // one grandchild per item from that primed state. If a grandchild's mutation to a
+    // module-level global (`G`) leaked to its siblings — via the intermediate child, or via
+    // fork not actually copying on write — every case after the first would observe a `G`
+    // longer than one element. Each case must instead see the module exactly as freshly
+    // loaded: `G` starts empty for every one of them.
+    let pool = NsjailPool::new(1).expect("spawn pool");
+    let src = "G = []\ndef f(x):\n    G.append(x)\n    return len(G)\n";
+
+    let inputs = [json!(1), json!(2), json!(3), json!(4), json!(5)];
+    let call_inputs: Vec<CallInput> =
+        inputs.iter().map(|v| (std::slice::from_ref(v), &[][..])).collect();
+    let batched = pool
+        .call_batch(src, "f", &call_inputs, None, None)
+        .expect("call_batch f");
+    assert_eq!(batched.len(), inputs.len());
+
+    for r in &batched {
+        assert!(r.ok, "case should run: {:?}", r.error);
+        assert_eq!(r.ret, json!(1), "a sibling grandchild's mutation to G leaked");
+    }
+}

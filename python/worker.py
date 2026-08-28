@@ -9,7 +9,10 @@ Two modes:
   so untrusted code cannot leak interpreter state (monkeypatched builtins, globals, imported
   modules) into the measurement of any other request. The parent never `exec`s untrusted
   source. This is what the persistent worker pool drives; it amortizes interpreter + import
-  startup while preserving per-request isolation.
+  startup while preserving per-request isolation. A `batch` request goes through an
+  intermediate child that execs the module once and forks one grandchild per item from that
+  primed state, so only the batch's first item pays a module exec — the parent still never
+  execs untrusted source, and every item's mutations still die with its own grandchild.
 
 Captured per request: the return value, pre- and post-call argument state (mutation is detected
 by diffing the tagged-encoded snapshot taken before the call against the one after), any raised
@@ -174,7 +177,17 @@ def _make_tracer(executed, arcs):
     return global_trace
 
 
-def run_request(req):
+def _load_module(source):
+    """Compile and exec the module source, returning its namespace dict. Compiling executes
+    nothing; the exec is what runs the module's top-level side effects, so callers that share a
+    namespace across many calls (the primed-fork batch path) must only ever call this once, in
+    the process that will be forked from — never in the long-lived serve parent."""
+    ns = {}
+    exec(compile(source, "<pylens>", "exec"), ns)
+    return ns
+
+
+def run_request(req, ns=None):
     """Execute one request in the current process. Returns a response dict.
 
     Free function: call `fn(*args)`. Method: instantiate `class(*ctor_args)`, snapshot its
@@ -183,6 +196,13 @@ def run_request(req):
     Load probe: when `fn` is null, only execute the module source (and, if `class` is given,
     instantiate the receiver) and report whether it loaded — no call. This is how the caller
     learns a module won't import, or a constructor can't be built, *once* instead of per case.
+
+    `ns` is the module's already-loaded namespace, when the caller primed it (the primed-fork
+    batch path: the intermediate child execs the module once and forks a grandchild per item,
+    each grandchild passing its inherited `ns` here so it skips its own exec). When `ns` is
+    None (the default, and always true for a single unbatched request), the module is loaded
+    here instead, so the unbatched path's behavior — and its `stage="setup"` error on a load
+    failure — is unchanged.
     """
     resp = base_response()
     try:
@@ -199,8 +219,8 @@ def run_request(req):
     # Load/ctor probe: exec the module, optionally build the receiver, report load status.
     if fn_name is None:
         try:
-            ns = {}
-            exec(compile(source, "<pylens>", "exec"), ns)
+            if ns is None:
+                ns = _load_module(source)
         except Exception as e:
             resp["error"] = exc_error("setup", e)
             return resp
@@ -219,8 +239,8 @@ def run_request(req):
 
     receiver = None
     try:
-        ns = {}
-        exec(compile(source, "<pylens>", "exec"), ns)
+        if ns is None:
+            ns = _load_module(source)
         args = [deserialize(a) for a in args_in]
         kwargs = {k: deserialize(v) for k, v in kwargs_in.items()}
         if class_name is not None:
@@ -326,31 +346,34 @@ def oneshot():
     sys.stdout.write(json.dumps(run_request(req), allow_nan=False))
 
 
-def _handle_in_child(req, timeout):
-    """Fork a child to run one prepared request dict; return its response bytes, or None on
-    timeout.
+def _fork_bytes(produce, timeout):
+    """Fork a child that runs `produce()` — a zero-arg callable returning the bytes to write to
+    the pipe — and hand those bytes back to the caller, or None on timeout.
 
-    Isolates untrusted state (the child inherits imports but its mutations die with it) and
-    bounds each request independently — necessary because the --serve process is long-lived,
-    so the jail's wall time_limit cannot bound individual calls. Takes an already-parsed
-    request dict (not a raw line) so both a single request and each item of a `batch` request
-    can share this isolation/timeout machinery.
+    The generic fork + deadline + pipe machinery underneath every isolation boundary in this
+    file: a single request's child (`produce` calls `run_request` once), a batch item's
+    grandchild (`produce` calls `run_request` against an already-primed `ns`), and the primed
+    batch's own intermediate child (`produce` runs the whole batch and returns the assembled
+    `{"results": [...]}` bytes). Bounds the child independently of the jail's wall time_limit,
+    which can't bound individual calls in a long-lived --serve process. A timed-out child is
+    killed; its (grand)children, if any, die with it.
     """
     r, w = os.pipe()
     pid = os.fork()
-    if pid == 0:  # child: run the untrusted request, write the response, never return
+    if pid == 0:  # child: run untrusted work, write the response, never return
         os.close(r)
         try:
-            resp = run_request(req)
+            data = produce()
         except Exception as e:
             resp = base_response()
             resp["error"] = exc_error("harness", e)
+            data = json.dumps(resp, allow_nan=False).encode()
         try:
-            os.write(w, json.dumps(resp, allow_nan=False).encode())
+            os.write(w, data)
         finally:
             os.close(w)
             os._exit(0)
-    # parent: read the child's response under a deadline, killing it on timeout
+    # parent: read the child's output under a deadline, killing it on timeout
     os.close(w)
     chunks = []
     deadline = time.monotonic() + timeout
@@ -377,6 +400,13 @@ def _handle_in_child(req, timeout):
     return None if timed_out else b"".join(chunks)
 
 
+def _handle_in_child(req, timeout):
+    """Fork a child to run one prepared request dict; return its response bytes, or None on
+    timeout. Takes an already-parsed request dict (not a raw line) so both a single request and
+    (via `run_request`'s `ns` argument) a primed batch item can share this machinery."""
+    return _fork_bytes(lambda: json.dumps(run_request(req), allow_nan=False).encode(), timeout)
+
+
 def _timeout_response(timeout):
     # Wall-time exceeded: as much a resource kill as MemoryError/RecursionError, so it gets the
     # same `stage="resource"` category (kind distinguishes the specific cause).
@@ -394,9 +424,9 @@ def _no_output_response():
     return resp
 
 
-def _run_one(req, timeout):
-    """Run one prepared request dict in a forked child; return the parsed response dict."""
-    out = _handle_in_child(req, timeout)
+def _collect_result(out, timeout):
+    """Turn a `_fork_bytes` outcome (bytes, empty bytes, or None on timeout) into a parsed
+    response dict, for one child's output."""
     if out is None:
         return _timeout_response(timeout)
     if not out:
@@ -411,6 +441,11 @@ def _run_one(req, timeout):
         return resp
 
 
+def _run_one(req, timeout):
+    """Run one prepared request dict in a forked child; return the parsed response dict."""
+    return _collect_result(_handle_in_child(req, timeout), timeout)
+
+
 def _run_one_bytes(req, timeout):
     """Run one prepared request dict in a forked child; return the raw response bytes, so a
     single unbatched request's output never pays a parse/re-serialize round trip."""
@@ -422,16 +457,55 @@ def _run_one_bytes(req, timeout):
     return out
 
 
+def _run_batch_primed(base_req, batch, timeout):
+    """Run inside the batch's intermediate child (already forked from the serve parent). Execs
+    the module ONCE, then forks one grandchild per batch item from that primed state, so each
+    item skips its own module re-exec — the cost that dominates for a module with real size.
+
+    Each grandchild still gets its own fork (so its mutations to the shared `ns` die with it —
+    fork's copy-on-write means siblings never see each other's writes) and its own per-item
+    timeout, so a hanging item is killed without sinking the rest of the batch. Returns the
+    assembled `{"results": [...]}` bytes; a module-load failure here is reported as the same
+    `stage="setup"` error, once per item, that a per-case exec would have produced.
+    """
+    try:
+        ns = _load_module(base_req["source"])
+    except Exception as e:
+        err = exc_error("setup", e)
+        results = []
+        for _ in batch:
+            resp = base_response()
+            resp["error"] = err
+            results.append(resp)
+        return json.dumps({"results": results}, allow_nan=False).encode()
+
+    results = []
+    for item in batch:
+        item_req = dict(base_req)
+        item_req["args"] = item.get("args", [])
+        item_req["kwargs"] = item.get("kwargs", {})
+        out = _fork_bytes(
+            lambda item_req=item_req: json.dumps(run_request(item_req, ns), allow_nan=False).encode(),
+            timeout,
+        )
+        results.append(_collect_result(out, timeout))
+    return json.dumps({"results": results}, allow_nan=False).encode()
+
+
 def serve():
-    """Fork-server loop: newline-delimited requests, one forked child per item.
+    """Fork-server loop: newline-delimited requests.
 
     A request may carry a `batch` field instead of `args`/`kwargs`:
     `{"source":..., "fn":..., "class":..., "ctor_args":..., "batch": [{"args":[...],
-    "kwargs":{...}}, ...]}`. Each batch item is forked and timed exactly like a standalone
-    request (sequentially, one child at a time), and the whole batch gets ONE
-    newline-delimited response: `{"results": [<normal response>, ...]}`. A timed-out item
-    kills only its own child; the remaining items in the batch still run. Unbatched requests
-    (validate, probes, one-shot mode) are untouched and keep byte-identical output.
+    "kwargs":{...}}, ...]}`. A batch is run by an intermediate child (`_run_batch_primed`) that
+    execs the module once and forks one grandchild per item from that primed state, so only the
+    first item in the batch pays a module exec. The intermediate child enforces each item's
+    normal per-item timeout itself; the serve parent supervises the intermediate child with a
+    whole-batch deadline of `timeout * len(batch)` as a backstop against the intermediate child
+    itself wedging — a timed-out item still only kills its own grandchild, never a sibling. The
+    whole batch gets ONE newline-delimited response: `{"results": [<normal response>, ...]}`.
+    Unbatched requests (validate, probes, one-shot mode) are untouched: one fork, exec in the
+    child, byte-identical output to before.
     """
     timeout = float(os.environ.get("PYLENS_CALL_TIMEOUT", "10"))
     for raw in sys.stdin.buffer:
@@ -450,13 +524,16 @@ def serve():
         batch = req.get("batch") if isinstance(req, dict) else None
         if batch is not None:
             base = {k: v for k, v in req.items() if k != "batch"}
-            results = []
-            for item in batch:
-                item_req = dict(base)
-                item_req["args"] = item.get("args", [])
-                item_req["kwargs"] = item.get("kwargs", {})
-                results.append(_run_one(item_req, timeout))
-            out = json.dumps({"results": results}, allow_nan=False).encode()
+            whole_timeout = timeout * max(len(batch), 1)
+            raw_out = _fork_bytes(lambda: _run_batch_primed(base, batch, timeout), whole_timeout)
+            if raw_out is None:
+                results = [_timeout_response(timeout) for _ in batch]
+                out = json.dumps({"results": results}, allow_nan=False).encode()
+            elif not raw_out:
+                results = [_no_output_response() for _ in batch]
+                out = json.dumps({"results": results}, allow_nan=False).encode()
+            else:
+                out = raw_out
         else:
             out = _run_one_bytes(req, timeout)
         sys.stdout.buffer.write(out + b"\n")
