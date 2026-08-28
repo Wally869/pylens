@@ -2,6 +2,7 @@
 //! [`EffectSignature`] per function/method using may-set (over-approximating) semantics. See
 //! docs/DESIGN.md.
 
+mod builtin_raises;
 mod collect;
 mod context;
 mod models;

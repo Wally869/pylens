@@ -3,6 +3,8 @@
 //! for a future Interprocedural pass that resolves intra-file calls; the table is collected here
 //! but not yet consumed by anything downstream, and it is never serialized.
 
+use std::collections::HashSet;
+
 use ruff_python_ast as ast;
 
 use super::super::context::ModuleAnalysis;
@@ -41,11 +43,37 @@ impl Pass for DeclarationsPass {
                     ctx.declarations.push(decl_info(def, None));
                 }
                 ast::Stmt::ClassDef(class) => {
-                    ctx.classes.insert(class.name.as_str().to_string());
+                    let name = class.name.as_str().to_string();
+                    ctx.classes.insert(name.clone());
+                    let attrs = ctx.class_attrs.entry(name).or_default();
                     for member in &class.body {
-                        if let ast::Stmt::FunctionDef(def) = member {
-                            ctx.declarations
-                                .push(decl_info(def, Some(class.name.as_str().to_string())));
+                        match member {
+                            ast::Stmt::FunctionDef(def) => {
+                                attrs.insert(def.name.as_str().to_string());
+                                // Only `__init__` proves an attribute: a fresh instance always
+                                // runs its class's `__init__` before any other method can
+                                // possibly see it, so a `self.attr = ...` there really is on
+                                // every instance. An assignment in any OTHER method (`arm()`,
+                                // say) proves nothing — an instance can reach `read()` without
+                                // ever having called `arm()` first, so treating that as a
+                                // guarantee is exactly the unsoundness a probe caught (see
+                                // `temp/probe_selfattr.py`: `Gadget.read` genuinely raises
+                                // `AttributeError` on a fresh, un-`arm`ed instance).
+                                if def.name.as_str() == "__init__"
+                                    && let Some(self_name) = first_param_name(&def.parameters)
+                                {
+                                    collect_self_attrs(&def.body, self_name, attrs);
+                                }
+                                ctx.declarations
+                                    .push(decl_info(def, Some(class.name.as_str().to_string())));
+                            }
+                            ast::Stmt::Assign(assign) => {
+                                for target in &assign.targets {
+                                    note_class_level_attr(target, attrs);
+                                }
+                            }
+                            ast::Stmt::AnnAssign(ann) => note_class_level_attr(&ann.target, attrs),
+                            _ => {}
                         }
                     }
                 }
@@ -130,4 +158,81 @@ fn param_names(params: &ast::Parameters) -> Vec<String> {
         out.push(k.name.as_str().to_string());
     }
     out
+}
+
+/// A class-level `attr = ...` / `attr: T = ...` statement (directly in the class body, not
+/// inside any method) — every instance has this attribute the moment the class object itself is
+/// defined, before `__init__` even runs, so it's proven unconditionally.
+fn note_class_level_attr(target: &ast::Expr, out: &mut HashSet<String>) {
+    if let ast::Expr::Name(n) = target {
+        out.insert(n.id.as_str().to_string());
+    }
+}
+
+fn first_param_name(params: &ast::Parameters) -> Option<&str> {
+    params
+        .posonlyargs
+        .first()
+        .or(params.args.first())
+        .map(|p| p.parameter.name.as_str())
+}
+
+/// Collect every name assigned as `self.<attr> = ...` (or annotated/augmented) anywhere in
+/// `body`, where `self_name` is this method's own receiver parameter name. Recurses through
+/// `if`/`for`/`while`/`try`/`with`/`match` the same way the Effects walk does, but — like the
+/// Effects walk — does not descend into a nested `def`/`class`'s own body: that introduces a
+/// separate scope, and a closure's `self`-attribute writes are out of scope for this table (see
+/// `ModuleAnalysis::class_attrs`'s doc: under-counting here only widens the resulting may-set,
+/// never narrows it).
+fn note_self_attr(target: &ast::Expr, self_name: &str, out: &mut HashSet<String>) {
+    if let ast::Expr::Attribute(a) = target
+        && let ast::Expr::Name(n) = a.value.as_ref()
+        && n.id.as_str() == self_name
+    {
+        out.insert(a.attr.as_str().to_string());
+    }
+}
+
+fn collect_self_attrs(body: &[ast::Stmt], self_name: &str, out: &mut HashSet<String>) {
+    for stmt in body {
+        match stmt {
+            ast::Stmt::Assign(assign) => {
+                for target in &assign.targets {
+                    note_self_attr(target, self_name, out);
+                }
+            }
+            ast::Stmt::AugAssign(aug) => note_self_attr(&aug.target, self_name, out),
+            ast::Stmt::AnnAssign(ann) => note_self_attr(&ann.target, self_name, out),
+            ast::Stmt::If(if_stmt) => {
+                collect_self_attrs(&if_stmt.body, self_name, out);
+                for clause in &if_stmt.elif_else_clauses {
+                    collect_self_attrs(&clause.body, self_name, out);
+                }
+            }
+            ast::Stmt::For(for_stmt) => {
+                collect_self_attrs(&for_stmt.body, self_name, out);
+                collect_self_attrs(&for_stmt.orelse, self_name, out);
+            }
+            ast::Stmt::While(while_stmt) => {
+                collect_self_attrs(&while_stmt.body, self_name, out);
+                collect_self_attrs(&while_stmt.orelse, self_name, out);
+            }
+            ast::Stmt::With(with_stmt) => collect_self_attrs(&with_stmt.body, self_name, out),
+            ast::Stmt::Try(try_stmt) => {
+                collect_self_attrs(&try_stmt.body, self_name, out);
+                for handler in &try_stmt.handlers {
+                    let ast::ExceptHandler::ExceptHandler(h) = handler;
+                    collect_self_attrs(&h.body, self_name, out);
+                }
+                collect_self_attrs(&try_stmt.orelse, self_name, out);
+                collect_self_attrs(&try_stmt.finalbody, self_name, out);
+            }
+            ast::Stmt::Match(match_stmt) => {
+                for case in &match_stmt.cases {
+                    collect_self_attrs(&case.body, self_name, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }

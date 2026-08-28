@@ -1,7 +1,9 @@
 use ruff_python_ast as ast;
 use crate::model::*;
 use super::super::super::collect::returns::classify_return;
-use super::super::super::collect::exceptions::exception_name;
+use super::super::super::collect::exceptions::{
+    destructure_may_raise, exception_name, for_destructure_may_raise,
+};
 use super::Walker;
 
 impl Walker < '_ , '_ > {
@@ -83,6 +85,13 @@ impl Walker < '_ , '_ > {
                 Stmt::Assign(assign) => {
                     self.visit_expr(&assign.value);
                     for target in &assign.targets {
+                        // A destructuring target (`a, b = ...`) may raise `ValueError` on an
+                        // arity mismatch — proven safe only for a literal `Tuple`/`List` RHS of
+                        // the exact same length (recursively, for a nested pattern); see
+                        // `collect::exceptions::destructure_may_raise`.
+                        if destructure_may_raise(target, &assign.value) {
+                            self.facts.sig.raises.implicit.push("ValueError".to_string());
+                        }
                         self.handle_assign_target(target, &assign.value);
                     }
                 }
@@ -116,6 +125,17 @@ impl Walker < '_ , '_ > {
                 }
                 Stmt::For(for_stmt) => {
                     self.visit_expr(&for_stmt.iter);
+                    // Iterating a value the analyzer can't prove is iterable may raise
+                    // `TypeError`; unpacking a destructuring target against an item the analyzer
+                    // can't prove has the right arity may raise `ValueError` — see
+                    // `FunctionFacts::iterable_proven` / `collect::exceptions::
+                    // for_destructure_may_raise`.
+                    if !self.facts.iterable_proven(&for_stmt.iter) {
+                        self.facts.sig.raises.implicit.push("TypeError".to_string());
+                    }
+                    if for_destructure_may_raise(&for_stmt.target, &for_stmt.iter) {
+                        self.facts.sig.raises.implicit.push("ValueError".to_string());
+                    }
                     // `for row in matrix:` binds `row` to an element reached through `matrix` — a
                     // mutation via `row` (`row[i] = ...`, `row.append(...)`, ...) is a (possibly
                     // nested) mutation of `matrix`, so the loop variable aliases the iterable's
@@ -165,6 +185,14 @@ impl Walker < '_ , '_ > {
         pub fn visit_comprehensions(&mut self, generators: &[ast::Comprehension]) {
             for comp in generators {
                 self.visit_expr(&comp.iter);
+                // Same iterability/arity rules as a `for` statement's own clause — see the
+                // `Stmt::For` arm above.
+                if !self.facts.iterable_proven(&comp.iter) {
+                    self.facts.sig.raises.implicit.push("TypeError".to_string());
+                }
+                if for_destructure_may_raise(&comp.target, &comp.iter) {
+                    self.facts.sig.raises.implicit.push("ValueError".to_string());
+                }
                 for cond in &comp.ifs {
                     self.visit_expr(cond);
                 }

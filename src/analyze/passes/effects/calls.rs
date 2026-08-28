@@ -1,9 +1,12 @@
 use ruff_python_ast as ast;
 use crate::model::*;
 use super::super::super::collect::aliases::{dotted_attr, leftmost_name};
-use super::super::super::collect::mutations::{is_known_readonly_method, is_mutating_method};
+use super::super::super::collect::mutations::{
+    is_known_readonly_method, is_mutating_method, readonly_arg_contract_violated,
+};
 use super::super::super::collect::exceptions::call_implicit_exception;
 use super::super::super::context::{CallReceiver, CallSite, ImportCallSite};
+use super::super::super::builtin_raises;
 use super::super::super::models::{self, ModelEntry};
 use super::super::declarations::resolve_unique;
 use super::builtins::is_known_pure_builtin;
@@ -171,11 +174,26 @@ impl Walker < '_ , '_ > {
                         }
                     } else {
                         let method = attr.attr.as_str();
+                        // The method lookup itself is an attribute load, whether or not the
+                        // method is on the mutating/readonly list below — same rule as a plain
+                        // load (`FunctionFacts::attribute_load_proven`), since this branch is
+                        // reached only when the receiver never resolved to a proven same-module
+                        // class/instance (the branches above handle every case that does).
+                        if !self.facts.attribute_load_proven(&attr.value, method) {
+                            self.facts.sig.raises.implicit.push("AttributeError".to_string());
+                        }
                         if is_mutating_method(method) {
                             if let Some(t) = self.facts.resolve_target(&attr.value, None) {
                                 self.facts.add_mutation(t, MutationKind::Method, Some(method));
                             }
-                        } else if !is_known_readonly_method(method) {
+                        } else if is_known_readonly_method(method) {
+                            // The receiver is safe, but a readonly method's own ARGUMENT can
+                            // still mistype (`s.replace(a, b)` needs `str` operands) — see
+                            // `readonly_arg_contract_violated`.
+                            if readonly_arg_contract_violated(method, &call.arguments) {
+                                self.facts.sig.raises.implicit.push("TypeError".to_string());
+                            }
+                        } else {
                             // An unrecognized method could mutate its receiver or raise — we can't
                             // see through it, so record it rather than assume purity. This holds
                             // whether or not the receiver is itself a trackable root (e.g. `x`
@@ -266,6 +284,15 @@ impl Walker < '_ , '_ > {
                         if let Some(exc) = call_implicit_exception(n) {
                             self.facts.sig.raises.implicit.push(exc.to_string());
                         }
+                        // A shadowless builtin (not a param/local rebind, nested def/class, or
+                        // anything already resolved above) raises predictably on a bad argument —
+                        // see `builtin_raises`. A shadowed name (`def len(x): ...`) skips this:
+                        // the analyzer can't know what the rebound callable actually does.
+                        if !self.facts.builtin_shadowed(n) {
+                            for exc in builtin_raises::lookup(n) {
+                                self.facts.sig.raises.implicit.push((*exc).to_string());
+                            }
+                        }
                         match n {
                             "print" => {
                                 match print_file_target(&call.arguments) {
@@ -311,7 +338,16 @@ impl Walker < '_ , '_ > {
                 }
                 _ => {}
             }
-            self.visit_expr(&call.func);
+            // The callee itself is excluded from the attribute-load `AttributeError` rule (a
+            // method call's own resolution failure is a `call_method_unknown`/resolved-callee
+            // concern, handled above, not a plain load) — so an `Attribute` callee visits only
+            // its base, not itself, bypassing `visit_expr`'s generic `Expr::Attribute` arm for
+            // the top attribute while still checking any further-nested attribute chain in the
+            // base (`x.a.b()`'s `x.a` is a genuine load).
+            match call.func.as_ref() {
+                ast::Expr::Attribute(attr) => self.visit_expr(&attr.value),
+                other => self.visit_expr(other),
+            }
             for arg in call.arguments.args.iter() {
                 self.visit_expr(arg);
             }

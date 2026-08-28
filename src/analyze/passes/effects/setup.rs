@@ -2,6 +2,8 @@
 //! annotation's name, and extracting a def's decorator names — all consumed once at the start of
 //! [`super::analyze_function`], before the body walk begins.
 
+use std::collections::HashSet;
+
 use ruff_python_ast as ast;
 
 use crate::model::{ParamInfo, ParamKind, Shape};
@@ -117,6 +119,60 @@ fn decorator_dotted_name(expr: &ast::Expr) -> Option<String> {
     match expr {
         ast::Expr::Call(c) => decorator_dotted_name(&c.func),
         _ => dotted_attr(expr),
+    }
+}
+
+/// Names bound to a nested `def`/`class` statement anywhere in `body` (any depth, recursing
+/// through `if`/`for`/`while`/`try`/`with`/`match` the way the Effects walk's own `visit_stmt`
+/// does) — see `FunctionFacts::local_defs`'s doc for why this exists: the Effects walk never
+/// descends into a nested def/class's own body ("a separate scope"), so nothing else notices a
+/// local `def len(...): ...` shadowing the builtin `len` for the rest of this function.
+pub(super) fn local_def_names(body: &[ast::Stmt]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    collect_local_defs(body, &mut out);
+    out
+}
+
+fn collect_local_defs(body: &[ast::Stmt], out: &mut HashSet<String>) {
+    for stmt in body {
+        match stmt {
+            ast::Stmt::FunctionDef(def) => {
+                out.insert(def.name.as_str().to_string());
+            }
+            ast::Stmt::ClassDef(class) => {
+                out.insert(class.name.as_str().to_string());
+            }
+            ast::Stmt::If(if_stmt) => {
+                collect_local_defs(&if_stmt.body, out);
+                for clause in &if_stmt.elif_else_clauses {
+                    collect_local_defs(&clause.body, out);
+                }
+            }
+            ast::Stmt::For(for_stmt) => {
+                collect_local_defs(&for_stmt.body, out);
+                collect_local_defs(&for_stmt.orelse, out);
+            }
+            ast::Stmt::While(while_stmt) => {
+                collect_local_defs(&while_stmt.body, out);
+                collect_local_defs(&while_stmt.orelse, out);
+            }
+            ast::Stmt::With(with_stmt) => collect_local_defs(&with_stmt.body, out),
+            ast::Stmt::Try(try_stmt) => {
+                collect_local_defs(&try_stmt.body, out);
+                for handler in &try_stmt.handlers {
+                    let ast::ExceptHandler::ExceptHandler(h) = handler;
+                    collect_local_defs(&h.body, out);
+                }
+                collect_local_defs(&try_stmt.orelse, out);
+                collect_local_defs(&try_stmt.finalbody, out);
+            }
+            ast::Stmt::Match(match_stmt) => {
+                for case in &match_stmt.cases {
+                    collect_local_defs(&case.body, out);
+                }
+            }
+            _ => {}
+        }
     }
 }
 

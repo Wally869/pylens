@@ -160,6 +160,23 @@ pub(in crate::analyze) struct ModuleAnalysis {
     /// Shapes pass consults this to infer `Shape::Instance(C)` for a same-module constructor
     /// call `C(...)`; an imported class isn't in this set, so it stays `Any`.
     pub(in crate::analyze) classes: HashSet<String>,
+    /// Class name -> the attribute names *every instance is guaranteed to have*: every method
+    /// name, every class-level `attr = ...` (bound the moment the class object is defined, before
+    /// any instance exists), and every `self.<attr> = ...` in `__init__` specifically — a fresh
+    /// instance always runs `__init__` before any other method can observe it, so that's the only
+    /// method whose assignments are a guarantee. An assignment in any OTHER method (`def arm
+    /// (self): self.v = 1`) proves nothing: an instance can reach a different method without ever
+    /// having called `arm()` first (see `temp/probe_selfattr.py`'s `Gadget.read`, a real
+    /// `AttributeError` a looser "declared anywhere" rule wrongly suppressed). Built by the
+    /// Declarations pass (`passes::declarations::collect_self_attrs`); consulted by
+    /// `FunctionFacts::attribute_load_proven` to decide whether an attribute load on a proven
+    /// same-module `Shape::Instance(C)` base (or on `self` inside a method of `C`) can skip the
+    /// implicit `AttributeError` a load otherwise adds. Only reachable through `__init__`/class
+    /// body — an attribute set from outside the class (`obj.extra = 1`) or from a non-`__init__`
+    /// method is invisible here, so this table can only ever under-count a class's real
+    /// attributes, never over-count: missing an entry just means the may-set stays wider (an
+    /// extra predicted `AttributeError`), never narrower.
+    pub(in crate::analyze) class_attrs: HashMap<String, HashSet<String>>,
     /// Per-function name->shape environments (params and locals) built by the Shapes pass, one
     /// entry per function/method in the same order as `declarations`. Flow-insensitive: a
     /// parameter unrelatedly rebound in the body (`x = Box()`) still carries its post-rebind
@@ -205,6 +222,7 @@ impl ModuleAnalysis {
             has_star: false,
             declarations: Vec::new(),
             classes: HashSet::new(),
+            class_attrs: HashMap::new(),
             shapes: Vec::new(),
             frozen_params: Vec::new(),
             frozen_dominance: Vec::new(),
@@ -240,6 +258,8 @@ pub(in crate::analyze) struct ModuleCtx<'a> {
     /// Names of classes declared at module top level, for resolving a same-module constructor
     /// call `C(...)` against `C.__init__`.
     pub(in crate::analyze) classes: &'a HashSet<String>,
+    /// Class name -> its declared attribute names. See `ModuleAnalysis::class_attrs`.
+    pub(in crate::analyze) class_attrs: &'a HashMap<String, HashSet<String>>,
 }
 
 /// Per-function accumulator: the mutable state one function's Effects walk reads and writes,
@@ -248,6 +268,14 @@ pub(in crate::analyze) struct ModuleCtx<'a> {
 pub(in crate::analyze) struct FunctionFacts<'a> {
     /// The method receiver's parameter name (`self`), if any.
     pub(in crate::analyze) self_param: Option<String>,
+    /// This function's declared parameter names, fixed for the whole walk — unlike `aliases`
+    /// (which drops an entry the moment a param is rebound to anything but a simple name-alias,
+    /// see `passes::effects::targets::handle_assign_target`), this never loses a name. Consulted
+    /// by `attribute_load_proven` so a rebound parameter (`p = Box(); p.n`) still counts as a
+    /// parameter base — `param_root`/`aliases` alone would miss it post-rebind, which would let a
+    /// merely-hypothesized post-rebind `Shape::Instance` prove the very load it produced safe,
+    /// the same unsoundness the module doc's soundness rule warns about for `TypeError`.
+    pub(in crate::analyze) param_names: HashSet<String>,
     /// Local name -> the parameter name it currently aliases (params seed this with identity).
     pub(in crate::analyze) aliases: HashMap<String, String>,
     pub(in crate::analyze) globals: HashSet<String>,
@@ -290,6 +318,8 @@ pub(in crate::analyze) struct FunctionFacts<'a> {
     /// Names of classes declared at module top level, for resolving a same-module constructor
     /// call `C(...)` against `C.__init__` the same way a method call resolves against a class.
     pub(in crate::analyze) classes: &'a HashSet<String>,
+    /// Class name -> its declared attribute names. See `ModuleAnalysis::class_attrs`.
+    pub(in crate::analyze) class_attrs: &'a HashMap<String, HashSet<String>>,
     /// The class this function is a method of, `None` for a free function — the `owner` half of
     /// resolving `self.method(...)` / `cls.method(...)` against `declarations`.
     pub(in crate::analyze) owner: Option<String>,
@@ -308,6 +338,13 @@ pub(in crate::analyze) struct FunctionFacts<'a> {
     /// `ParamInfo::hints` in `finish`. Unlike `guard_samples`, this isn't accumulated
     /// incrementally during the walk.
     pub(in crate::analyze) hints: HashMap<String, Vec<String>>,
+    /// Names bound to a nested `def`/`class` statement anywhere in this function's body (any
+    /// depth, not crossing into a further-nested def/class's own body) — computed once up front
+    /// by `passes::effects::setup::local_def_names`. Consulted by `builtin_shadowed` so a local
+    /// redefinition of a builtin name (`def len(x): ...`) suppresses the builtin implicit-raise
+    /// table for calls to that name within this function, the same way a parameter/local
+    /// rebind does via `shapes`.
+    pub(in crate::analyze) local_defs: HashSet<String>,
     pub(in crate::analyze) sig: EffectSignature,
 }
 
@@ -324,8 +361,10 @@ impl<'a> FunctionFacts<'a> {
         for p in params {
             aliases.insert(p.clone(), p.clone());
         }
+        let param_names = params.iter().cloned().collect();
         Self {
             self_param,
+            param_names,
             aliases,
             globals: HashSet::new(),
             nonlocals: HashSet::new(),
@@ -341,11 +380,13 @@ impl<'a> FunctionFacts<'a> {
             may_use_star: false,
             declarations: module.declarations,
             classes: module.classes,
+            class_attrs: module.class_attrs,
             owner,
             call_sites: Vec::new(),
             import_call_sites: Vec::new(),
             guard_samples: HashMap::new(),
             hints: HashMap::new(),
+            local_defs: HashSet::new(),
             sig,
         }
     }
@@ -412,6 +453,94 @@ impl<'a> FunctionFacts<'a> {
             }
         }
         Some(self.shapes.get(&root).cloned().unwrap_or(Shape::Any))
+    }
+
+    /// Whether an attribute load's `base.attr` is *proven* safe from `AttributeError` — see
+    /// `passes::effects::expressions`'s `Expr::Attribute` arm, the sole caller. Two forms of
+    /// proof, both requiring the base to resolve to a same-module class whose declared members
+    /// (`ModuleAnalysis::class_attrs`) include `attr`:
+    /// - `self` inside one of that class's own methods (`self.owner`/`self_param`), or
+    /// - a *local*'s settled shape (`env_shape`) is exactly `Shape::Instance(C)` — never a
+    ///   `Union`, which could still mean some other class entirely.
+    ///
+    /// A **parameter** base is never proven, even when its inferred shape happens to look like a
+    /// `Shape::Instance` — that shape is a hypothesis built from how this function's own body
+    /// happens to use the parameter, not a contract a caller is bound by (see the module doc's
+    /// soundness rule). Checked via `param_names` (fixed for the whole walk) rather than
+    /// `param_root`/`aliases`, which drop a rebound parameter's identity — `p = Box(); p.n` must
+    /// still count `p` as a parameter, not fall through to `env_shape`'s post-rebind `Instance`
+    /// evidence.
+    pub(in crate::analyze) fn attribute_load_proven(&self, base: &ast::Expr, attr: &str) -> bool {
+        let self_receiver = matches!(base, ast::Expr::Name(n) if Some(n.id.as_str()) == self.self_param.as_deref());
+        if self_receiver {
+            return self
+                .owner
+                .as_deref()
+                .and_then(|c| self.class_attrs.get(c))
+                .is_some_and(|attrs| attrs.contains(attr));
+        }
+        if leftmost_name(base).is_some_and(|n| self.param_names.contains(n)) {
+            return false;
+        }
+        match self.env_shape(base) {
+            Some(Shape::Instance(class)) => self
+                .class_attrs
+                .get(&class)
+                .is_some_and(|attrs| attrs.contains(attr)),
+            _ => false,
+        }
+    }
+
+    /// Whether `expr` is *proven* iterable — the condition under which a `for`/comprehension
+    /// clause's TypeError candidate (see `passes::effects::statements`) is suppressed. Two proof
+    /// forms:
+    /// - a literal container display (`[...]`, `(...)`, `{...}`, a dict/set/list/generator
+    ///   comprehension, a string/bytes literal) or a bare `range(...)` call — always iterable by
+    ///   construction, no shape lookup needed;
+    /// - a *local*'s settled shape (`env_shape`) is a known-iterable shape (`Seq`, `Str`, `Map`,
+    ///   `Set`).
+    ///
+    /// A **parameter** is never proven, for the same reason `attribute_load_proven` excludes one:
+    /// its shape is a hypothesis this function's own body produced, not a caller-enforced
+    /// contract. Anything else (a call's return value, an attribute chain, ...) is conservatively
+    /// unproven too — this table doesn't attempt to model arbitrary call return shapes.
+    pub(in crate::analyze) fn iterable_proven(&self, expr: &ast::Expr) -> bool {
+        match expr {
+            ast::Expr::List(_)
+            | ast::Expr::Tuple(_)
+            | ast::Expr::Set(_)
+            | ast::Expr::Dict(_)
+            | ast::Expr::ListComp(_)
+            | ast::Expr::SetComp(_)
+            | ast::Expr::DictComp(_)
+            | ast::Expr::Generator(_)
+            | ast::Expr::StringLiteral(_)
+            | ast::Expr::BytesLiteral(_)
+            | ast::Expr::FString(_) => true,
+            ast::Expr::Call(c) => {
+                matches!(c.func.as_ref(), ast::Expr::Name(n)
+                    if n.id.as_str() == "range" && !self.builtin_shadowed("range"))
+            }
+            _ => {
+                if leftmost_name(expr).is_some_and(|n| self.param_names.contains(n)) {
+                    return false;
+                }
+                matches!(
+                    self.env_shape(expr),
+                    Some(Shape::Seq(_)) | Some(Shape::Str) | Some(Shape::Map(..)) | Some(Shape::Set(_))
+                )
+            }
+        }
+    }
+
+    /// Whether `name` — a bare callee that resolved to none of imports/local declarations/
+    /// classes — is shadowed within this function by a parameter, a local rebind, or a nested
+    /// `def`/`class` of the same name, so the builtin implicit-raise table (`models::builtins`)
+    /// must not apply to it here. `shapes` covers params and every rebound local (see
+    /// `ModuleAnalysis::shapes`); `local_defs` covers a nested def/class the Shapes/Effects walks
+    /// don't otherwise track (see `local_defs`'s doc).
+    pub(in crate::analyze) fn builtin_shadowed(&self, name: &str) -> bool {
+        self.shapes.contains_key(name) || self.local_defs.contains(name)
     }
 
     /// Resolve the base of a mutation/argument expression to a [`MutationTarget`] root.

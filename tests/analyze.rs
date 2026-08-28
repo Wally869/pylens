@@ -1194,3 +1194,258 @@ fn hints_field_omitted_from_json_when_empty() {
         "expected `hints` omitted from JSON when empty: {param}"
     );
 }
+
+#[test]
+fn attribute_load_on_an_any_shaped_parameter_predicts_attribute_error() {
+    let s = analyze("def f(fast):\n    return fast.next\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"AttributeError".to_string()));
+}
+
+#[test]
+fn self_attribute_load_of_a_declared_attribute_is_proven_safe() {
+    let s = analyze(
+        "class Node:\n    def __init__(self, x):\n        self.x = x\n    def get(self):\n        return self.x\n",
+    );
+    let get = s.iter().find(|f| f.name == "get" && f.owner.as_deref() == Some("Node")).unwrap();
+    assert!(
+        !get.raises.implicit.contains(&"AttributeError".to_string()),
+        "self.x is declared by Node's own __init__, so the load is proven: {:?}",
+        get.raises.implicit
+    );
+}
+
+#[test]
+fn self_attribute_load_of_an_undeclared_attribute_predicts_attribute_error() {
+    let s = analyze(
+        "class Node:\n    def get(self):\n        return self.missing\n",
+    );
+    let get = s.iter().find(|f| f.name == "get" && f.owner.as_deref() == Some("Node")).unwrap();
+    assert!(
+        get.raises.implicit.contains(&"AttributeError".to_string()),
+        "Node never declares `missing`: {:?}",
+        get.raises.implicit
+    );
+}
+
+#[test]
+fn attribute_load_on_a_local_instance_with_the_declared_attribute_is_proven_safe() {
+    let s = analyze(
+        "class Box:\n    def __init__(self):\n        self.n = 0\n\ndef f():\n    b = Box()\n    return b.n\n",
+    );
+    let f = sig(&s, "f");
+    assert!(
+        !f.raises.implicit.contains(&"AttributeError".to_string()),
+        "b is a local, proven Box() instance that declares n: {:?}",
+        f.raises.implicit
+    );
+}
+
+#[test]
+fn attribute_load_on_a_parameter_with_an_instance_looking_shape_still_predicts_attribute_error() {
+    // A parameter's inferred shape is a hypothesis built from how this function's own body
+    // happens to use it, never a guarantee a caller is bound by — see the module doc's soundness
+    // rule. `p`'s only evidence for `Shape::Instance("Box")` is this very constructor call inside
+    // the function, so it must not be used to prove the load below it safe.
+    let s = analyze(
+        "class Box:\n    def __init__(self):\n        self.n = 0\n\ndef f(p):\n    p = Box()\n    return p.n\n",
+    );
+    let f = sig(&s, "f");
+    assert!(
+        f.raises.implicit.contains(&"AttributeError".to_string()),
+        "a rebound parameter never proves the load safe: {:?}",
+        f.raises.implicit
+    );
+}
+
+#[test]
+fn bare_len_call_predicts_type_error() {
+    let s = analyze("def f(p):\n    return len(p)\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"TypeError".to_string()));
+}
+
+#[test]
+fn self_attribute_assigned_outside_init_never_proves_the_load_safe() {
+    // Mirrors `temp/probe_selfattr.py`: `Gadget.arm()` sets `self.v`, but a fresh instance can
+    // reach `read()` without ever calling `arm()` first — that's a real `AttributeError`, so
+    // "declared anywhere in the class's methods" was unsound. Only `__init__` proves an
+    // attribute; `Safe.__init__` assigns `self.v`, so `Safe.read` stays proven.
+    let s = analyze(
+        "class Gadget:\n\
+         \x20   def arm(self):\n\
+         \x20       self.v = 1\n\
+         \x20   def read(self):\n\
+         \x20       return self.v\n\
+         \n\
+         class Safe:\n\
+         \x20   def __init__(self):\n\
+         \x20       self.v = 0\n\
+         \x20   def read(self):\n\
+         \x20       return self.v\n",
+    );
+    let gadget_read = s.iter().find(|f| f.name == "read" && f.owner.as_deref() == Some("Gadget")).unwrap();
+    assert!(
+        gadget_read.raises.implicit.contains(&"AttributeError".to_string()),
+        "arm() assigning self.v proves nothing for read(): {:?}",
+        gadget_read.raises.implicit
+    );
+    let safe_read = s.iter().find(|f| f.name == "read" && f.owner.as_deref() == Some("Safe")).unwrap();
+    assert!(
+        !safe_read.raises.implicit.contains(&"AttributeError".to_string()),
+        "Safe.__init__ assigns self.v unconditionally: {:?}",
+        safe_read.raises.implicit
+    );
+}
+
+#[test]
+fn a_local_len_shadow_suppresses_the_builtin_raise_prediction() {
+    let s = analyze("def f(p):\n    def len(x):\n        return 0\n    return len(p)\n");
+    let f = sig(&s, "f");
+    assert!(
+        !f.raises.implicit.contains(&"TypeError".to_string()),
+        "a nested def len(...) shadows the builtin, so its raise profile no longer applies: {:?}",
+        f.raises.implicit
+    );
+}
+
+#[test]
+fn tuple_unpack_of_a_parameter_predicts_value_error() {
+    let s = analyze("def f(pair):\n    a, b = pair\n    return a\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"ValueError".to_string()));
+}
+
+#[test]
+fn tuple_unpack_of_a_matching_literal_is_proven_safe() {
+    let s = analyze("def f():\n    a, b = (1, 2)\n    return a\n");
+    let f = sig(&s, "f");
+    assert!(
+        !f.raises.implicit.contains(&"ValueError".to_string()),
+        "(1, 2) is a literal 2-tuple matching the 2-target pattern: {:?}",
+        f.raises.implicit
+    );
+}
+
+#[test]
+fn for_loop_unpack_of_a_parameter_predicts_value_error() {
+    let s = analyze("def f(pairs):\n    for a, b in pairs:\n        return a\n    return None\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"ValueError".to_string()));
+}
+
+#[test]
+fn for_loop_unpack_of_matching_literal_tuples_is_proven_safe() {
+    let s = analyze(
+        "def f():\n    for a, b in [(1, 2), (3, 4)]:\n        return a\n    return None\n",
+    );
+    let f = sig(&s, "f");
+    assert!(
+        !f.raises.implicit.contains(&"ValueError".to_string()),
+        "every literal item is a matching 2-tuple: {:?}",
+        f.raises.implicit
+    );
+}
+
+#[test]
+fn for_loop_over_a_parameter_predicts_type_error() {
+    let s = analyze("def f(xs):\n    for x in xs:\n        return x\n    return None\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"TypeError".to_string()));
+}
+
+#[test]
+fn for_loop_over_a_literal_list_is_proven_iterable() {
+    let s = analyze("def f():\n    for x in [1, 2, 3]:\n        return x\n    return None\n");
+    let f = sig(&s, "f");
+    assert!(
+        !f.raises.implicit.contains(&"TypeError".to_string()),
+        "a literal list display is always iterable: {:?}",
+        f.raises.implicit
+    );
+}
+
+#[test]
+fn for_loop_over_a_seq_shaped_local_is_proven_iterable() {
+    let s = analyze("def f():\n    xs = [1, 2, 3]\n    for x in xs:\n        return x\n    return None\n");
+    let f = sig(&s, "f");
+    assert!(
+        !f.raises.implicit.contains(&"TypeError".to_string()),
+        "xs is a local pinned to a Seq shape: {:?}",
+        f.raises.implicit
+    );
+}
+
+#[test]
+fn left_shift_by_a_parameter_predicts_value_error() {
+    let s = analyze("def f(n, i):\n    return n << i\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"ValueError".to_string()));
+}
+
+#[test]
+fn left_shift_by_a_nonnegative_literal_is_proven_safe() {
+    let s = analyze("def f(n):\n    return n << 3\n");
+    let f = sig(&s, "f");
+    assert!(
+        !f.raises.implicit.contains(&"ValueError".to_string()),
+        "3 is a proven non-negative literal shift count: {:?}",
+        f.raises.implicit
+    );
+}
+
+#[test]
+fn right_shift_by_a_negative_literal_still_predicts_value_error() {
+    // A negative literal is a `UnaryOp(USub, ...)` node, not a bare `NumberLiteral` — it must
+    // NOT be mistaken for a proven non-negative shift count.
+    let s = analyze("def f(n):\n    return n >> -1\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"ValueError".to_string()));
+}
+
+#[test]
+fn readonly_method_call_with_a_parameter_argument_predicts_type_error() {
+    let s = analyze("def f(s, x):\n    return s.count(x)\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"TypeError".to_string()));
+}
+
+#[test]
+fn readonly_method_call_with_a_string_literal_argument_is_proven_safe() {
+    let s = analyze("def f(s):\n    return s.count('a')\n");
+    let f = sig(&s, "f");
+    assert!(
+        !f.raises.implicit.contains(&"TypeError".to_string()),
+        "'a' is a proven str literal argument to count(): {:?}",
+        f.raises.implicit
+    );
+}
+
+#[test]
+fn zero_argument_readonly_method_call_never_predicts_type_error() {
+    let s = analyze("def f(s):\n    return s.lower()\n");
+    let f = sig(&s, "f");
+    assert!(
+        !f.raises.implicit.contains(&"TypeError".to_string()),
+        "lower() takes no arguments, so it has no argument contract: {:?}",
+        f.raises.implicit
+    );
+}
+
+#[test]
+fn join_with_a_non_literal_argument_predicts_type_error() {
+    let s = analyze("def f(sep, xs):\n    return sep.join(xs)\n");
+    let f = sig(&s, "f");
+    assert!(f.raises.implicit.contains(&"TypeError".to_string()));
+}
+
+#[test]
+fn join_with_a_literal_list_of_string_literals_is_proven_safe() {
+    let s = analyze("def f(sep):\n    return sep.join(['a', 'b'])\n");
+    let f = sig(&s, "f");
+    assert!(
+        !f.raises.implicit.contains(&"TypeError".to_string()),
+        "['a', 'b'] is a proven literal list of str literals: {:?}",
+        f.raises.implicit
+    );
+}

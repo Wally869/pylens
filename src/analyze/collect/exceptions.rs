@@ -77,3 +77,74 @@ pub(in crate::analyze) fn is_ordered_compare(op: ast::CmpOp) -> bool {
         ast::CmpOp::Lt | ast::CmpOp::LtE | ast::CmpOp::Gt | ast::CmpOp::GtE
     )
 }
+
+/// The element list of a `Tuple`/`List` destructuring target pattern, `None` for a plain
+/// (non-destructuring) target such as a bare `Name`, `Attribute`, or `Subscript`.
+fn destructure_elts(target: &ast::Expr) -> Option<&[ast::Expr]> {
+    match target {
+        ast::Expr::Tuple(t) => Some(&t.elts),
+        ast::Expr::List(l) => Some(&l.elts),
+        _ => None,
+    }
+}
+
+/// Whether an `a, b = value` (or `for a, b in xs:`, treating `value` as one iteration's item)
+/// binding may raise `ValueError` for an arity mismatch. `target` not being a destructuring
+/// pattern at all is never a raise (a bare-name bind can't mismatch anything). A starred element
+/// (`a, *b = value`) is never proven — its accepted arity is a range (`len(value) >= len(target)
+/// - 1`), not a single count, and this table doesn't reason about ranges. Otherwise proven only
+/// when `value` is itself a literal `Tuple`/`List` display of the exact same length as `target`,
+/// recursing pairwise so a proven outer arity match still lets a mismatched NESTED pattern
+/// (`(a, b), c = (( 1, 2, 3), 4)`) raise.
+pub(in crate::analyze) fn destructure_may_raise(target: &ast::Expr, value: &ast::Expr) -> bool {
+    let Some(elts) = destructure_elts(target) else {
+        return false;
+    };
+    if elts.iter().any(|e| matches!(e, ast::Expr::Starred(_))) {
+        return true;
+    }
+    let value_elts = match value {
+        ast::Expr::Tuple(t) => &t.elts,
+        ast::Expr::List(l) => &l.elts,
+        _ => return true,
+    };
+    if value_elts.len() != elts.len() {
+        return true;
+    }
+    elts.iter().zip(value_elts.iter()).any(|(t, v)| destructure_may_raise(t, v))
+}
+
+/// Whether `for target in iter:` (or a comprehension's `for` clause) may raise `ValueError` for
+/// an arity mismatch on one of its iterations. `iter` not being a literal `Tuple`/`List` display
+/// means each item's own arity is opaque to the analyzer, so — unlike the plain-assignment form
+/// — this is never proven safe for a non-literal `iter`, even when `target` isn't itself a
+/// destructuring pattern's usual single-value case (a bare `for x in xs:` is still never a raise,
+/// since `destructure_may_raise` returns `false` immediately for a non-destructuring `target`).
+pub(in crate::analyze) fn for_destructure_may_raise(target: &ast::Expr, iter: &ast::Expr) -> bool {
+    if destructure_elts(target).is_none() {
+        return false;
+    }
+    let items: &[ast::Expr] = match iter {
+        ast::Expr::Tuple(t) => &t.elts,
+        ast::Expr::List(l) => &l.elts,
+        _ => return true,
+    };
+    items.iter().any(|item| destructure_may_raise(target, item))
+}
+
+/// Whether `expr` is a non-negative integer literal (`5`, `+5`) — the only form
+/// `<<`/`>>`'s right operand is *proven* safe from `ValueError` (Python raises `ValueError` for a
+/// negative shift count). A negative literal is a `UnaryOp(USub, ...)` node in the AST, which
+/// doesn't match either arm here and so correctly falls through to `false`; anything that isn't a
+/// literal at all (a name, a call, an arbitrary expression) is likewise never proven, even if some
+/// other part of the analyzer has pinned its shape to `Int` — this rule is deliberately
+/// literal-only, no shape lookup.
+pub(in crate::analyze) fn is_proven_nonnegative_int_literal(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::NumberLiteral(n) => matches!(n.value, ast::Number::Int(_)),
+        ast::Expr::UnaryOp(u) if u.op == ast::UnaryOp::UAdd => {
+            is_proven_nonnegative_int_literal(&u.operand)
+        }
+        _ => false,
+    }
+}

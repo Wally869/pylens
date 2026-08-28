@@ -1,6 +1,6 @@
 use ruff_python_ast as ast;
 use super::super::super::collect::exceptions::{
-    binop_implicit_exception, is_ordered_compare,
+    binop_implicit_exception, is_ordered_compare, is_proven_nonnegative_int_literal,
     subscript_read_exceptions,
 };
 use super::Walker;
@@ -21,7 +21,17 @@ impl Walker < '_ , '_ > {
                 }
                 Expr::Await(a) => self.visit_expr(&a.value),
                 Expr::Call(call) => self.visit_call(call),
-                Expr::Attribute(a) => self.visit_expr(&a.value),
+                Expr::Attribute(a) => {
+                    // An attribute LOAD (this arm is reached in load position only — a call's
+                    // own callee attribute is excluded by `visit_call`'s own final visit of
+                    // `call.func`, see its doc). Unless the base is *proven* — see
+                    // `FunctionFacts::attribute_load_proven` — a may-set over-approximation:
+                    // most `any`-shaped bases genuinely can raise `AttributeError`.
+                    if !self.facts.attribute_load_proven(&a.value, a.attr.as_str()) {
+                        self.facts.sig.raises.implicit.push("AttributeError".to_string());
+                    }
+                    self.visit_expr(&a.value);
+                }
                 Expr::Subscript(s) => {
                     // A subscript READ (this arm is only reached in value position — assignment
                     // and delete targets are handled separately and never call `visit_expr`) may
@@ -56,6 +66,14 @@ impl Walker < '_ , '_ > {
                     // `TypeError` — see `collect::exceptions` doc.
                     for operand in [b.left.as_ref(), b.right.as_ref()] {
                         self.facts.note_type_error_candidate(operand);
+                    }
+                    // `<<`/`>>` additionally raise `ValueError` for a negative shift count,
+                    // proven safe only when the right operand is a literal non-negative int (no
+                    // shape lookup — see `collect::exceptions::is_proven_nonnegative_int_literal`).
+                    if matches!(b.op, ast::Operator::LShift | ast::Operator::RShift)
+                        && !is_proven_nonnegative_int_literal(&b.right)
+                    {
+                        self.facts.sig.raises.implicit.push("ValueError".to_string());
                     }
                 }
                 Expr::BoolOp(b) => {

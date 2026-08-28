@@ -3,7 +3,9 @@ use crate::model::*;
 use super::super::super::collect::hints::infer_hints;
 use super::super::super::context::{CallSite, FunctionFacts, ImportCallSite, ModuleCtx, ShapeFacts};
 use super::super::declarations::ReceiverKind;
-use super::setup::{annotation_name, collect_param_defs, collect_param_names, decorator_names};
+use super::setup::{
+    annotation_name, collect_param_defs, collect_param_names, decorator_names, local_def_names,
+};
 use super::{Walker};
 use super::finalization::finish;
 
@@ -33,6 +35,7 @@ pub(super) fn analyze_function(
     let mut facts =
         FunctionFacts::new(self_param, &params, module, shape_facts, sig, owner.map(str::to_string));
     facts.hints = infer_hints(&def.body, &param_names);
+    facts.local_defs = local_def_names(&def.body);
     Walker { facts: &mut facts }.run(&def.body);
     let call_sites = std::mem::take(&mut facts.call_sites);
     let import_call_sites = std::mem::take(&mut facts.import_call_sites);
