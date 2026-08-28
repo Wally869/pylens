@@ -225,7 +225,7 @@ fn record_project_parallelizes_across_files_with_stable_output_order() {
         return;
     }
     let report =
-        record_project(Path::new("tests/fixtures/project"), 4, None).expect("record_project");
+        record_project(Path::new("tests/fixtures/project"), 4, None, false).expect("record_project");
 
     let files = report["files"].as_array().expect("files array");
     let paths: Vec<&str> = files.iter().map(|f| f["path"].as_str().unwrap()).collect();

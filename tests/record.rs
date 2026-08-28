@@ -5,8 +5,8 @@ use pylens::exec::{CallResult, Sandbox, probe};
 use pylens::generate::ValueDomain;
 use pylens::model::ReturnKind;
 use pylens::record::{
-    CaseSource, DepStatus, ReplayMap, parse_replay, record_file, record_file_with_options,
-    record_file_with_replay, record_with_signatures_replay,
+    CaseSource, DepStatus, RecordFlags, ReplayMap, parse_replay, record_file,
+    record_file_with_options, record_file_with_replay, record_with_signatures_replay,
 };
 use pylens::{analyze_source, imports_of};
 use serde_json::{Value, json};
@@ -527,7 +527,15 @@ fn replay_unmatched_function_name_is_an_error() {
     let mut replay = ReplayMap::new();
     replay.insert("does_not_exist".to_string(), vec![vec![json!(1)]]);
 
-    let result = record_with_signatures_replay(&PanicSandbox, src, imports, sigs, 4, &replay, None);
+    let result = record_with_signatures_replay(
+        &PanicSandbox,
+        src,
+        imports,
+        sigs,
+        4,
+        &replay,
+        RecordFlags { domain: None, cover_branches: false },
+    );
     let err = result.err().expect("an unmatched replay function name must be an error");
     assert!(err.contains("does_not_exist"), "unexpected message: {err}");
 }
@@ -576,7 +584,7 @@ fn value_domain_restricts_generated_cases_but_not_replay() {
     let mut replay = ReplayMap::new();
     replay.insert("f".to_string(), vec![vec![json!("not an int")]]);
 
-    let rec = record_file_with_options(src, 8, &replay, Some(&domain)).expect("record");
+    let rec = record_file_with_options(src, 8, &replay, Some(&domain), false).expect("record");
     let f = rec.functions.iter().find(|r| r.signature.name == "f").expect("f record");
 
     let generated: Vec<_> = f.cases.iter().filter(|c| c.source == CaseSource::Generated).collect();

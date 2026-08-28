@@ -21,12 +21,17 @@ cargo test                          # the sandbox tests skip if the sandbox is a
 cargo clippy --all-targets -- -D warnings
 
 pylens analyze  <file.py|dir> [--format json|summary|pyi|html]
-pylens record   <file.py|dir> [--inputs N] [--format json|summary|pyi|html]  # sandbox; pyi is for one file only
+pylens record   <file.py|dir> [--inputs N] [--cover-branches] [--format json|summary|pyi|html]  # sandbox; pyi is for one file only
 pylens validate <file.py|dir> [--inputs N] [--format json|summary|html]      # exits non-zero on a hard defect
 ```
 
 `--inputs` defaults to 12. `record` and `validate` also report executed-line coverage per
 function, which tells you how much of the function the generated inputs actually reached.
+`record --cover-branches` (off by default) turns `--inputs` into the TOTAL per-function case
+budget and runs a predicate-targeted loop after the initial batch: every uncovered branch outcome
+whose test expression `generate::predicate` can parse gets extra, targeted inputs, until every
+observable outcome is covered, an iteration adds none, or the budget runs out. Each still-
+uncovered outcome then carries a `reason` (see `docs/SCHEMA.md`).
 
 `analyze` is static and needs no sandbox. `record` is `analyze` plus the dynamic layer, on one
 static core. A directory argument starts project mode.
@@ -68,11 +73,16 @@ and the
 - `src/analyze/models.rs` — the stdlib effect table (raises and io), keyed on the resolved
   module path. An entry removes an unresolved acknowledgment, so each entry over-approximates.
 - `src/generate/` — `mod.rs` (the sampler: ranked candidates, one parameter at a time),
-  `seeds.rs` (the shape, property and domain corpora). Also gives the shrink candidates.
+  `seeds.rs` (the shape, property and domain corpora), `domain.rs` (`--value-domain`),
+  `predicate.rs` (extracts handled branch-test forms over a single positional parameter and
+  synthesizes satisfying/violating values — feeds `record::cover`). Also gives the shrink
+  candidates.
 - `src/exec.rs` — sandboxed execution: the `Sandbox` trait, `Nsjail`, the `NsjailPool` fork
   server. There is no unsandboxed launcher.
-- `src/record.rs` — the static signature and the sandboxed cases (`ModuleRecord`, `Case`), with
-  the mutation difference before and after the call.
+- `src/record/` — `mod.rs` (the static signature and the sandboxed cases: `ModuleRecord`, `Case`,
+  with the mutation difference before and after the call), `cover.rs` (the `--cover-branches`
+  predicate-targeted coverage loop, and the `branches`/`branch_coverage` report it feeds a
+  `reason` into).
 - `src/shrink.rs` — greedy input minimization for the cases that raise. An aid for the report
   only.
 - `src/validate.rs` — the `observed ⊆ static` harness. `Defect` severity is Hard if a may-set

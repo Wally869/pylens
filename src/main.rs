@@ -2,7 +2,7 @@
 //!
 //!   pylens analyze  <file.py|dir> [--format json|summary|pyi|html]      static effect signatures
 //!   pylens record   <file.py|dir> [--inputs N] [--replay <cases.json>]
-//!                    [--value-domain <profile.json>]
+//!                    [--value-domain <profile.json>] [--cover-branches]
 //!                    [--format json|summary|pyi|html]                 signatures + observed
 //!                                                                       cases (runs the jail).
 //!                                                                       `--replay` additionally
@@ -16,6 +16,15 @@
 //!                                                                       (see `pylens::generate::
 //!                                                                       ValueDomain`); replayed
 //!                                                                       inputs are unaffected.
+//!                                                                       `--cover-branches` opts
+//!                                                                       into the predicate-
+//!                                                                       targeted coverage loop
+//!                                                                       (see `pylens::record::
+//!                                                                       cover`); `--inputs`
+//!                                                                       becomes the TOTAL
+//!                                                                       per-function case budget.
+//!                                                                       Off by default: plain
+//!                                                                       `record` is unaffected.
 //!   pylens validate <file.py|dir> [--inputs N] [--format json|summary|html] observed ⊆ static
 //!                                                                       soundness-defect report
 //!                                                                       (runs the jail); exits
@@ -51,7 +60,8 @@ fn main() {
             eprintln!(
                 "usage:\n  pylens analyze <file.py|dir> [--format json|summary|pyi|html]\n  \
                  pylens record <file.py|dir> [--inputs <N>] [--replay <cases.json>] \
-                 [--value-domain <profile.json>] [--format json|summary|pyi|html]\n  \
+                 [--value-domain <profile.json>] [--cover-branches] \
+                 [--format json|summary|pyi|html]\n  \
                  pylens validate <file.py|dir> [--inputs <N>] [--format json|summary|html]"
             );
             std::process::exit(2);
@@ -158,6 +168,7 @@ fn cmd_record(args: &[String]) {
         let text = read_file(p);
         ValueDomain::parse(&text).unwrap_or_else(|e| fail(&format!("record error: {e}")))
     });
+    let cover_branches = args.iter().any(|a| a == "--cover-branches");
 
     if std::path::Path::new(&path).is_dir() {
         if format == Format::Pyi {
@@ -166,7 +177,7 @@ fn cmd_record(args: &[String]) {
         if replay_path.is_some() {
             fail("--replay needs a single file, not a directory");
         }
-        match pylens::project::record_project(std::path::Path::new(&path), inputs, domain.as_ref()) {
+        match pylens::project::record_project(std::path::Path::new(&path), inputs, domain.as_ref(), cover_branches) {
             Ok(report) => match format {
                 Format::Summary => print!("{}", report::project_summary(&report)),
                 Format::Html => print!("{}", pylens::html::render("record", &report)),
@@ -186,7 +197,7 @@ fn cmd_record(args: &[String]) {
         None => pylens::record::ReplayMap::new(),
     };
     let record_result =
-        pylens::record::record_file_with_options(&src, inputs, &replay, domain.as_ref());
+        pylens::record::record_file_with_options(&src, inputs, &replay, domain.as_ref(), cover_branches);
     match record_result {
         Ok(record) => {
             if format == Format::Pyi {

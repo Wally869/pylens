@@ -1,7 +1,7 @@
 # pylens JSON schema
 
 This is the contract for the `--format json` output of `analyze`, `record`, and `validate`. The
-field names below agree with the serde definitions in `src/model/`, `src/record.rs`, and
+field names below agree with the serde definitions in `src/model/`, `src/record/`, and
 `src/validate.rs`. pylens does not emit the optional fields if they are empty or absent.
 
 ## Versions
@@ -163,15 +163,25 @@ The signature fields, and also:
   body, `{ "kind": <BranchKind>, "line": <int>, "outcomes": [<BranchOutcome>...] }`. `kind` is
   `"if"` \| `"while"` \| `"for"` \| `"except"` \| `"try_else"` \| `"match"` \| `"ternary"` \|
   `"bool_op"` \| `"inline_if"` \| `"comprehension_if"`. A `BranchOutcome` is `{ "outcome": <str>,
-  "status": "covered" | "uncovered" | "unobservable_line_granularity" }`. The outcome names are
-  construct-specific (`"true"`/`"false"` for `if`/ternary, `"enter"`/`"skip"` for `while`,
-  `"iterate"`/`"empty"` for `for`, `"entered"` for `except`/`try_else`/`match`,
-  `"short_circuit"`/`"full_evaluation"` for boolops). `unobservable_line_granularity` means
-  line-level tracing cannot distinguish this outcome from its siblings — same-line constructs
-  (ternaries, `and`/`or` short-circuits, single-line `if x: y` bodies, comprehension guards) are
-  always in that state; every other kind is decided from the traced `(prev_line, cur_line)` arcs
-  (or, for `except`/`try_else`/`match`, the traced handler/clause/case line) aggregated over every
-  case. Omitted under the same conditions as `coverage` (no branch points, or no cases).
+  "status": "covered" | "uncovered" | "unobservable_line_granularity", "reason": <str, uncovered
+  only> }`. The outcome names are construct-specific (`"true"`/`"false"` for `if`/ternary,
+  `"enter"`/`"skip"` for `while`, `"iterate"`/`"empty"` for `for`, `"entered"` for
+  `except`/`try_else`/`match`, `"short_circuit"`/`"full_evaluation"` for boolops).
+  `unobservable_line_granularity` means line-level tracing cannot distinguish this outcome from
+  its siblings — same-line constructs (ternaries, `and`/`or` short-circuits, single-line `if x: y`
+  bodies, comprehension guards) are always in that state; every other kind is decided from the
+  traced `(prev_line, cur_line)` arcs (or, for `except`/`try_else`/`match`, the traced
+  handler/clause/case line) aggregated over every case. Omitted under the same conditions as
+  `coverage` (no branch points, or no cases).
+  - `reason` is present exactly when `status == "uncovered"`, and says why the `record
+    --cover-branches` loop (`src/record/cover.rs`) didn't confirm this outcome: `"loop_not_run"`
+    (`--cover-branches` wasn't passed — every uncovered outcome carries this reason in plain
+    `record`), `"no_synthesizer"` (no handled predicate form covers this outcome's branch test —
+    see `src/generate/predicate.rs` for the closed set of forms — or every synthesized value was
+    excluded by `--value-domain`), `"candidates_exhausted"` (synthesized values were tried and
+    executed, and the outcome still didn't fire), or `"budget"` (the loop's total-case budget —
+    `--inputs`, reinterpreted as the TOTAL per-function case count once `--cover-branches` is set
+    — ran out before this outcome got a synthesized case).
 - `branch_coverage` — `{ "covered": <int>, "uncovered": <int>, "unobservable": <int> }`, the
   rollup over every outcome in `branches` — a closed count, always present exactly when `branches`
   is.

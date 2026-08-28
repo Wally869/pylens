@@ -368,9 +368,10 @@ fn record_file_entry(
     ef: EnrichedFile,
     max_inputs: usize,
     domain: Option<&ValueDomain>,
+    cover_branches: bool,
 ) -> FileEntry {
     let EnrichedFile { path, src, imports, signatures } = ef;
-    match record_with_signatures(sandbox, &src, imports, signatures, max_inputs, domain) {
+    match record_with_signatures(sandbox, &src, imports, signatures, max_inputs, domain, cover_branches) {
         Ok(record) => {
             let purities = record.functions.iter().map(|f| f.signature.purity).collect();
             let (coverage_executed, coverage_total) = record
@@ -410,12 +411,17 @@ fn record_file_entry(
 /// so this parallelizes cleanly. Fails the whole run only if a worker's sandbox can't be
 /// provisioned at all; a per-file record failure becomes a `{path, error}` entry instead.
 /// Records against cross-file-propagated signatures, same as `analyze_project`.
-pub fn record_project(root: &Path, max_inputs: usize, domain: Option<&ValueDomain>) -> Result<Value, String> {
+pub fn record_project(
+    root: &Path,
+    max_inputs: usize,
+    domain: Option<&ValueDomain>,
+    cover_branches: bool,
+) -> Result<Value, String> {
     let files = collect_py_files(root);
     let index = &ModuleIndex::build(root, &files);
     let (enriched, error_entries) = analyze_and_propagate(root, &files);
     let mut entries = record_files_parallel(enriched, |pool, ef| {
-        record_file_entry(pool, index, ef, max_inputs, domain)
+        record_file_entry(pool, index, ef, max_inputs, domain, cover_branches)
     })?;
     entries.extend(error_entries);
     Ok(build_report(root, entries, false))
@@ -423,7 +429,7 @@ pub fn record_project(root: &Path, max_inputs: usize, domain: Option<&ValueDomai
 
 fn validate_file_entry(sandbox: &dyn Sandbox, ef: EnrichedFile, max_inputs: usize) -> FileEntry {
     let EnrichedFile { path, src, imports, signatures } = ef;
-    let record = match record_with_signatures(sandbox, &src, imports, signatures, max_inputs, None) {
+    let record = match record_with_signatures(sandbox, &src, imports, signatures, max_inputs, None, false) {
         Ok(r) => r,
         Err(e) => return error_entry(path, format!("record error: {e}")),
     };

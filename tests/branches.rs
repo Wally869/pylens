@@ -6,7 +6,7 @@ use pylens::analyze_source;
 use pylens::exec::{Sandbox, probe};
 use pylens::model::branch::{BranchKind, BranchPoint, OutcomeEvidence};
 use pylens::model::EffectSignature;
-use pylens::record::{BranchReport, FunctionRecord, ReplayMap, record_file_with_replay};
+use pylens::record::{BranchReport, FunctionRecord, ReplayMap, record_file_with_options, record_file_with_replay};
 use serde_json::json;
 
 fn ready(test: &str) -> bool {
@@ -218,6 +218,16 @@ fn status_of<'a>(report: &'a BranchReport, outcome: &str) -> &'a str {
         .status
 }
 
+fn reason_of<'a>(report: &'a BranchReport, outcome: &str) -> Option<&'a str> {
+    report
+        .outcomes
+        .iter()
+        .find(|o| o.outcome == outcome)
+        .unwrap_or_else(|| panic!("no outcome {outcome:?} on {report:?}"))
+        .reason
+        .as_deref()
+}
+
 #[test]
 fn else_less_if_false_path_is_covered_via_its_arc() {
     if !ready("else_less_if_false_path_is_covered_via_its_arc") {
@@ -311,4 +321,62 @@ fn branch_coverage_rollup_is_a_closed_count() {
     let total_outcomes: usize = branches.iter().map(|b| b.outcomes.len()).sum();
     assert_eq!(rollup.covered + rollup.uncovered + rollup.unobservable, total_outcomes);
     assert!(rollup.unobservable >= 2, "the ternary's two outcomes must be unobservable");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Dynamic: `--cover-branches`'s predicate-targeted loop.
+// ---------------------------------------------------------------------------------------------
+
+/// `len(x) == 4` isn't a form `analyze::collect::guards`'s guard-sample extraction handles (it
+/// only roots a name/attribute/subscript chain, and a `Call` like `len(x)` has none) — so, unlike
+/// a bare `x == 42`, plain generation has no pre-existing heuristic nudging it toward a
+/// length-4 list, and the branch stays uncovered at a small budget without `--cover-branches`.
+const LEN_EQ_SRC: &str = "def f(x):\n    if len(x) == 4:\n        return 1\n    return 0\n";
+
+#[test]
+fn cover_branches_off_leaves_the_equality_branch_uncovered_with_loop_not_run() {
+    if !ready("cover_branches_off_leaves_the_equality_branch_uncovered_with_loop_not_run") {
+        return;
+    }
+    let rec = record_file_with_options(LEN_EQ_SRC, 12, &ReplayMap::new(), None, false).expect("record");
+    let f = find_function(&rec.functions, "f");
+    let branches = f.branches.as_ref().expect("branches present");
+    let bp = branch_report(branches, BranchKind::If, 2);
+    assert_eq!(status_of(bp, "true"), "uncovered");
+    assert_eq!(reason_of(bp, "true"), Some("loop_not_run"));
+}
+
+#[test]
+fn cover_branches_on_covers_the_equality_branch_and_terminates() {
+    if !ready("cover_branches_on_covers_the_equality_branch_and_terminates") {
+        return;
+    }
+    let rec = record_file_with_options(LEN_EQ_SRC, 12, &ReplayMap::new(), None, true).expect("record");
+    let f = find_function(&rec.functions, "f");
+    let branches = f.branches.as_ref().expect("branches present");
+    let bp = branch_report(branches, BranchKind::If, 2);
+    assert_eq!(status_of(bp, "true"), "covered");
+    assert!(
+        f.cases.len() <= 12,
+        "the loop must respect the total per-function case budget: got {} cases",
+        f.cases.len()
+    );
+}
+
+#[test]
+fn cover_branches_on_an_opaque_predicate_stays_uncovered_with_no_synthesizer() {
+    if !ready("cover_branches_on_an_opaque_predicate_stays_uncovered_with_no_synthesizer") {
+        return;
+    }
+    // `id(x)` (a memory address) is both unhandled by `extract_deriv` (not a recognized
+    // derivation) and, practically, never equal to a fixed literal by chance — so this branch's
+    // `true` outcome stays uncovered whether or not `--cover-branches` runs, for two independent
+    // reasons that both point at `no_synthesizer`.
+    let src = "def f(x):\n    if id(x) == 999999999999:\n        return 1\n    return 0\n";
+    let rec = record_file_with_options(src, 12, &ReplayMap::new(), None, true).expect("record");
+    let f = find_function(&rec.functions, "f");
+    let branches = f.branches.as_ref().expect("branches present");
+    let bp = branch_report(branches, BranchKind::If, 2);
+    assert_eq!(status_of(bp, "true"), "uncovered");
+    assert_eq!(reason_of(bp, "true"), Some("no_synthesizer"));
 }

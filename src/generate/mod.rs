@@ -17,6 +17,7 @@ use serde_json::{Value, Map, json};
 use crate::model::{EffectSignature, ParamInfo, ParamKind, Shape};
 
 mod domain;
+pub mod predicate;
 mod seeds;
 
 pub use domain::ValueDomain;

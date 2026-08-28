@@ -10,23 +10,37 @@ use serde_json::{Map, Value};
 
 use crate::exec::{CallResult, HarnessError, NsjailPool, Sandbox};
 use crate::generate::{GenInput, ValueDomain, gen_inputs, keyword_only_params, positional_params};
-use crate::model::branch::OutcomeEvidence;
-use crate::model::{BranchKind, DefKind, EffectSignature, Import};
+use crate::model::{DefKind, EffectSignature, Import};
 use crate::shrink::shrink_case;
 use crate::{analyze_source, imports_of};
+
+mod cover;
+
+pub use cover::{BranchCoverage, BranchOutcomeReport, BranchReport};
 
 /// One long-lived jailed worker, reused for the whole file (load probe + dependency probes +
 /// every case). Recording is sequential, so a single fork-server worker amortizes interpreter
 /// startup without idle jails; each request still runs in its own forked child.
 const POOL_SIZE: usize = 1;
 
-/// Generation settings threaded through the recording of one function or method: the
-/// `--inputs` budget and, when `--value-domain` restricts generation, the profile to enforce.
-/// Bundled to keep `function_cases`/`method_record`'s argument counts down.
+/// Bundles `--value-domain` and `--cover-branches` for [`record_with_signatures_replay`] — keeps
+/// its argument count down alongside `sandbox`/`src`/`imports`/`sigs`/`max_inputs`/`replay`.
 #[derive(Clone, Copy)]
-struct GenOptions<'a> {
-    max_inputs: usize,
-    domain: Option<&'a ValueDomain>,
+pub struct RecordFlags<'a> {
+    pub domain: Option<&'a ValueDomain>,
+    pub cover_branches: bool,
+}
+
+/// Generation settings threaded through the recording of one function or method: the
+/// `--inputs` budget (interpreted as the TOTAL per-function case budget once `cover_branches` is
+/// set — see `cover::run_loop`), the `--value-domain` profile to enforce (if any), and whether
+/// `--cover-branches` opted into the predicate-targeted coverage loop. Bundled to keep
+/// `function_cases`/`method_record`'s argument counts down.
+#[derive(Clone, Copy)]
+pub(super) struct GenOptions<'a> {
+    pub(super) max_inputs: usize,
+    pub(super) domain: Option<&'a ValueDomain>,
+    pub(super) cover_branches: bool,
 }
 
 /// External input tuples supplied via `--replay`: function name → list of positional-argument
@@ -181,87 +195,6 @@ fn coverage_for(sig: &EffectSignature, cases: &[Case]) -> Option<Coverage> {
     })
 }
 
-/// One outcome of a [`BranchReport`], and whether the aggregated cases proved it happened.
-#[derive(Debug, Serialize)]
-pub struct BranchOutcomeReport {
-    pub outcome: String,
-    /// `covered` (some case's traced arc/line is the evidence for this outcome) | `uncovered`
-    /// (the evidence was never observed) | `unobservable_line_granularity` (line-level tracing
-    /// cannot distinguish this outcome from its siblings — see
-    /// [`crate::model::branch::OutcomeEvidence::Unobservable`]).
-    pub status: String,
-}
-
-/// One branch point of a function's body — see [`crate::analyze::collect::branches`] — with each
-/// of its outcomes' observed status.
-#[derive(Debug, Serialize)]
-pub struct BranchReport {
-    pub kind: BranchKind,
-    pub line: u32,
-    pub outcomes: Vec<BranchOutcomeReport>,
-}
-
-/// The per-function rollup over every outcome of every [`BranchReport`] — a closed count: every
-/// outcome is exactly one of `covered`, `uncovered`, or `unobservable`.
-#[derive(Debug, Serialize, Default)]
-pub struct BranchCoverage {
-    pub covered: usize,
-    pub uncovered: usize,
-    pub unobservable: usize,
-}
-
-/// Aggregate `cases`' traced lines and arcs against `sig.branch_points`, deciding each outcome's
-/// status from the union of evidence over every case (generated and replayed alike — a branch
-/// outcome reached by any input counts as covered). `None` when there's nothing to measure: no
-/// branch points, or no cases to have measured them with — mirrors [`coverage_for`].
-fn branch_report_for(sig: &EffectSignature, cases: &[Case]) -> Option<(Vec<BranchReport>, BranchCoverage)> {
-    if cases.is_empty() || sig.branch_points.is_empty() {
-        return None;
-    }
-    let lines_seen: HashSet<u32> = cases.iter().flat_map(|c| c.lines.iter().copied()).collect();
-    let arcs_seen: HashSet<(u32, u32)> = cases.iter().flat_map(|c| c.arcs.iter().copied()).collect();
-
-    let mut rollup = BranchCoverage::default();
-    let mut reports = Vec::with_capacity(sig.branch_points.len());
-    for bp in &sig.branch_points {
-        let mut outcomes = Vec::with_capacity(bp.outcomes.len());
-        for o in &bp.outcomes {
-            let status = match o.evidence {
-                OutcomeEvidence::Unobservable => "unobservable_line_granularity",
-                OutcomeEvidence::Arc(a, b) => {
-                    if arcs_seen.contains(&(a, b)) {
-                        "covered"
-                    } else {
-                        "uncovered"
-                    }
-                }
-                OutcomeEvidence::Line(l) => {
-                    if lines_seen.contains(&l) {
-                        "covered"
-                    } else {
-                        "uncovered"
-                    }
-                }
-            };
-            match status {
-                "covered" => rollup.covered += 1,
-                "uncovered" => rollup.uncovered += 1,
-                _ => rollup.unobservable += 1,
-            }
-            outcomes.push(BranchOutcomeReport {
-                outcome: o.outcome.clone(),
-                status: status.to_string(),
-            });
-        }
-        reports.push(BranchReport {
-            kind: bp.kind,
-            line: bp.line,
-            outcomes,
-        });
-    }
-    Some((reports, rollup))
-}
-
 /// Why a function couldn't be executed at all — recorded once, instead of as N identical
 /// per-case failures.
 #[derive(Serialize)]
@@ -285,8 +218,8 @@ pub struct FunctionRecord {
     /// nothing to measure — see [`coverage_for`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coverage: Option<Coverage>,
-    /// Per-branch-outcome accounting over `cases` — see [`branch_report_for`]. Omitted when
-    /// there's nothing to measure (no branch points, or no cases), same as `coverage`.
+    /// Per-branch-outcome accounting over `cases` — see [`cover::branch_report_for`]. Omitted
+    /// when there's nothing to measure (no branch points, or no cases), same as `coverage`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branches: Option<Vec<BranchReport>>,
     /// The rollup over every outcome in `branches`. Present exactly when `branches` is.
@@ -343,7 +276,7 @@ pub fn record_file_with_replay(
     replay: &ReplayMap,
 ) -> Result<ModuleRecord, String> {
     let sandbox = NsjailPool::new(POOL_SIZE)?;
-    record_with_replay(&sandbox, src, max_inputs, replay, None)
+    record_with_replay(&sandbox, src, max_inputs, replay, None, false)
 }
 
 /// Like [`record_file`], with generation restricted to a `--value-domain` profile (see
@@ -357,16 +290,19 @@ pub fn record_file_with_domain(
     record_with(&sandbox, src, max_inputs, domain)
 }
 
-/// The general entry point combining `--replay` and `--value-domain`: replayed tuples are
-/// executed as-is (never filtered), generated ones are restricted to `domain` when given.
+/// The general entry point combining `--replay`, `--value-domain`, and `--cover-branches`:
+/// replayed tuples are executed as-is (never filtered), generated ones are restricted to `domain`
+/// when given, and `cover_branches` opts into `cover::run_loop`'s predicate-targeted coverage
+/// loop (see the module doc) once the initial generated batch is done.
 pub fn record_file_with_options(
     src: &str,
     max_inputs: usize,
     replay: &ReplayMap,
     domain: Option<&ValueDomain>,
+    cover_branches: bool,
 ) -> Result<ModuleRecord, String> {
     let sandbox = NsjailPool::new(POOL_SIZE)?;
-    record_with_replay(&sandbox, src, max_inputs, replay, domain)
+    record_with_replay(&sandbox, src, max_inputs, replay, domain, cover_branches)
 }
 
 /// Record a whole file's functions against an already-provisioned sandbox. Lets a caller
@@ -378,21 +314,30 @@ pub fn record_with(
     max_inputs: usize,
     domain: Option<&ValueDomain>,
 ) -> Result<ModuleRecord, String> {
-    record_with_replay(sandbox, src, max_inputs, &ReplayMap::new(), domain)
+    record_with_replay(sandbox, src, max_inputs, &ReplayMap::new(), domain, false)
 }
 
-/// Like [`record_with`], with externally supplied `--replay` input tuples — see
-/// [`record_file_with_replay`].
+/// Like [`record_with`], with externally supplied `--replay` input tuples and the
+/// `--cover-branches` opt-in — see [`record_file_with_replay`], [`record_file_with_options`].
 pub fn record_with_replay(
     sandbox: &dyn Sandbox,
     src: &str,
     max_inputs: usize,
     replay: &ReplayMap,
     domain: Option<&ValueDomain>,
+    cover_branches: bool,
 ) -> Result<ModuleRecord, String> {
     let imports = imports_of(src).map_err(|e| e.to_string())?;
     let sigs = analyze_source(src).map_err(|e| e.to_string())?;
-    record_with_signatures_replay(sandbox, src, imports, sigs, max_inputs, replay, domain)
+    record_with_signatures_replay(
+        sandbox,
+        src,
+        imports,
+        sigs,
+        max_inputs,
+        replay,
+        RecordFlags { domain, cover_branches },
+    )
 }
 
 /// Record a whole file's functions against an already-provisioned sandbox, using precomputed
@@ -409,8 +354,17 @@ pub fn record_with_signatures(
     sigs: Vec<EffectSignature>,
     max_inputs: usize,
     domain: Option<&ValueDomain>,
+    cover_branches: bool,
 ) -> Result<ModuleRecord, String> {
-    record_with_signatures_replay(sandbox, src, imports, sigs, max_inputs, &ReplayMap::new(), domain)
+    record_with_signatures_replay(
+        sandbox,
+        src,
+        imports,
+        sigs,
+        max_inputs,
+        &ReplayMap::new(),
+        RecordFlags { domain, cover_branches },
+    )
 }
 
 /// Like [`record_with_signatures`], with externally supplied `--replay` input tuples: each
@@ -425,8 +379,9 @@ pub fn record_with_signatures_replay(
     sigs: Vec<EffectSignature>,
     max_inputs: usize,
     replay: &ReplayMap,
-    domain: Option<&ValueDomain>,
+    flags: RecordFlags,
 ) -> Result<ModuleRecord, String> {
+    let RecordFlags { domain, cover_branches } = flags;
     for name in replay.keys() {
         if !sigs.iter().any(|s| &s.name == name) {
             return Err(format!("replay: no function named {name:?} in this module"));
@@ -461,9 +416,12 @@ pub fn record_with_signatures_replay(
             continue;
         }
         let replay_inputs: &[Vec<Value>] = replay.get(&sig.name).map(Vec::as_slice).unwrap_or(&[]);
-        let opts = GenOptions { max_inputs, domain };
-        let (uncallable, cases) = match sig.kind {
-            DefKind::Function => (None, function_cases(sandbox, src, sig, opts, replay_inputs)?),
+        let opts = GenOptions { max_inputs, domain, cover_branches };
+        let (uncallable, cases, cover_ctx) = match sig.kind {
+            DefKind::Function => {
+                let (cases, ctx) = function_cases(sandbox, src, sig, opts, replay_inputs)?;
+                (None, cases, ctx)
+            }
             DefKind::Method => {
                 method_record(sandbox, src, sig, &sigs, opts, &mut ctor_cache, replay_inputs)?
             }
@@ -476,7 +434,7 @@ pub fn record_with_signatures_replay(
         let (branches, branch_coverage) = if uncallable.is_some() {
             (None, None)
         } else {
-            match branch_report_for(sig, &cases) {
+            match cover::branch_report_for(sig, &cases, &cover_ctx) {
                 Some((b, c)) => (Some(b), Some(c)),
                 None => (None, None),
             }
@@ -549,7 +507,7 @@ fn function_cases(
     sig: &EffectSignature,
     opts: GenOptions,
     replay_inputs: &[Vec<Value>],
-) -> Result<Vec<Case>, String> {
+) -> Result<(Vec<Case>, cover::CoverContext), String> {
     let mut cases = Vec::new();
     for input in gen_inputs(sig, opts.max_inputs, opts.domain) {
         let result = sandbox.call(src, &sig.name, &input.positional, &input.kwargs)?;
@@ -569,12 +527,13 @@ fn function_cases(
         };
         cases.push(build_case(sig, &input, None, &result, CaseSource::Replay));
     }
-    Ok(cases)
+    let ctx = cover::run_loop(sandbox, src, sig, cover::CallTarget::Function, opts, &mut cases)?;
+    Ok((cases, ctx))
 }
 
 /// Shrink a `raised` case's input, re-executing via `call` (the same call shape — free function
 /// or method — the case itself ran on). Returns `None` when nothing shrank.
-fn minimize_raised(
+pub(super) fn minimize_raised(
     case: &Case,
     input: &GenInput,
     domain: Option<&ValueDomain>,
@@ -602,7 +561,7 @@ fn method_record(
     opts: GenOptions,
     ctor_cache: &mut HashMap<String, Option<HarnessError>>,
     replay_inputs: &[Vec<Value>],
-) -> Result<(Option<Uncallable>, Vec<Case>), String> {
+) -> Result<(Option<Uncallable>, Vec<Case>, cover::CoverContext), String> {
     let class = sig
         .owner
         .as_deref()
@@ -621,6 +580,7 @@ fn method_record(
                 error: err.clone(),
             }),
             Vec::new(),
+            cover::CoverContext::not_run(),
         ));
     }
 
@@ -650,7 +610,15 @@ fn method_record(
             CaseSource::Replay,
         ));
     }
-    Ok((None, cases))
+    let ctx = cover::run_loop(
+        sandbox,
+        src,
+        sig,
+        cover::CallTarget::Method { class, ctor_args: &ctor_args },
+        opts,
+        &mut cases,
+    )?;
+    Ok((None, cases, ctx))
 }
 
 /// Constructor arguments for `class`: empty when `__init__` is absent or fully defaulted
@@ -672,7 +640,7 @@ fn constructor_args(all: &[EffectSignature], class: &str, domain: Option<&ValueD
         .unwrap_or_default()
 }
 
-fn build_case(
+pub(super) fn build_case(
     sig: &EffectSignature,
     input: &GenInput,
     ctor_args: Option<Vec<Value>>,
