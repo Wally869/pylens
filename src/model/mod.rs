@@ -267,6 +267,14 @@ pub struct ParamInfo {
     /// a function's real body instead of raising on the first parse of a placeholder string.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hints: Vec<String>,
+    /// A concrete [`Shape`] read off `declared`'s annotation for the simple forms (`int`, `list`,
+    /// `Optional[int]`, `int | None`, ...) — same UNTRUSTED source as `declared`, kept separate
+    /// from it and never folded into `shape` or the may-set. Used only as a ranking hint by
+    /// `generate::candidates_for`, which prepends candidates matching this shape so the sampler's
+    /// early budget lands on inputs the author's own annotation expects. `None` for an annotation
+    /// that isn't one of the recognized simple forms.
+    #[serde(skip)]
+    pub declared_shape_hint: Option<Shape>,
 }
 
 /// The full effect signature of one function/method.

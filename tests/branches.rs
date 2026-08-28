@@ -327,18 +327,26 @@ fn branch_coverage_rollup_is_a_closed_count() {
 // Dynamic: `--cover-branches`'s predicate-targeted loop.
 // ---------------------------------------------------------------------------------------------
 
-/// `len(x) == 4` isn't a form `analyze::collect::guards`'s guard-sample extraction handles (it
+/// `len(x) == 5` isn't a form `analyze::collect::guards`'s guard-sample extraction handles (it
 /// only roots a name/attribute/subscript chain, and a `Call` like `len(x)` has none) — so, unlike
 /// a bare `x == 42`, plain generation has no pre-existing heuristic nudging it toward a
-/// length-4 list, and the branch stays uncovered at a small budget without `--cover-branches`.
-const LEN_EQ_SRC: &str = "def f(x):\n    if len(x) == 4:\n        return 1\n    return 0\n";
+/// length-5 sequence, and the branch stays uncovered at a small budget without
+/// `--cover-branches`. `5` (not `4`) is deliberate: `len(x)`'s sole evidence widens `x`'s shape
+/// to admit a `str` alongside the `Seq` (see `analyze::passes::shapes`'s sequence-protocol
+/// widening), and the `str` seed corpus's one length-4 filler (`"Word"`) would otherwise satisfy
+/// the branch by coincidence at this budget — no length in the corpus happens to be `5`.
+const LEN_EQ_SRC: &str = "def f(x):\n    if len(x) == 5:\n        return 1\n    return 0\n";
 
 #[test]
 fn cover_branches_off_leaves_the_equality_branch_uncovered_with_loop_not_run() {
     if !ready("cover_branches_off_leaves_the_equality_branch_uncovered_with_loop_not_run") {
         return;
     }
-    let rec = record_file_with_options(LEN_EQ_SRC, 12, &ReplayMap::new(), None, false).expect("record");
+    // 16 (not 12): `x`'s shape is a `Union(Seq, Str)` (sequence-protocol widening — see
+    // `LEN_EQ_SRC`'s doc), whose combined seed corpus alone is 13 candidates; a budget of exactly
+    // 12 would let the initial ranked batch consume the whole budget before the (here, disabled)
+    // cover-branches loop ever gets a turn, which isn't what this test is about.
+    let rec = record_file_with_options(LEN_EQ_SRC, 16, &ReplayMap::new(), None, false).expect("record");
     let f = find_function(&rec.functions, "f");
     let branches = f.branches.as_ref().expect("branches present");
     let bp = branch_report(branches, BranchKind::If, 2);
@@ -351,13 +359,16 @@ fn cover_branches_on_covers_the_equality_branch_and_terminates() {
     if !ready("cover_branches_on_covers_the_equality_branch_and_terminates") {
         return;
     }
-    let rec = record_file_with_options(LEN_EQ_SRC, 12, &ReplayMap::new(), None, true).expect("record");
+    // See the sibling `off` test for why the budget is 16, not 12: the initial ranked batch off
+    // `x`'s widened `Union(Seq, Str)` shape alone can consume up to 13 cases, so the
+    // cover-branches loop needs headroom past that to add its targeted case.
+    let rec = record_file_with_options(LEN_EQ_SRC, 16, &ReplayMap::new(), None, true).expect("record");
     let f = find_function(&rec.functions, "f");
     let branches = f.branches.as_ref().expect("branches present");
     let bp = branch_report(branches, BranchKind::If, 2);
     assert_eq!(status_of(bp, "true"), "covered");
     assert!(
-        f.cases.len() <= 12,
+        f.cases.len() <= 16,
         "the loop must respect the total per-function case budget: got {} cases",
         f.cases.len()
     );

@@ -177,8 +177,10 @@ fn comprehension_call_is_descended_into() {
             .any(|u| u.reason == "call_unknown_callee" && u.callee.as_deref() == Some("helper"))
     );
     assert_eq!(f.purity, Purity::Unknown);
-    // The comprehension's `for` iterable votes shape like an ordinary `for` loop's.
-    assert!(f.params.iter().any(|p| p.name == "items" && p.shape == Shape::any_seq()));
+    // The comprehension's `for` iterable votes shape like an ordinary `for` loop's — widened to
+    // admit `str` too, since this is sequence-protocol evidence on a parameter.
+    let widened_seq = Shape::union_of([Shape::any_seq(), Shape::Str]);
+    assert!(f.params.iter().any(|p| p.name == "items" && p.shape == widened_seq));
 }
 
 #[test]
@@ -316,6 +318,26 @@ fn subscript_with_literal_index_on_pinned_param_base_still_yields_type_error() {
 }
 
 #[test]
+fn list_specific_evidence_on_a_param_still_infers_a_bare_seq() {
+    // `.append` is list-specific evidence, not sequence-protocol evidence, so it must not widen
+    // to admit `str` — appending to a string isn't valid Python.
+    let s = analyze("def f(xs):\n    xs.append(1)\n");
+    let f = sig(&s, "f");
+    let xs = f.params.iter().find(|p| p.name == "xs").unwrap();
+    assert_eq!(xs.shape, Shape::any_seq());
+}
+
+#[test]
+fn sequence_protocol_evidence_on_a_param_widens_to_admit_str() {
+    // `len(p)` and `for c in p` are both sequence-protocol evidence only — a real caller can
+    // pass a `str` here just as validly as a `list`, so the inferred shape must admit both.
+    let s = analyze("def g(p):\n    n = len(p)\n    for c in p:\n        pass\n    return n\n");
+    let g = sig(&s, "g");
+    let p = g.params.iter().find(|p| p.name == "p").unwrap();
+    assert_eq!(p.shape, Shape::union_of([Shape::any_seq(), Shape::Str]));
+}
+
+#[test]
 fn subscript_on_local_list_literal_does_not_gain_key_error() {
     // `xs` is a LOCAL built from a list literal, never a parameter — a caller cannot substitute
     // a mapping into it, so its pinned `Seq` shape may still narrow the may-set to `IndexError`
@@ -369,7 +391,11 @@ fn nested_container_shape_is_inferred_from_loop_variable_usage() {
     );
     let f = sig(&s, "f");
     let m = f.params.iter().find(|p| p.name == "m").unwrap();
-    assert_eq!(m.shape, Shape::Seq(Box::new(Shape::any_seq())));
+    // `m` is a parameter, so the iteration evidence widens to admit `str` too.
+    assert_eq!(
+        m.shape,
+        Shape::union_of([Shape::Seq(Box::new(Shape::any_seq())), Shape::Str])
+    );
 }
 
 #[test]
@@ -382,9 +408,10 @@ fn nested_numeric_container_shape_is_inferred_from_subscript_division() {
     );
     let s = sig(&s, "g");
     let rows = s.params.iter().find(|p| p.name == "rows").unwrap();
+    // `rows` is a parameter, so the iteration evidence widens to admit `str` too.
     assert_eq!(
         rows.shape,
-        Shape::Seq(Box::new(Shape::Seq(Box::new(Shape::Float))))
+        Shape::union_of([Shape::Seq(Box::new(Shape::Seq(Box::new(Shape::Float)))), Shape::Str])
     );
 }
 

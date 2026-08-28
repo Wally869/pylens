@@ -79,6 +79,22 @@ pub(super) fn numeric_pin_for_op(op: ast::Operator) -> Option<Shape> {
     }
 }
 
+/// Sequence-protocol evidence — iteration, `len`/`sum`/`sorted`/`reversed`/`enumerate`/`min`/
+/// `max`'s first argument, and the numeric-pinned-subscript default below — accepts a `str`
+/// equally well as a `list`, and a real corpus shows callers pass one just as often. For a
+/// PARAMETER (the hypothesis side of inference), this widens the vote to `Union(Seq(elem), Str)`
+/// instead of committing to `Seq(elem)` alone. A local's shape never widens this way — an
+/// assignment (`xs = [...]`) is a value fact, not a protocol hypothesis — nor does list-specific
+/// evidence (`.append`, `.extend`, `+= [...]`, ...), which is voted directly as `Seq` by its own
+/// call sites and never routes through this helper.
+fn seq_protocol_shape(state: &ShapeState, name: &str, elem: Shape) -> Shape {
+    if state.is_param(name) {
+        Shape::union_of([Shape::Seq(Box::new(elem)), Shape::Str])
+    } else {
+        Shape::Seq(Box::new(elem))
+    }
+}
+
 /// Pin `expr`'s shape toward `target`: a plain name is refined directly; a subscript `B[i]`
 /// bumps `B`'s element (or map value) shape instead, since `B[i]`'s own shape isn't a name we
 /// can store evidence against.
@@ -92,7 +108,7 @@ pub(super) fn pin_operand(state: &mut ShapeState, expr: &ast::Expr, target: Shap
                     Shape::Map(k, v) => Shape::Map(k, Box::new(Shape::join(*v, target))),
                     Shape::Set(e) => Shape::Set(Box::new(Shape::join(*e, target))),
                     Shape::Seq(e) => Shape::Seq(Box::new(Shape::join(*e, target))),
-                    _ => Shape::Seq(Box::new(target)),
+                    _ => seq_protocol_shape(state, name, target),
                 };
                 state.refine(name, bumped);
             }
@@ -109,6 +125,16 @@ pub(super) fn pin_root(state: &mut ShapeState, expr: &ast::Expr, shape: Shape) {
     }
 }
 
+/// Pin `expr`'s root toward the [`Shape::any_seq`] sequence-protocol evidence (the `len`/`sum`/
+/// `sorted`/`reversed`/`enumerate`/`min`/`max` first-argument pin), widened for a parameter — see
+/// [`seq_protocol_shape`].
+pub(super) fn pin_root_seq_evidence(state: &mut ShapeState, expr: &ast::Expr) {
+    if let Some(name) = leftmost_name(expr) {
+        let shape = seq_protocol_shape(state, name, Shape::Any);
+        state.refine(name, shape);
+    }
+}
+
 /// The `for v in E` rule: binds `v` to `E`'s element shape, then refines `E`'s root to be at
 /// least a `Seq` of `v`'s shape (as of the start of this pass) — the rule that lifts a nested
 /// container's outer shape from its inner loop variable's settled shape.
@@ -121,7 +147,8 @@ pub(super) fn refine_for(state: &mut ShapeState, target: &ast::Expr, iter: &ast:
     bind_for_target(target, elem, state);
     if let Some(root) = leftmost_name(iter) {
         let v_shape = shape_of(target, state);
-        state.refine(root, Shape::Seq(Box::new(v_shape)));
+        let widened = seq_protocol_shape(state, root, v_shape);
+        state.refine(root, widened);
     }
 }
 

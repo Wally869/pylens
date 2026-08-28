@@ -175,6 +175,17 @@ pub fn gen_inputs(sig: &EffectSignature, max_vectors: usize, domain: Option<&Val
 /// to sample.
 fn candidates_for(p: &ParamInfo, domain: Option<&ValueDomain>) -> Vec<Candidate> {
     let mut c = seeds::candidates(&generation_shape(p));
+    // The author's own annotation (untrusted for inference, but a fine ranking hint) says which
+    // concrete shape the sampler's limited early budget should reach first. Prepending — rather
+    // than replacing — keeps every other candidate as a falsifier for a wrong or lying
+    // annotation. See `ParamInfo::declared_shape_hint`.
+    if let Some(hint) = &p.declared_shape_hint {
+        let matching: Vec<Candidate> = seeds::candidates(hint)
+            .into_iter()
+            .filter(|cand| !c.iter().any(|existing| existing.value == cand.value))
+            .collect();
+        c.splice(0..0, matching);
+    }
     // A defaulted parameter is likely Optional — exercise the None/default path.
     if p.has_default && !c.iter().any(|cand| cand.value.is_null()) {
         c.push(Candidate { value: Value::Null, rank: Rank::Guard });

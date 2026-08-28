@@ -41,7 +41,7 @@ fn param_info(
     name: String,
     has_default: bool,
     kind: ParamKind,
-    declared: Option<String>,
+    ann: Option<&ast::Expr>,
     default_literal: Option<serde_json::Value>,
 ) -> ParamInfo {
     ParamInfo {
@@ -49,10 +49,11 @@ fn param_info(
         shape: Shape::Any,
         has_default,
         kind,
-        declared,
+        declared: annotation_name(ann),
         guard_samples: Vec::new(),
         default_literal,
         hints: Vec::new(),
+        declared_shape_hint: declared_shape_hint(ann),
     }
 }
 
@@ -63,7 +64,7 @@ pub(super) fn collect_param_defs(params: &ast::Parameters, skip: Option<&str>) -
             p.parameter.name.as_str().to_string(),
             p.default.is_some(),
             ParamKind::Positional,
-            annotation_name(p.parameter.annotation.as_deref()),
+            p.parameter.annotation.as_deref(),
             default_literal(p.default.as_deref()),
         ));
     }
@@ -72,7 +73,7 @@ pub(super) fn collect_param_defs(params: &ast::Parameters, skip: Option<&str>) -
             p.parameter.name.as_str().to_string(),
             p.default.is_some(),
             ParamKind::Positional,
-            annotation_name(p.parameter.annotation.as_deref()),
+            p.parameter.annotation.as_deref(),
             default_literal(p.default.as_deref()),
         ));
     }
@@ -81,7 +82,7 @@ pub(super) fn collect_param_defs(params: &ast::Parameters, skip: Option<&str>) -
             v.name.as_str().to_string(),
             false,
             ParamKind::VarPositional,
-            annotation_name(v.annotation.as_deref()),
+            v.annotation.as_deref(),
             None,
         ));
     }
@@ -90,7 +91,7 @@ pub(super) fn collect_param_defs(params: &ast::Parameters, skip: Option<&str>) -
             p.parameter.name.as_str().to_string(),
             p.default.is_some(),
             ParamKind::KeywordOnly,
-            annotation_name(p.parameter.annotation.as_deref()),
+            p.parameter.annotation.as_deref(),
             default_literal(p.default.as_deref()),
         ));
     }
@@ -99,7 +100,7 @@ pub(super) fn collect_param_defs(params: &ast::Parameters, skip: Option<&str>) -
             k.name.as_str().to_string(),
             false,
             ParamKind::VarKeyword,
-            annotation_name(k.annotation.as_deref()),
+            k.annotation.as_deref(),
             None,
         ));
     }
@@ -180,6 +181,50 @@ pub(super) fn annotation_name(ann: Option<&ast::Expr>) -> Option<String> {
     match ann? {
         ast::Expr::Name(n) => Some(n.id.as_str().to_string()),
         ast::Expr::Subscript(s) => Some(leftmost_name(&s.value)?.to_string()),
+        _ => None,
+    }
+}
+
+/// A concrete generation-ranking [`Shape`] for the simple annotation forms `int`, `float`,
+/// `str`, `bool`, `bytes`, `list`/`List`/`tuple`/`Tuple`/`Sequence`, `dict`/`Dict`/`Mapping`,
+/// `set`/`Set`/`frozenset`, `Optional[T]`, and `T | None` (recursing into `T` for the last two).
+/// `None` for anything else (a bare class name, an unparameterized `Union`, `Any`, ...) — see
+/// `ParamInfo::declared_shape_hint`'s doc. Deliberately independent of [`annotation_name`]'s
+/// coarser `declared` string, which `type_check` relies on staying exactly as it is today.
+fn declared_shape_hint(ann: Option<&ast::Expr>) -> Option<Shape> {
+    match ann? {
+        ast::Expr::Name(n) => base_shape_for_annotation_name(n.id.as_str()),
+        ast::Expr::Subscript(s) => {
+            let base = leftmost_name(&s.value)?;
+            if base == "Optional" {
+                declared_shape_hint(Some(&s.slice))
+            } else {
+                base_shape_for_annotation_name(base)
+            }
+        }
+        ast::Expr::BinOp(b) if b.op == ast::Operator::BitOr => {
+            if matches!(b.left.as_ref(), ast::Expr::NoneLiteral(_)) {
+                declared_shape_hint(Some(&b.right))
+            } else if matches!(b.right.as_ref(), ast::Expr::NoneLiteral(_)) {
+                declared_shape_hint(Some(&b.left))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn base_shape_for_annotation_name(name: &str) -> Option<Shape> {
+    match name {
+        "int" => Some(Shape::Int),
+        "float" => Some(Shape::Float),
+        "bool" => Some(Shape::Bool),
+        "str" => Some(Shape::Str),
+        "bytes" => Some(Shape::Bytes),
+        "list" | "List" | "tuple" | "Tuple" | "Sequence" => Some(Shape::any_seq()),
+        "dict" | "Dict" | "Mapping" => Some(Shape::any_map()),
+        "set" | "Set" | "frozenset" => Some(Shape::any_set()),
         _ => None,
     }
 }

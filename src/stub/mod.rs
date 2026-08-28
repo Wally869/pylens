@@ -316,6 +316,7 @@ mod tests {
             guard_samples: Vec::new(),
             default_literal: None,
             hints: Vec::new(),
+            declared_shape_hint: None,
         }
     }
 
@@ -382,6 +383,7 @@ mod tests {
             guard_samples: Vec::new(),
             default_literal: None,
             hints: Vec::new(),
+            declared_shape_hint: None,
         });
         sig.params.push(ParamInfo {
             name: "flag".to_string(),
@@ -392,6 +394,7 @@ mod tests {
             guard_samples: Vec::new(),
             default_literal: None,
             hints: Vec::new(),
+            declared_shape_hint: None,
         });
         sig.params.push(ParamInfo {
             name: "kwargs".to_string(),
@@ -402,6 +405,7 @@ mod tests {
             guard_samples: Vec::new(),
             default_literal: None,
             hints: Vec::new(),
+            declared_shape_hint: None,
         });
         let out = render_stub(std::slice::from_ref(&sig));
         assert!(out.contains(

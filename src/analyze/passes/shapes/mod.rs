@@ -38,6 +38,13 @@
 //! - **Iterable-consuming builtins/methods**: `len`/`sum`/`sorted`/`reversed`/`enumerate`/
 //!   `min`/`max`'s first argument, and value methods (via [`shape_for_method`]), pin their
 //!   receiver to at least a sequence/set/map/string as appropriate.
+//! - **Sequence-protocol widening (parameters only)**: the for-loop and `len`/`sum`/... votes
+//!   above, and the numeric-pinned-subscript default, only ever observe *protocol* usage — they
+//!   never rule out a `str` argument, and a real corpus shows callers pass one about as often as
+//!   a `list`. For a parameter (never a local — see [`pinning`]) that evidence votes
+//!   `Union(Seq(elem), Str)` instead of committing to `Seq(elem)`; list-specific evidence
+//!   (`.append`, `.extend`, `+= [...]`, ...) still votes a bare `Seq`, straight through
+//!   [`shape_for_method`]/[`pin_root`]. See `pinning::seq_protocol_shape`.
 //! - **Literals**: list/tuple -> `Seq`, set -> `Set`, dict -> `Map`, scalars -> their `Shape`.
 
 use std::collections::HashMap;
@@ -55,7 +62,9 @@ mod pinning;
 mod shape_of;
 mod state;
 
-use pinning::{assign_target, numeric_pin_for_op, pin_operand, pin_root, refine_for};
+use pinning::{
+    assign_target, numeric_pin_for_op, pin_operand, pin_root, pin_root_seq_evidence, refine_for,
+};
 use state::ShapeState;
 
 /// Maximum number of full-body refinement passes per function before giving up on reaching a
@@ -404,7 +413,7 @@ fn visit_call(call: &ast::ExprCall, state: &mut ShapeState) {
                 "len" | "sum" | "sorted" | "reversed" | "enumerate" | "min" | "max"
             ) && let Some(arg) = call.arguments.args.first()
             {
-                pin_root(state, arg, Shape::any_seq());
+                pin_root_seq_evidence(state, arg);
             }
         }
         _ => {}

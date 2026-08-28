@@ -99,6 +99,15 @@ impl<'a> ShapeState<'a> {
         }
     }
 
+    /// True if `name` (after alias resolution) denotes one of this function's tracked
+    /// parameters — the hypothesis side of shape inference, where sequence-protocol evidence
+    /// (iteration, `len`/`sum`/... first argument) widens to admit a `str` argument too, since
+    /// real callers pass one just as often. See `pinning::seq_protocol_shape`. A local's shape
+    /// (`xs = [...]`) is a value fact, never gated by this.
+    pub(super) fn is_param(&self, name: &str) -> bool {
+        self.params.contains(&self.root(name))
+    }
+
     /// The representative name `name` currently denotes the same object as (identity, not
     /// alias to a param specifically — every local is tracked, not just param aliases).
     pub(super) fn root(&self, name: &str) -> String {

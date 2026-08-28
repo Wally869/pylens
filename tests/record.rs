@@ -291,11 +291,16 @@ fn raised_case_carries_a_smaller_minimized_input() {
     if !ready("raised_case_carries_a_smaller_minimized_input") {
         return;
     }
-    // The `for` loop pins `xs`'s shape to a sequence, so every generated case is a list; `xs[10]`
-    // raises IndexError whenever the list has fewer than 11 elements. Shrinking should find a
-    // smaller (or equal, for already-minimal) list that still raises IndexError.
+    // The `for` loop is sequence-protocol evidence, so `xs`'s shape is `Union(Seq, Str)` (it
+    // admits a `str` argument too — see `analyze::passes::shapes`'s widening doc) and generated
+    // cases are a mix of lists and strings; `xs[10]` raises IndexError whenever either has fewer
+    // than 11 elements/characters. This test is about list shrinking specifically, so it only
+    // looks at the list-shaped IndexError cases. Shrinking should find a smaller (or equal, for
+    // already-minimal) list that still raises IndexError. The budget is 16, not 6: `xs`'s widened
+    // corpus is 13 candidates and ranks the `str` half first, so a small budget can crowd out
+    // every non-trivial (shrinkable) list candidate before reaching one.
     let src = "def f(xs):\n    for _ in xs:\n        pass\n    return xs[10]\n";
-    let rec = record_file(src, 6).expect("record");
+    let rec = record_file(src, 16).expect("record");
     let f = rec
         .functions
         .iter()
@@ -304,9 +309,13 @@ fn raised_case_carries_a_smaller_minimized_input() {
     let index_errors: Vec<_> = f
         .cases
         .iter()
-        .filter(|c| c.outcome == "raised" && c.raises.as_deref() == Some("IndexError"))
+        .filter(|c| {
+            c.outcome == "raised"
+                && c.raises.as_deref() == Some("IndexError")
+                && c.input.first().is_some_and(Value::is_array)
+        })
         .collect();
-    assert!(!index_errors.is_empty(), "expected at least one IndexError case: {:?}",
+    assert!(!index_errors.is_empty(), "expected at least one list-shaped IndexError case: {:?}",
         f.cases.iter().map(|c| (&c.outcome, &c.raises)).collect::<Vec<_>>());
 
     let shrunk = index_errors

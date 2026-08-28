@@ -80,6 +80,33 @@ fn guard_samples_appear_in_generated_vectors() {
 }
 
 #[test]
+fn declared_int_annotation_ranks_an_int_candidate_first_without_dropping_other_types() {
+    let sigs = analyze_source("def f(x: int):\n    return x\n").expect("parse");
+    let f = sig(&sigs, "f");
+    let vectors = gen_inputs(&f, 12, None);
+    assert!(!vectors.is_empty());
+    assert!(
+        vectors[0].positional.first().is_some_and(Value::is_i64),
+        "expected the first generated vector to use an int candidate: {vectors:?}"
+    );
+    assert!(
+        vectors
+            .iter()
+            .any(|v| v.positional.first().is_some_and(|val| !val.is_i64())),
+        "expected later vectors to still cover non-int candidates: {vectors:?}"
+    );
+}
+
+#[test]
+fn unparseable_declared_annotation_leaves_generation_unchanged() {
+    let with_annotation = analyze_source("def f(x: SomeClass):\n    return x\n").expect("parse");
+    let without_annotation = analyze_source("def f(x):\n    return x\n").expect("parse");
+    let f_with = sig(&with_annotation, "f");
+    let f_without = sig(&without_annotation, "f");
+    assert_eq!(gen_inputs(&f_with, 12, None), gen_inputs(&f_without, 12, None));
+}
+
+#[test]
 fn hinted_param_receives_a_corpus_value_at_default_budget() {
     let sigs = analyze_source(
         "from urllib.parse import urlparse\ndef f(url):\n    return urlparse(url)\n",
