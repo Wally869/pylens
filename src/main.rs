@@ -280,14 +280,16 @@ fn cmd_record(args: &[String]) {
         }
         None => pylens::record::ReplayMap::new(),
     };
-    let record_result = pylens::record::record_file_with_options_and_stability_and_budget(
+    let record_result = pylens::record::record_file(
         &src,
         inputs,
         &replay,
-        domain.as_ref(),
-        cover_branches,
-        stability_runs,
-        time_budget,
+        pylens::record::RecordFlags {
+            domain: domain.as_ref(),
+            cover_branches,
+            stability_runs,
+            time_budget,
+        },
     );
     match record_result {
         Ok(record) => {
@@ -344,7 +346,12 @@ fn cmd_validate(args: &[String]) {
     }
 
     let src = read_file(&path);
-    let record = match pylens::record::record_file(&src, inputs) {
+    let record = match pylens::record::record_file(
+        &src,
+        inputs,
+        &pylens::record::ReplayMap::new(),
+        pylens::record::RecordFlags::default(),
+    ) {
         Ok(r) => r,
         Err(e) => fail(&format!("record error: {e}")),
     };

@@ -3,7 +3,7 @@
 //! `src/record/stability.rs`.
 
 use pylens::exec::probe;
-use pylens::record::{ReplayMap, record_file_with_options, record_file_with_options_and_stability};
+use pylens::record::{RecordFlags, ReplayMap, record_file};
 
 fn ready(test: &str) -> bool {
     match probe() {
@@ -32,13 +32,11 @@ fn deterministic_function_keeps_all_cases() {
     if !ready("deterministic_function_keeps_all_cases") {
         return;
     }
-    let rec = record_file_with_options_and_stability(
+    let rec = record_file(
         DETERMINISTIC_SRC,
         6,
         &ReplayMap::new(),
-        None,
-        false,
-        Some(3),
+        RecordFlags { stability_runs: Some(3), ..RecordFlags::default() },
     )
     .expect("record");
     let f = rec
@@ -58,7 +56,7 @@ fn nondeterministic_function_drops_unstable_cases() {
     if !ready("nondeterministic_function_drops_unstable_cases") {
         return;
     }
-    let plain = record_file_with_options(NONDETERMINISTIC_SRC, 6, &ReplayMap::new(), None, false)
+    let plain = record_file(NONDETERMINISTIC_SRC, 6, &ReplayMap::new(), RecordFlags::default())
         .expect("plain record");
     let plain_f = plain
         .functions
@@ -68,13 +66,11 @@ fn nondeterministic_function_drops_unstable_cases() {
     let total_cases_without_stability = plain_f.cases.len();
     assert!(total_cases_without_stability > 0, "unstable() should have produced cases");
 
-    let rec = record_file_with_options_and_stability(
+    let rec = record_file(
         NONDETERMINISTIC_SRC,
         6,
         &ReplayMap::new(),
-        None,
-        false,
-        Some(3),
+        RecordFlags { stability_runs: Some(3), ..RecordFlags::default() },
     )
     .expect("record");
     let f = rec
@@ -100,7 +96,7 @@ fn plain_record_has_no_dropped_cases_field() {
     if !ready("plain_record_has_no_dropped_cases_field") {
         return;
     }
-    let rec = record_file_with_options(DETERMINISTIC_SRC, 4, &ReplayMap::new(), None, false)
+    let rec = record_file(DETERMINISTIC_SRC, 4, &ReplayMap::new(), RecordFlags::default())
         .expect("record");
     let f = rec
         .functions

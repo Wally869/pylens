@@ -73,7 +73,9 @@ and the
 - `src/model/` — the data model: `shape.rs` (the `Shape` lattice: join, unions, serde) and
   `mod.rs` (`EffectSignature`, params, mutations, raises, imports, `TypeMismatch`, `Purity`).
 - `src/analyze/` — `mod.rs` (the driver), `pass.rs` (the `Pass` trait), `context.rs` (the shared
-  state), `passes/` (one file for each pass; `shapes/` and `effects/` have submodules),
+  state: `ModuleAnalysis`, `FunctionFacts`), `proof.rs` (the `FunctionFacts` "is this expression
+  proven safe" checks: `attribute_load_proven`, `iterable_proven`, `builtin_shadowed`),
+  `passes/` (one file for each pass; `shapes/` and `effects/` have submodules),
   `collect/` (aliases, mutations, exceptions, shapes, returns, guards, hints, body_lines).
 - `src/analyze/models.rs` — the stdlib effect table (raises and io), keyed on the resolved
   module path. An entry removes an unresolved acknowledgment, so each entry over-approximates.
@@ -84,11 +86,13 @@ and the
   candidates.
 - `src/exec.rs` — sandboxed execution: the `Sandbox` trait, `Nsjail`, the `NsjailPool` fork
   server. There is no unsandboxed launcher.
-- `src/record/` — `mod.rs` (the static signature and the sandboxed cases: `ModuleRecord`, `Case`,
-  with the mutation difference before and after the call), `cover.rs` (the `--cover-branches`
-  predicate-targeted coverage loop, and the `branches`/`branch_coverage` report it feeds a
-  `reason` into), `stability.rs` (`--stability-runs`: re-executes each case N times and drops any
-  whose runs disagree, feeding `FunctionRecord::dropped_cases`).
+- `src/record/` — `mod.rs` (orchestration: `record_file`, `record_with_signatures`, `RecordFlags`,
+  replay parsing), `case.rs` (the serialization-side output types — `ModuleRecord`, `Case`,
+  `FunctionRecord`, `Coverage`, `Dependency`, ... — and `build_case`, which diffs the mutation
+  before and after the call), `cover.rs` (the `--cover-branches` predicate-targeted coverage loop,
+  and the `branches`/`branch_coverage` report it feeds a `reason` into), `stability.rs`
+  (`--stability-runs`: re-executes each case N times and drops any whose runs disagree, feeding
+  `FunctionRecord::dropped_cases`).
 - `src/shrink.rs` — greedy input minimization for the cases that raise. An aid for the report
   only.
 - `src/validate.rs` — the `observed ⊆ static` harness. `Defect` severity is Hard if a may-set

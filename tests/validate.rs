@@ -4,7 +4,7 @@
 //! sandbox isn't provisioned.
 
 use pylens::exec::probe;
-use pylens::record::record_file;
+use pylens::record::{RecordFlags, ReplayMap, record_file};
 use pylens::report::{FunctionValidation, validate_summary};
 use pylens::validate::{Severity, validate_function};
 
@@ -33,7 +33,7 @@ fn example_corpus_has_zero_hard_defects() {
         include_str!("../examples/normalize.py"),
         include_str!("../examples/streaming.py"),
     ] {
-        let rec = record_file(src, 4).expect("record");
+        let rec = record_file(src, 4, &ReplayMap::new(), RecordFlags::default()).expect("record");
         for f in &rec.functions {
             let defects = validate_function(f);
             let hard: Vec<_> = defects
@@ -59,7 +59,7 @@ fn uncallable_function_is_reported_unvalidated_in_the_summary() {
     // is `uncallable` — validate observed nothing for it, and that must be surfaced, not read as
     // a silent pass.
     let src = "import definitely_not_a_real_module_xyz as z\ndef f(x):\n    return z.go(x)\n";
-    let rec = record_file(src, 3).expect("record");
+    let rec = record_file(src, 3, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let f = rec
         .functions
         .iter()
@@ -114,7 +114,7 @@ fn pre_rebind_method_call_has_zero_hard_defects() {
         "    x = Box()\n",
         "    x.bump()\n",
     );
-    let rec = record_file(src, 12).expect("record");
+    let rec = record_file(src, 12, &ReplayMap::new(), RecordFlags::default()).expect("record");
     for f in &rec.functions {
         let defects = validate_function(f);
         let hard: Vec<_> = defects.iter().filter(|d| d.severity == Severity::Hard).collect();

@@ -6,7 +6,7 @@ use pylens::analyze_source;
 use pylens::exec::{Sandbox, probe};
 use pylens::model::branch::{BranchKind, BranchPoint, OutcomeEvidence};
 use pylens::model::EffectSignature;
-use pylens::record::{BranchReport, FunctionRecord, ReplayMap, record_file_with_options, record_file_with_replay};
+use pylens::record::{BranchReport, FunctionRecord, RecordFlags, ReplayMap, record_file};
 use serde_json::json;
 
 fn ready(test: &str) -> bool {
@@ -253,7 +253,7 @@ fn else_less_if_false_path_is_covered_via_its_arc() {
 
     let mut replay = ReplayMap::new();
     replay.insert("f".to_string(), vec![vec![json!(-1)]]);
-    let rec = record_file_with_replay(src, 1, &replay).expect("record");
+    let rec = record_file(src, 1, &replay, RecordFlags::default()).expect("record");
     let f = find_function(&rec.functions, "f");
     let branches = f.branches.as_ref().expect("branches present");
     let bp = branch_report(branches, BranchKind::If, 2);
@@ -268,7 +268,7 @@ fn for_loop_iterate_and_empty_are_both_covered() {
     let src = "def f(xs):\n    for x in xs:\n        pass\n    return xs\n";
     let mut replay = ReplayMap::new();
     replay.insert("f".to_string(), vec![vec![json!([])], vec![json!([1])]]);
-    let rec = record_file_with_replay(src, 1, &replay).expect("record");
+    let rec = record_file(src, 1, &replay, RecordFlags::default()).expect("record");
     let f = find_function(&rec.functions, "f");
     let branches = f.branches.as_ref().expect("branches present");
     let bp = branch_report(branches, BranchKind::For, 2);
@@ -284,7 +284,7 @@ fn while_loop_skip_is_covered() {
     let src = "def f(n):\n    while n > 0:\n        n -= 1\n    return n\n";
     let mut replay = ReplayMap::new();
     replay.insert("f".to_string(), vec![vec![json!(0)], vec![json!(2)]]);
-    let rec = record_file_with_replay(src, 1, &replay).expect("record");
+    let rec = record_file(src, 1, &replay, RecordFlags::default()).expect("record");
     let f = find_function(&rec.functions, "f");
     let branches = f.branches.as_ref().expect("branches present");
     let bp = branch_report(branches, BranchKind::While, 2);
@@ -300,7 +300,7 @@ fn ternary_is_reported_unobservable_regardless_of_input() {
     let src = "def f(x):\n    return \"a\" if x else \"b\"\n";
     let mut replay = ReplayMap::new();
     replay.insert("f".to_string(), vec![vec![json!(true)], vec![json!(false)]]);
-    let rec = record_file_with_replay(src, 1, &replay).expect("record");
+    let rec = record_file(src, 1, &replay, RecordFlags::default()).expect("record");
     let f = find_function(&rec.functions, "f");
     let branches = f.branches.as_ref().expect("branches present");
     let bp = branch_report(branches, BranchKind::Ternary, 2);
@@ -314,7 +314,7 @@ fn branch_coverage_rollup_is_a_closed_count() {
         return;
     }
     let src = "def f(x):\n    if x > 0:\n        y = 1\n    z = \"a\" if x else \"b\"\n    return x, z\n";
-    let rec = record_file_with_replay(src, 4, &ReplayMap::new()).expect("record");
+    let rec = record_file(src, 4, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let f = find_function(&rec.functions, "f");
     let branches = f.branches.as_ref().expect("branches present");
     let rollup = f.branch_coverage.as_ref().expect("rollup present");
@@ -346,7 +346,7 @@ fn cover_branches_off_leaves_the_equality_branch_uncovered_with_loop_not_run() {
     // `LEN_EQ_SRC`'s doc), whose combined seed corpus alone is 13 candidates; a budget of exactly
     // 12 would let the initial ranked batch consume the whole budget before the (here, disabled)
     // cover-branches loop ever gets a turn, which isn't what this test is about.
-    let rec = record_file_with_options(LEN_EQ_SRC, 16, &ReplayMap::new(), None, false).expect("record");
+    let rec = record_file(LEN_EQ_SRC, 16, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let f = find_function(&rec.functions, "f");
     let branches = f.branches.as_ref().expect("branches present");
     let bp = branch_report(branches, BranchKind::If, 2);
@@ -362,7 +362,13 @@ fn cover_branches_on_covers_the_equality_branch_and_terminates() {
     // See the sibling `off` test for why the budget is 16, not 12: the initial ranked batch off
     // `x`'s widened `Union(Seq, Str)` shape alone can consume up to 13 cases, so the
     // cover-branches loop needs headroom past that to add its targeted case.
-    let rec = record_file_with_options(LEN_EQ_SRC, 16, &ReplayMap::new(), None, true).expect("record");
+    let rec = record_file(
+        LEN_EQ_SRC,
+        16,
+        &ReplayMap::new(),
+        RecordFlags { cover_branches: true, ..RecordFlags::default() },
+    )
+    .expect("record");
     let f = find_function(&rec.functions, "f");
     let branches = f.branches.as_ref().expect("branches present");
     let bp = branch_report(branches, BranchKind::If, 2);
@@ -384,7 +390,13 @@ fn cover_branches_on_an_opaque_predicate_stays_uncovered_with_no_synthesizer() {
     // `true` outcome stays uncovered whether or not `--cover-branches` runs, for two independent
     // reasons that both point at `no_synthesizer`.
     let src = "def f(x):\n    if id(x) == 999999999999:\n        return 1\n    return 0\n";
-    let rec = record_file_with_options(src, 12, &ReplayMap::new(), None, true).expect("record");
+    let rec = record_file(
+        src,
+        12,
+        &ReplayMap::new(),
+        RecordFlags { cover_branches: true, ..RecordFlags::default() },
+    )
+    .expect("record");
     let f = find_function(&rec.functions, "f");
     let branches = f.branches.as_ref().expect("branches present");
     let bp = branch_report(branches, BranchKind::If, 2);

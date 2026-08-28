@@ -8,6 +8,7 @@ mod context;
 mod models;
 mod pass;
 mod passes;
+mod proof;
 
 pub use context::ImportCallSite;
 pub use passes::declarations::{DeclInfo, ReceiverKind};

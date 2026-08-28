@@ -6,8 +6,7 @@ use pylens::generate::ValueDomain;
 use pylens::model::ReturnKind;
 use pylens::record::{
     CaseSource, DepStatus, RecordFlags, ReplayMap, parse_project_replay, parse_replay, record_file,
-    record_file_with_options, record_file_with_options_and_stability_and_budget,
-    record_file_with_replay, record_with_signatures_replay,
+    record_with_signatures,
 };
 use std::time::Duration;
 use pylens::{analyze_source, imports_of};
@@ -29,7 +28,7 @@ fn method_record_captures_self_mutation() {
         return;
     }
     let src = include_str!("../examples/inventory.py");
-    let rec = record_file(src, 4).expect("record");
+    let rec = record_file(src, 4, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let add = rec
         .functions
         .iter()
@@ -57,7 +56,7 @@ fn function_record_has_union_returns_and_cases() {
         return;
     }
     let src = include_str!("../examples/normalize.py");
-    let rec = record_file(src, 4).expect("record");
+    let rec = record_file(src, 4, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let classify = rec
         .functions
         .iter()
@@ -76,7 +75,7 @@ fn reports_unresolved_dependency() {
         return;
     }
     let src = "import definitely_not_a_real_module_xyz as z\ndef f(x):\n    return z.go(x)\n";
-    let rec = record_file(src, 2).expect("record");
+    let rec = record_file(src, 2, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let dep = rec
         .dependencies
         .iter()
@@ -106,7 +105,7 @@ fn unresolved_module_import_hoists_to_uncallable() {
     // A module-scope import that can't load stops the whole file from loading, so the function
     // is marked uncallable ONCE — not with N identical per-case setup errors.
     let src = "import definitely_not_a_real_module_xyz as z\ndef f(x):\n    return z.go(x)\n";
-    let rec = record_file(src, 3).expect("record");
+    let rec = record_file(src, 3, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let f = rec
         .functions
         .iter()
@@ -131,7 +130,7 @@ fn recursion_error_is_reported_as_resource_kill_not_raised() {
     // generated case is a plain integer and recursion depth is what exhausts the limit, not a
     // spurious `TypeError` from a mismatched shape guess.
     let src = "def f(n):\n    return f(n - 1)\n";
-    let rec = record_file(src, 3).expect("record");
+    let rec = record_file(src, 3, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let f = rec
         .functions
         .iter()
@@ -163,7 +162,7 @@ fn semantic_raise_is_unaffected_by_resource_kill_handling() {
     // A genuine `raise` inside the function is unambiguously semantic and must still surface
     // as outcome "raised" with the exception type in `raises`.
     let src = "def g():\n    raise ValueError('x')\n";
-    let rec = record_file(src, 3).expect("record");
+    let rec = record_file(src, 3, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let g = rec
         .functions
         .iter()
@@ -183,7 +182,7 @@ fn kwargs_param_does_not_produce_spurious_type_error() {
         return;
     }
     let src = "def f(a, **kw):\n    return a\n";
-    let rec = record_file(src, 4).expect("record");
+    let rec = record_file(src, 4, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let f = rec
         .functions
         .iter()
@@ -209,7 +208,7 @@ fn keyword_only_param_is_passed_by_name_and_returns() {
     // argument"). It must now be generated and passed as a keyword argument instead, so at
     // least the type-compatible cases (e.g. `a` and `b` both strings/numbers) actually return.
     let src = "def f(a, *, b=5):\n    return a + b\n";
-    let rec = record_file(src, 4).expect("record");
+    let rec = record_file(src, 4, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let f = rec
         .functions
         .iter()
@@ -235,7 +234,7 @@ fn guarded_branch_is_reached_via_guard_sample() {
     // Without guard-directed sampling, an even spread over `x`'s generic candidates is unlikely
     // to land exactly on 42, so the guarded `"hit"` branch would rarely (if ever) be exercised.
     let src = "def f(x):\n    if x == 42:\n        return \"hit\"\n    return \"miss\"\n";
-    let rec = record_file(src, 8).expect("record");
+    let rec = record_file(src, 8, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let f = rec
         .functions
         .iter()
@@ -264,7 +263,7 @@ fn record_pyi_folds_observed_return_type_when_static_is_opaque() {
     // `int`, so `record --format pyi` should fold that observed type in with a `# observed`
     // marker — never claiming it as statically proven.
     let src = "def f():\n    return abs(-5)\n";
-    let rec = record_file(src, 4).expect("record");
+    let rec = record_file(src, 4, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let f = rec
         .functions
         .iter()
@@ -302,7 +301,7 @@ fn raised_case_carries_a_smaller_minimized_input() {
     // corpus is 13 candidates and ranks the `str` half first, so a small budget can crowd out
     // every non-trivial (shrinkable) list candidate before reaching one.
     let src = "def f(xs):\n    for _ in xs:\n        pass\n    return xs[10]\n";
-    let rec = record_file(src, 16).expect("record");
+    let rec = record_file(src, 16, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let f = rec
         .functions
         .iter()
@@ -354,7 +353,7 @@ fn non_finite_float_return_is_tagged_and_round_trips() {
     // `json.dumps` emits bare NaN/Infinity, which serde_json rejects; the worker must instead
     // tag them the same way it tags set/tuple/dict so the response is valid JSON.
     let nan_src = "def f():\n    return float('nan')\n";
-    let rec = record_file(nan_src, 1).expect("record");
+    let rec = record_file(nan_src, 1, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let f = rec.functions.iter().find(|r| r.signature.name == "f").expect("f record");
     assert!(!f.cases.is_empty(), "expected generated cases");
     for c in &f.cases {
@@ -363,7 +362,7 @@ fn non_finite_float_return_is_tagged_and_round_trips() {
     }
 
     let inf_src = "def f():\n    return float('inf')\n";
-    let rec = record_file(inf_src, 1).expect("record");
+    let rec = record_file(inf_src, 1, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let f = rec.functions.iter().find(|r| r.signature.name == "f").expect("f record");
     assert!(!f.cases.is_empty(), "expected generated cases");
     for c in &f.cases {
@@ -380,7 +379,7 @@ fn unreachable_branch_is_reported_as_missed_coverage() {
     // The unconditional `return 1` makes every line after it dead code — no input can ever
     // reach it, so it must show up as `missed`, never silently folded into `executed`.
     let src = "def f(x):\n    return 1\n    y = x + 1\n    return y\n";
-    let rec = record_file(src, 4).expect("record");
+    let rec = record_file(src, 4, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let f = rec
         .functions
         .iter()
@@ -401,7 +400,7 @@ fn fully_exercised_function_reports_full_coverage() {
     // A single-statement body that always runs, regardless of input, must report executed ==
     // total — nothing to miss.
     let src = "def f(x):\n    return x + 1\n";
-    let rec = record_file(src, 4).expect("record");
+    let rec = record_file(src, 4, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let f = rec
         .functions
         .iter()
@@ -421,7 +420,7 @@ fn keyword_only_mutation_is_detected() {
     // `acc` is keyword-only and mutated in place; the worker must snapshot kwargs before/after
     // the same way it does positional args, or this mutation is invisible.
     let src = "def f(*, acc):\n    acc.append(1)\n    return None\n";
-    let rec = record_file(src, 4).expect("record");
+    let rec = record_file(src, 4, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let f = rec
         .functions
         .iter()
@@ -443,7 +442,7 @@ fn sys_exit_is_reported_as_raised_not_a_resource_kill() {
     // wouldn't catch — a genuine `raise` inside the function's own behavior, so it must surface
     // as outcome "raised" (not crash the child / surface as a harness `error`).
     let src = "import sys\ndef f():\n    sys.exit(1)\n";
-    let rec = record_file(src, 3).expect("record");
+    let rec = record_file(src, 3, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let f = rec
         .functions
         .iter()
@@ -476,7 +475,7 @@ fn stderr_write_is_captured() {
         return;
     }
     let src = "import sys\ndef f():\n    print('boom', file=sys.stderr)\n    return None\n";
-    let rec = record_file(src, 4).expect("record");
+    let rec = record_file(src, 4, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let f = rec
         .functions
         .iter()
@@ -504,7 +503,7 @@ fn io_observability_flags_stdout_and_stderr_observable_but_not_filesystem() {
         "    open('/nonexistent', 'r')\n",
         "    return None\n"
     );
-    let rec = record_file(src, 2).expect("record");
+    let rec = record_file(src, 2, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let f = rec
         .functions
         .iter()
@@ -538,7 +537,7 @@ fn output_type_coverage_is_full_when_every_return_kind_and_line_is_reached() {
     }
     // A single unconditional return: one return kind, one return line, both always reached.
     let src = "def f(x):\n    return 1\n";
-    let rec = record_file(src, 4).expect("record");
+    let rec = record_file(src, 4, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let f = rec
         .functions
         .iter()
@@ -569,8 +568,13 @@ fn output_type_coverage_is_partial_when_a_return_branch_is_never_reached() {
         "    return 1\n"
     );
     let domain = ValueDomain::parse(r#"{"scalars": ["int"]}"#).expect("parse profile");
-    let rec = record_file_with_options(src, 6, &pylens::record::ReplayMap::new(), Some(&domain), false)
-        .expect("record");
+    let rec = record_file(
+        src,
+        6,
+        &ReplayMap::new(),
+        RecordFlags { domain: Some(&domain), ..RecordFlags::default() },
+    )
+    .expect("record");
     let f = rec
         .functions
         .iter()
@@ -696,14 +700,14 @@ fn replay_unmatched_function_name_is_an_error() {
     let mut replay = ReplayMap::new();
     replay.insert("does_not_exist".to_string(), vec![vec![json!(1)]]);
 
-    let result = record_with_signatures_replay(
+    let result = record_with_signatures(
         &PanicSandbox,
         src,
         imports,
         sigs,
         4,
         &replay,
-        RecordFlags { domain: None, cover_branches: false, stability_runs: None, time_budget: None },
+        RecordFlags::default(),
     );
     let err = result.err().expect("an unmatched replay function name must be an error");
     assert!(err.contains("does_not_exist"), "unexpected message: {err}");
@@ -718,7 +722,7 @@ fn replay_input_executes_and_is_tagged_source_replay() {
     let mut replay = ReplayMap::new();
     replay.insert("add".to_string(), vec![vec![json!(3), json!(4)]]);
 
-    let rec = record_file_with_replay(src, 4, &replay).expect("record");
+    let rec = record_file(src, 4, &replay, RecordFlags::default()).expect("record");
     let add = rec
         .functions
         .iter()
@@ -753,7 +757,13 @@ fn value_domain_restricts_generated_cases_but_not_replay() {
     let mut replay = ReplayMap::new();
     replay.insert("f".to_string(), vec![vec![json!("not an int")]]);
 
-    let rec = record_file_with_options(src, 8, &replay, Some(&domain), false).expect("record");
+    let rec = record_file(
+        src,
+        8,
+        &replay,
+        RecordFlags { domain: Some(&domain), ..RecordFlags::default() },
+    )
+    .expect("record");
     let f = rec.functions.iter().find(|r| r.signature.name == "f").expect("f record");
 
     let generated: Vec<_> = f.cases.iter().filter(|c| c.source == CaseSource::Generated).collect();
@@ -794,14 +804,11 @@ fn tight_time_budget_trips_and_keeps_already_recorded_cases() {
     if !ready("tight_time_budget_trips_and_keeps_already_recorded_cases") {
         return;
     }
-    let rec = record_file_with_options_and_stability_and_budget(
+    let rec = record_file(
         SLOW_SRC,
         20,
         &ReplayMap::new(),
-        None,
-        false,
-        None,
-        Some(Duration::from_secs_f64(0.05)),
+        RecordFlags { time_budget: Some(Duration::from_secs_f64(0.05)), ..RecordFlags::default() },
     )
     .expect("record");
     let f = rec.functions.iter().find(|r| r.signature.name == "slow").expect("slow record");
@@ -821,7 +828,7 @@ fn plain_record_has_no_time_budget_hit_field() {
     if !ready("plain_record_has_no_time_budget_hit_field") {
         return;
     }
-    let rec = record_file_with_options(SLOW_SRC, 1, &ReplayMap::new(), None, false).expect("record");
+    let rec = record_file(SLOW_SRC, 1, &ReplayMap::new(), RecordFlags::default()).expect("record");
     let f = rec.functions.iter().find(|r| r.signature.name == "slow").expect("slow record");
     assert!(f.time_budget_hit.is_none(), "time_budget_hit must be omitted when --time-budget wasn't set");
 
@@ -841,14 +848,11 @@ fn time_budget_never_drops_replay_cases() {
     let mut replay = ReplayMap::new();
     replay.insert("slow".to_string(), vec![vec![json!(7)]]);
 
-    let rec = record_file_with_options_and_stability_and_budget(
+    let rec = record_file(
         SLOW_SRC,
         20,
         &replay,
-        None,
-        false,
-        None,
-        Some(Duration::from_secs_f64(0.05)),
+        RecordFlags { time_budget: Some(Duration::from_secs_f64(0.05)), ..RecordFlags::default() },
     )
     .expect("record");
     let f = rec.functions.iter().find(|r| r.signature.name == "slow").expect("slow record");
