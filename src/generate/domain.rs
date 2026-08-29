@@ -25,6 +25,7 @@ enum Kind {
     Str,
     None,
     List,
+    Tuple,
 }
 
 impl Kind {
@@ -36,8 +37,9 @@ impl Kind {
             "str" => Ok(Kind::Str),
             "none" => Ok(Kind::None),
             "list" => Ok(Kind::List),
+            "tuple" => Ok(Kind::Tuple),
             other => Err(format!(
-                "value-domain profile: unknown kind {other:?} (expected one of int, float, bool, str, none, list)"
+                "value-domain profile: unknown kind {other:?} (expected one of int, float, bool, str, none, list, tuple)"
             )),
         }
     }
@@ -50,6 +52,7 @@ impl Kind {
             Kind::Str => json!("x"),
             Kind::None => Value::Null,
             Kind::List => json!([]),
+            Kind::Tuple => json!({"__t__": "tuple", "items": [1, "x"]}),
         }
     }
 }
@@ -61,9 +64,11 @@ const FIELDS: [&str; 5] =
     ["scalars", "list_elements", "max_list_len", "max_str_len", "max_list_depth"];
 
 /// A parsed `--value-domain` profile. Every field is optional; an absent field leaves that
-/// dimension unrestricted (see the module doc). Dicts, sets, tuples and bytes have no kind
-/// string at all — they are unnameable in `scalars`/`list_elements` and so are always rejected
-/// once a domain exists, per the spec's "excluded whenever a domain is given and not listed".
+/// dimension unrestricted (see the module doc). Dicts, sets and bytes have no kind string at
+/// all — they are unnameable in `scalars`/`list_elements` and so are always rejected once a
+/// domain exists, per the spec's "excluded whenever a domain is given and not listed". Tuples are
+/// nameable via `"tuple"`; a tagged tuple is allowed only when named at its nesting position and
+/// each of its items is allowed there too (same depth/length caps as a list).
 #[derive(Debug, Clone, Default)]
 pub struct ValueDomain {
     scalars: Option<HashSet<Kind>>,
@@ -125,6 +130,28 @@ impl ValueDomain {
             }
             return items.iter().all(|item| self.allows_at(item, this_depth));
         }
+        if let Value::Object(map) = value
+            && map.get("__t__").and_then(Value::as_str) == Some("tuple")
+        {
+            let Some(items) = map.get("items").and_then(Value::as_array) else {
+                return false;
+            };
+            let this_depth = list_depth + 1;
+            if let Some(max_depth) = self.max_list_depth
+                && this_depth > max_depth
+            {
+                return false;
+            }
+            if !self.kind_allowed(Kind::Tuple, list_depth) {
+                return false;
+            }
+            if let Some(max_len) = self.max_list_len
+                && items.len() > max_len
+            {
+                return false;
+            }
+            return items.iter().all(|item| self.allows_at(item, this_depth));
+        }
         if let Value::String(s) = value
             && let Some(max) = self.max_str_len
             && s.chars().count() > max
@@ -133,7 +160,7 @@ impl ValueDomain {
         }
         match scalar_kind_of(value) {
             Some(kind) => self.kind_allowed(kind, list_depth),
-            // A dict, set, tuple, or other tagged encoding (`__t__` values other than "float") —
+            // A dict, set, or other tagged encoding (`__t__` values other than "float"/"tuple") —
             // unnameable in a profile, so always rejected once a domain is active.
             None => false,
         }
@@ -164,6 +191,9 @@ impl ValueDomain {
         }
         if self.kind_allowed(Kind::List, 0) {
             out.push(Value::Array(Vec::new()));
+        }
+        if self.kind_allowed(Kind::Tuple, 0) {
+            out.push(Kind::Tuple.literal());
         }
         out.into_iter()
             .enumerate()

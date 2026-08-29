@@ -371,6 +371,54 @@ fn value_domain_enforces_max_list_len_and_max_str_len_and_max_list_depth() {
 }
 
 #[test]
+fn value_domain_allows_a_tagged_tuple_when_named() {
+    let domain = ValueDomain::parse(r#"{"scalars": ["tuple", "str", "int"]}"#).expect("parse");
+    assert!(domain.allows(&json!({"__t__": "tuple", "items": ["withdraw", 5]})));
+}
+
+#[test]
+fn value_domain_rejects_a_tagged_tuple_when_not_named() {
+    let domain = ValueDomain::parse(r#"{"scalars": ["str", "int"]}"#).expect("parse");
+    assert!(
+        !domain.allows(&json!({"__t__": "tuple", "items": ["withdraw", 5]})),
+        "tuple not named in scalars, so it must be rejected"
+    );
+}
+
+#[test]
+fn value_domain_checks_tuple_items_against_list_elements() {
+    let domain = ValueDomain::parse(
+        r#"{"scalars": ["tuple"], "list_elements": ["str", "int"], "max_list_len": 2}"#,
+    )
+    .expect("parse");
+    assert!(domain.allows(&json!({"__t__": "tuple", "items": ["withdraw", 5]})));
+    assert!(
+        !domain.allows(&json!({"__t__": "tuple", "items": [1.5, 5]})),
+        "float item not in list_elements"
+    );
+    assert!(
+        !domain.allows(&json!({"__t__": "tuple", "items": ["a", "b", "c"]})),
+        "exceeds max_list_len"
+    );
+}
+
+#[test]
+fn value_domain_enforces_max_list_depth_on_nested_tuples() {
+    let domain = ValueDomain::parse(
+        r#"{"scalars": ["tuple"], "list_elements": ["tuple", "int"], "max_list_depth": 1}"#,
+    )
+    .expect("parse");
+    assert!(domain.allows(&json!({"__t__": "tuple", "items": [1, 2]})));
+    assert!(
+        !domain.allows(&json!({
+            "__t__": "tuple",
+            "items": [{"__t__": "tuple", "items": [1]}]
+        })),
+        "nested tuple exceeds max_list_depth"
+    );
+}
+
+#[test]
 fn gen_inputs_under_a_restrictive_domain_produces_only_in_domain_values() {
     // `Shape::Any` (no evidence for `x`) spreads across ints, a float, a string, a list, a
     // dict and a set (see `seeds::candidates`'s `Shape::Any` arm) — exactly the corpora a
