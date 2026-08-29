@@ -140,3 +140,102 @@ fn attribute_truthiness_is_still_unhandled() {
     let preds = predicates_at(src, "f", &["x"], 2);
     assert!(preds.is_empty(), "attribute predicates are explicitly out of scope: {preds:?}");
 }
+
+#[test]
+fn plain_loop_element_synthesizes_a_one_element_list() {
+    let src = "def f(commands):\n    for direction in commands:\n        if direction == \"N\":\n            pass\n";
+    let preds = predicates_at(src, "f", &["commands"], 3);
+    assert_eq!(preds.len(), 1);
+    match &preds[0] {
+        Predicate::Compare { param, deriv, .. } => {
+            assert_eq!(param, "commands");
+            assert_eq!(*deriv, predicate::Derivation::Element { field: None, arity: 1 });
+        }
+        other => panic!("expected a Compare over the loop element, got {other:?}"),
+    }
+    let shape = Shape::any_seq();
+    let satisfy = predicate::synthesize(&preds[0], true, &shape).expect("satisfying value");
+    let violate = predicate::synthesize(&preds[0], false, &shape).expect("violating value");
+    let satisfy_items = satisfy.as_array().expect("array");
+    let violate_items = violate.as_array().expect("array");
+    assert_eq!(satisfy_items.len(), 1, "must be non-empty so the for body executes: {satisfy_items:?}");
+    assert_eq!(satisfy_items[0], "N");
+    assert_eq!(violate_items.len(), 1, "must be non-empty so the for body executes: {violate_items:?}");
+    assert_ne!(violate_items[0], "N");
+}
+
+#[test]
+fn tuple_unpacked_for_target_synthesizes_a_matching_tagged_tuple() {
+    let src = "def f(pairs):\n    for action, amount in pairs:\n        if action == \"withdraw\":\n            pass\n";
+    let preds = predicates_at(src, "f", &["pairs"], 3);
+    assert_eq!(preds.len(), 1);
+    match &preds[0] {
+        Predicate::Compare { param, deriv, .. } => {
+            assert_eq!(param, "pairs");
+            assert_eq!(*deriv, predicate::Derivation::Element { field: Some(0), arity: 2 });
+        }
+        other => panic!("expected a Compare over field 0 of the tuple element, got {other:?}"),
+    }
+    let shape = Shape::any_seq();
+    let satisfy = predicate::synthesize(&preds[0], true, &shape).expect("satisfying value");
+    let violate = predicate::synthesize(&preds[0], false, &shape).expect("violating value");
+    let satisfy_items = satisfy.as_array().expect("array");
+    assert_eq!(satisfy_items.len(), 1);
+    let tuple = satisfy_items[0].as_object().expect("tagged tuple");
+    assert_eq!(tuple["__t__"], "tuple");
+    let fields = tuple["items"].as_array().expect("items");
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0], "withdraw");
+
+    let violate_items = violate.as_array().expect("array");
+    assert_eq!(violate_items.len(), 1, "must be non-empty so the for body executes: {violate_items:?}");
+    let violate_tuple = violate_items[0].as_object().expect("tagged tuple");
+    let violate_fields = violate_tuple["items"].as_array().expect("items");
+    assert_ne!(violate_fields[0], "withdraw");
+}
+
+#[test]
+fn assign_unpack_of_a_whole_loop_element_binds_each_field() {
+    let src = "def f(transactions):\n    for transaction in transactions:\n        action, amount = transaction\n        if action == \"withdraw\":\n            pass\n";
+    let preds = predicates_at(src, "f", &["transactions"], 4);
+    assert_eq!(preds.len(), 1);
+    match &preds[0] {
+        Predicate::Compare { param, deriv, .. } => {
+            assert_eq!(param, "transactions");
+            assert_eq!(*deriv, predicate::Derivation::Element { field: Some(0), arity: 2 });
+        }
+        other => panic!("expected a Compare over field 0 of the unpacked element, got {other:?}"),
+    }
+    let shape = Shape::any_seq();
+    let satisfy = predicate::synthesize(&preds[0], true, &shape).expect("satisfying value");
+    let items = satisfy.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let tuple = items[0].as_object().expect("tagged tuple");
+    assert_eq!(tuple["items"].as_array().expect("items")[0], "withdraw");
+}
+
+#[test]
+fn loop_element_vs_another_parameter_stays_unhandled() {
+    let src = "def f(pairs, other):\n    for a, b in pairs:\n        if a == other:\n            pass\n";
+    let preds = predicates_at(src, "f", &["pairs", "other"], 3);
+    assert_eq!(preds.len(), 1);
+    let Predicate::ParamCompare { deriv_a, op, deriv_b, .. } = &preds[0] else {
+        panic!("expected a ParamCompare, got {:?}", preds[0]);
+    };
+    let pair = predicate::synthesize_pair(deriv_a, *op, deriv_b, &Shape::any_seq(), &Shape::Str, true);
+    assert!(pair.is_none(), "pairing a loop element is pinned unhandled, got {pair:?}");
+}
+
+#[test]
+fn post_loop_reference_to_the_target_name_is_not_an_element() {
+    let src = "def f(xs):\n    for x in xs:\n        pass\n    if x == \"N\":\n        pass\n";
+    let preds = predicates_at(src, "f", &["xs"], 4);
+    assert!(preds.is_empty(), "the loop target must not resolve past the loop body: {preds:?}");
+}
+
+#[test]
+fn rebind_with_an_unrecognized_rhs_clears_the_prior_alias() {
+    let src = "def f(s):\n    n = len(s)\n    n = hash(s)\n    if n > 3:\n        pass\n";
+    let preds = predicates_at(src, "f", &["s"], 4);
+    assert!(preds.is_empty(), "the rebind to hash(s) must clear the stale `n = len(s)` alias: {preds:?}");
+}

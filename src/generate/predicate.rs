@@ -12,9 +12,18 @@
 //! literal container `C`, or `v in p` for a literal `v`), or — the one piece of cross-variable
 //! reasoning this module does — through a local variable this function's own body assigns
 //! directly from one of the forms above (`n = len(s)`) and then tests, or a comparison between
-//! two parameters (`a < b`). Two-variable coordination and attribute-based forms (`x.attr`,
-//! `hasattr`) stay out of scope — see [`Predicate::ParamCompare`] and the module's absence of any
-//! attribute-truthiness form.
+//! two parameters (`a < b`). A `for` loop's target, when the iterated expression resolves
+//! directly to a parameter, is bound the same way: a plain target names an element
+//! ([`Derivation::Element`], `field: None`), a flat tuple-of-names target names each field, and a
+//! tuple unpack of a still-whole loop element one statement later (`for t in p: a, b = t`) gets
+//! the same field-wise binding. Both bindings are scoped strictly to the loop body — see `walk`'s
+//! `For` arm. Two-variable coordination and attribute-based forms (`x.attr`, `hasattr`) stay out
+//! of scope — see [`Predicate::ParamCompare`] and the module's absence of any attribute-truthiness
+//! form. [`Predicate::ParamCompare`] between two [`Derivation::Element`]s is likewise unhandled
+//! (see [`synthesize_pair`]'s guard) — an element paired with an element or a non-parameter local
+//! (`balance >= amount` in the ATM-style example) stays `no_synthesizer`. So do elements of a
+//! locally *derived* container (`parts = ip.split('.')`, then `for part in parts:`) — the iterable
+//! must resolve to a parameter directly, not through a derivation.
 
 use std::collections::HashMap;
 
@@ -38,6 +47,12 @@ pub enum Derivation {
     Index(i64),
     /// `p % k`, `k` a literal integer modulus.
     Mod(i64),
+    /// A loop-bound element of the parameter (`for x in p:`, or a tuple unpack of that whole
+    /// element, `for t in p: a, b = t` / `for a, b in p:`). `field` is `None` for a plain,
+    /// un-unpacked loop target and `Some(i)` for field `i` of an `arity`-wide tuple unpack;
+    /// `arity` is 1 for a plain target. Synthesis builds a one-element list around the field's
+    /// value (see [`element_value`]) — never the empty list, so the `for` body actually runs.
+    Element { field: Option<usize>, arity: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,13 +220,7 @@ fn walk(
     for stmt in body {
         match stmt {
             ast::Stmt::FunctionDef(_) | ast::Stmt::ClassDef(_) => {}
-            ast::Stmt::Assign(assign) => {
-                if let [ast::Expr::Name(target)] = assign.targets.as_slice()
-                    && let Some(deriv) = extract_deriv(&assign.value, params, aliases)
-                {
-                    aliases.insert(target.id.to_string(), deriv);
-                }
-            }
+            ast::Stmt::Assign(assign) => bind_assign(assign, params, aliases),
             ast::Stmt::If(if_stmt) => {
                 insert_test(out, line_at(if_stmt.range().start(), li), &if_stmt.test, params, aliases);
                 walk(&if_stmt.body, li, params, aliases, out);
@@ -229,11 +238,17 @@ fn walk(
             }
             ast::Stmt::For(f) => {
                 let line = line_at(f.range().start(), li);
-                if let Some((param, Derivation::Direct)) = extract_deriv(&f.iter, params, aliases) {
-                    out.insert(line, LinePredicates::ForIter(Predicate::ForIter { param }));
+                let iter_deriv = extract_deriv(&f.iter, params, aliases);
+                if let Some((param, Derivation::Direct)) = &iter_deriv {
+                    out.insert(line, LinePredicates::ForIter(Predicate::ForIter { param: param.clone() }));
+                }
+                let pre_loop = aliases.clone();
+                if let Some((param, Derivation::Direct)) = iter_deriv {
+                    bind_for_target(&f.target, &param, aliases);
                 }
                 walk(&f.body, li, params, aliases, out);
                 walk(&f.orelse, li, params, aliases, out);
+                *aliases = pre_loop;
             }
             ast::Stmt::With(w) => walk(&w.body, li, params, aliases, out),
             ast::Stmt::Try(t) => {
@@ -252,6 +267,75 @@ fn walk(
             }
             _ => {}
         }
+    }
+}
+
+/// Bind a `for` loop's target name(s) as [`Derivation::Element`]s of `param` — a plain `Name`
+/// target names the whole element (`field: None`), a flat tuple-of-`Name`s target names each
+/// field. Any other target shape (a starred target, a nested tuple, a subscript/attribute target)
+/// is left unbound. The caller (`walk`'s `For` arm) restores `aliases` to its pre-loop snapshot
+/// once the body has been walked, so these bindings never leak past the loop.
+fn bind_for_target(target: &ast::Expr, param: &str, aliases: &mut Aliases) {
+    match target {
+        ast::Expr::Name(n) => {
+            aliases.insert(n.id.to_string(), (param.to_string(), Derivation::Element { field: None, arity: 1 }));
+        }
+        ast::Expr::Tuple(t) if !t.elts.is_empty() && t.elts.iter().all(|e| matches!(e, ast::Expr::Name(_))) => {
+            let arity = t.elts.len();
+            for (i, elt) in t.elts.iter().enumerate() {
+                let ast::Expr::Name(n) = elt else { unreachable!("checked all Name above") };
+                aliases.insert(n.id.to_string(), (param.to_string(), Derivation::Element { field: Some(i), arity }));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Bind (or clear) aliases for one `Assign` statement, walking two shapes: a single-`Name` target
+/// (the existing `n = len(s)`-style direct derivation, now also clearing a stale alias when the
+/// RHS isn't a recognized derivation — a rebind must not leave a prior binding dangling), and a
+/// flat tuple-of-`Name`s target whose RHS is itself a whole, not-yet-unpacked loop element
+/// (`Derivation::Element { field: None, arity: 1 }`) — the `for t in p: a, b = t` shape — which
+/// fans out into one [`Derivation::Element`] per field. Any other target/RHS shape clears every
+/// name in the target rather than leaving a possibly-stale alias in place.
+fn bind_assign(assign: &ast::StmtAssign, params: &[String], aliases: &mut Aliases) {
+    match assign.targets.as_slice() {
+        [ast::Expr::Name(target)] => match extract_deriv(&assign.value, params, aliases) {
+            Some(deriv) => {
+                aliases.insert(target.id.to_string(), deriv);
+            }
+            None => {
+                aliases.remove(target.id.as_str());
+            }
+        },
+        [ast::Expr::Tuple(t)] if !t.elts.is_empty() && t.elts.iter().all(|e| matches!(e, ast::Expr::Name(_))) => {
+            let names: Vec<&str> = t
+                .elts
+                .iter()
+                .map(|e| {
+                    let ast::Expr::Name(n) = e else { unreachable!("checked all Name above") };
+                    n.id.as_str()
+                })
+                .collect();
+            let rhs = match assign.value.as_ref() {
+                ast::Expr::Name(n) => aliases.get(n.id.as_str()).cloned(),
+                _ => None,
+            };
+            match rhs {
+                Some((param, Derivation::Element { field: None, arity: 1 })) => {
+                    let arity = names.len();
+                    for (i, name) in names.iter().enumerate() {
+                        aliases.insert(name.to_string(), (param.clone(), Derivation::Element { field: Some(i), arity }));
+                    }
+                }
+                _ => {
+                    for name in names {
+                        aliases.remove(name);
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -602,6 +686,31 @@ fn index_value(idx: i64, op: CmpOp, literal: &Literal, want: bool) -> Option<Val
     Some(Value::Array(arr))
 }
 
+/// A one-element list value for a [`Derivation::Element`]: `arity <= 1` (a plain, un-unpacked
+/// loop target) wraps the field's own value directly; `arity > 1` wraps a tagged tuple with
+/// `field`'s slot set to the field value and every other slot filled with a neutral `0`. Always
+/// non-empty by construction — an empty list would falsify a membership-style claim, but it would
+/// also skip the loop body entirely, so it can never stand in for the `want == false` outcome the
+/// caller (`synthesize`, via `record::cover`) is targeting the branch *line* with.
+fn element_value(field: Option<usize>, arity: usize, op: CmpOp, literal: &Literal, want: bool) -> Option<Value> {
+    let elem = match literal {
+        Literal::Int(c) => json!(synth_int(op, *c, want)),
+        Literal::Str(s) => str_eq_ne(op, s, want)?,
+    };
+    let item = if arity <= 1 {
+        elem
+    } else {
+        let field = field?;
+        if field >= arity {
+            return None;
+        }
+        let mut fields = vec![json!(0); arity];
+        fields[field] = elem;
+        json!({ "__t__": "tuple", "items": fields })
+    };
+    Some(Value::Array(vec![item]))
+}
+
 fn mod_value(k: i64, op: CmpOp, r: i64, want: bool) -> Option<Value> {
     if k == 0 {
         return None;
@@ -742,6 +851,7 @@ fn compare_value(deriv: &Derivation, op: CmpOp, literal: &Literal, shape: &Shape
             let Literal::Int(r) = literal else { return None };
             mod_value(*k, op, *r, want)
         }
+        Derivation::Element { field, arity } => element_value(*field, *arity, op, literal, want),
     }
 }
 
@@ -764,7 +874,7 @@ fn value_for_target(deriv: &Derivation, shape: &Shape, target: i64) -> Option<Va
             arr[idx] = json!(target);
             Some(Value::Array(arr))
         }
-        Derivation::Mod(_) => None,
+        Derivation::Mod(_) | Derivation::Element { .. } => None,
     }
 }
 
@@ -772,7 +882,9 @@ fn value_for_target(deriv: &Derivation, shape: &Shape, target: i64) -> Option<Va
 /// that `a <op> b` evaluates to `want`: `b` is pinned to an arbitrary reference integer, and `a`
 /// is synthesized against that reference the same way [`compare_value`] synthesizes against any
 /// other integer literal. `None` when either derivation is [`Derivation::Mod`] (no reference value
-/// composes cleanly through a modulus on both sides) or either shape can't realize its side.
+/// composes cleanly through a modulus on both sides), either is [`Derivation::Element`] (pairing
+/// two loop elements, or an element with another parameter, isn't handled — see the module doc),
+/// or either shape can't realize its side.
 pub fn synthesize_pair(
     deriv_a: &Derivation,
     op: CmpOp,
@@ -781,7 +893,9 @@ pub fn synthesize_pair(
     shape_b: &Shape,
     want: bool,
 ) -> Option<(Value, Value)> {
-    if matches!(deriv_a, Derivation::Mod(_)) || matches!(deriv_b, Derivation::Mod(_)) {
+    if matches!(deriv_a, Derivation::Mod(_) | Derivation::Element { .. })
+        || matches!(deriv_b, Derivation::Mod(_) | Derivation::Element { .. })
+    {
         return None;
     }
     const REFERENCE: i64 = 5;
