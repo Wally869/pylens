@@ -234,6 +234,91 @@ fn post_loop_reference_to_the_target_name_is_not_an_element() {
 }
 
 #[test]
+fn split_len_compare_synthesizes_a_joined_string_with_the_right_part_count() {
+    let src = "def f(ip):\n    parts = ip.split('.')\n    if len(parts) != 4:\n        pass\n";
+    let preds = predicates_at(src, "f", &["ip"], 3);
+    assert_eq!(preds.len(), 1);
+    match &preds[0] {
+        Predicate::Compare { param, deriv, .. } => {
+            assert_eq!(param, "ip");
+            assert_eq!(*deriv, predicate::Derivation::SplitLen(Some(".".to_string())));
+        }
+        other => panic!("expected a Compare over len(parts), got {other:?}"),
+    }
+    let satisfy = predicate::synthesize(&preds[0], true, &Shape::Str).expect("satisfying value");
+    let violate = predicate::synthesize(&preds[0], false, &Shape::Str).expect("violating value");
+    let satisfy_count = satisfy.as_str().expect("str").split('.').count();
+    let violate_count = violate.as_str().expect("str").split('.').count();
+    assert_ne!(satisfy_count, 4, "true outcome means len(parts) != 4");
+    assert_eq!(violate_count, 4, "false outcome means len(parts) == 4");
+}
+
+#[test]
+fn for_iter_over_a_split_local_synthesizes_a_joined_string() {
+    let src = "def f(ip):\n    parts = ip.split('.')\n    for part in parts:\n        pass\n";
+    let preds = predicates_at(src, "f", &["ip"], 3);
+    assert_eq!(preds.len(), 1);
+    let Predicate::ForIter { param, deriv } = &preds[0] else {
+        panic!("expected a ForIter, got {:?}", preds[0]);
+    };
+    assert_eq!(param, "ip");
+    assert_eq!(*deriv, predicate::Derivation::Split(Some(".".to_string())));
+    let satisfy = predicate::synthesize(&preds[0], true, &Shape::Str).expect("satisfying (nonempty) value");
+    assert!(satisfy.as_str().expect("str").split('.').count() >= 1);
+    let violate = predicate::synthesize(&preds[0], false, &Shape::Str);
+    assert!(violate.is_none(), "an explicit separator's split() never yields zero parts");
+}
+
+#[test]
+fn strmethod_on_a_split_element_synthesizes_a_single_joined_part() {
+    let src = "def f(ip):\n    parts = ip.split('.')\n    for part in parts:\n        if part.isdigit():\n            pass\n";
+    let preds = predicates_at(src, "f", &["ip"], 4);
+    assert_eq!(preds.len(), 1);
+    let Predicate::StrMethod { param, deriv, .. } = &preds[0] else {
+        panic!("expected a StrMethod, got {:?}", preds[0]);
+    };
+    assert_eq!(param, "ip");
+    assert_eq!(*deriv, predicate::Derivation::SplitElement(Some(".".to_string())));
+    let satisfy = predicate::synthesize(&preds[0], true, &Shape::Str).expect("satisfying value");
+    let violate = predicate::synthesize(&preds[0], false, &Shape::Str).expect("violating value");
+    let satisfy_parts: Vec<&str> = satisfy.as_str().expect("str").split('.').collect();
+    let violate_parts: Vec<&str> = violate.as_str().expect("str").split('.').collect();
+    assert_eq!(satisfy_parts.len(), 1, "must split back into one part carrying the digit string");
+    assert!(satisfy_parts[0].chars().all(|c| c.is_ascii_digit()));
+    assert_eq!(violate_parts.len(), 1, "must split back into one part carrying the non-digit string");
+    assert!(!violate_parts[0].chars().all(|c| c.is_ascii_digit()));
+}
+
+#[test]
+fn split_element_len_compare_synthesizes_a_single_part_of_the_right_length() {
+    let src = "def f(ip):\n    parts = ip.split('.')\n    for part in parts:\n        if len(part) > 1:\n            pass\n";
+    let preds = predicates_at(src, "f", &["ip"], 4);
+    assert_eq!(preds.len(), 1);
+    match &preds[0] {
+        Predicate::Compare { param, deriv, .. } => {
+            assert_eq!(param, "ip");
+            assert_eq!(*deriv, predicate::Derivation::SplitElementLen(Some(".".to_string())));
+        }
+        other => panic!("expected a Compare over len(part), got {other:?}"),
+    }
+    let satisfy = predicate::synthesize(&preds[0], true, &Shape::Str).expect("satisfying value");
+    let violate = predicate::synthesize(&preds[0], false, &Shape::Str).expect("violating value");
+    let satisfy_parts: Vec<&str> = satisfy.as_str().expect("str").split('.').collect();
+    let violate_parts: Vec<&str> = violate.as_str().expect("str").split('.').collect();
+    assert_eq!(satisfy_parts.len(), 1);
+    assert!(satisfy_parts[0].len() > 1, "true outcome means len(part) > 1");
+    assert_eq!(violate_parts.len(), 1);
+    assert!(violate_parts[0].len() <= 1, "false outcome means len(part) <= 1");
+}
+
+#[test]
+fn indexing_a_split_element_stays_unhandled() {
+    let src = "def f(ip):\n    parts = ip.split('.')\n    for part in parts:\n        if part[0] == '0':\n            pass\n";
+    let preds = predicates_at(src, "f", &["ip"], 4);
+    assert!(preds.is_empty(), "part[0] is a third-level derivation (param -> split -> element -> index), out of scope: {preds:?}");
+}
+
+#[test]
 fn rebind_with_an_unrecognized_rhs_clears_the_prior_alias() {
     let src = "def f(s):\n    n = len(s)\n    n = hash(s)\n    if n > 3:\n        pass\n";
     let preds = predicates_at(src, "f", &["s"], 4);

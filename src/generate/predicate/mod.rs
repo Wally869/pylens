@@ -22,6 +22,16 @@ pub enum Derivation {
     /// `arity` is 1 for a plain target. Synthesis builds a one-element list around the field's
     /// value (see [`element_value`]) — never the empty list, so the `for` body actually runs.
     Element { field: Option<usize>, arity: usize },
+    /// `p.split(sep)` (`sep` a string literal) or `p.split()` (`None`, whitespace) — the whole
+    /// result list, bound to a local by `parts = p.split(sep)`.
+    Split(Option<String>),
+    /// `len(parts)` where `parts` is [`Derivation::Split`]-bound — the part count.
+    SplitLen(Option<String>),
+    /// A loop element of a [`Derivation::Split`]-bound local (`for part in parts:`) — the
+    /// two-level `param -> split -> element` chain; nesting stops here.
+    SplitElement(Option<String>),
+    /// `len(part)` where `part` is [`Derivation::SplitElement`]-bound.
+    SplitElementLen(Option<String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,10 +80,13 @@ pub enum Predicate {
     /// `v in p` / `v not in p` — `p` is the container (a parameter), `v` a literal tested for
     /// membership.
     ContainerMembership { param: String, negated: bool, literal: Literal },
-    /// A [`StrMethod`] call on a parameter, e.g. `p.startswith("x")`, `p.isdigit()`.
-    StrMethod { param: String, method: StrMethod, arg: Option<String> },
-    /// `for p2 in p:` — iterating a parameter.
-    ForIter { param: String },
+    /// A [`StrMethod`] call on a parameter, or on a name derived from it — `deriv` is
+    /// [`Derivation::Direct`] for `p.startswith("x")`, [`Derivation::Element`]/
+    /// [`Derivation::SplitElement`] for a method called on a loop element (`part.isdigit()`).
+    StrMethod { param: String, deriv: Derivation, method: StrMethod, arg: Option<String> },
+    /// `for p2 in p:` — iterating a parameter directly ([`Derivation::Direct`]) or a
+    /// [`Derivation::Split`]-bound local (`for part in parts:`).
+    ForIter { param: String, deriv: Derivation },
     /// `not <inner>` — negates the inner predicate's outcome polarity at synthesis time.
     Not(Box<Predicate>),
     /// `a <op> b`, both operands resolving to a parameter (or a derivation of one) — a
@@ -134,7 +147,7 @@ impl Predicate {
             | Predicate::Membership { param, .. }
             | Predicate::ContainerMembership { param, .. }
             | Predicate::StrMethod { param, .. }
-            | Predicate::ForIter { param } => param,
+            | Predicate::ForIter { param, .. } => param,
             Predicate::Not(inner) => inner.param(),
             Predicate::ParamCompare { param_a, .. } => param_a,
         }

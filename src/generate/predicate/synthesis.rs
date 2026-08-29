@@ -19,6 +19,66 @@ fn str_eq_ne(op: CmpOp, s: &str, want: bool) -> Option<Value> {
     }
 }
 
+/// A string that `.split(sep)` (or `.split()` when `sep` is `None`) yields exactly `count` parts
+/// for -- `count` placeholder parts joined by `sep` (or by a single space for whitespace-split).
+/// `count == 0` is only realizable for whitespace split (an empty/blank string); an explicit
+/// separator's `.split(sep)` always yields at least one part.
+fn split_join_value(sep: &Option<String>, count: i64) -> Option<Value> {
+    if count < 0 {
+        return None;
+    }
+    let n = count as usize;
+    match sep {
+        Some(s) => {
+            if s.is_empty() || n == 0 {
+                return None;
+            }
+            Some(json!(vec!["a"; n].join(s.as_str())))
+        }
+        None => {
+            if n == 0 {
+                return Some(json!("   "));
+            }
+            Some(json!(vec!["a"; n].join(" ")))
+        }
+    }
+}
+
+/// Wrap a synthesized string method value (the receiver's own value) around the underlying
+/// parameter, per `deriv`: `Direct` returns it as-is, `Element` matches [`element_value`]'s
+/// one-element-list convention, `SplitElement` returns the value itself as the whole parameter
+/// string (so splitting it back out yields exactly this one part) -- `None` if the value would
+/// contain the separator, which would produce more than one part.
+fn wrap_receiver_value(deriv: &Derivation, elem: Value) -> Option<Value> {
+    match deriv {
+        Derivation::Direct => Some(elem),
+        Derivation::Element { field, arity } => {
+            let item = if *arity <= 1 {
+                elem
+            } else {
+                let field = (*field)?;
+                if field >= *arity {
+                    return None;
+                }
+                let mut fields = vec![json!(0); *arity];
+                fields[field] = elem;
+                json!({ "__t__": "tuple", "items": fields })
+            };
+            Some(Value::Array(vec![item]))
+        }
+        Derivation::SplitElement(sep) => {
+            let s = elem.as_str()?;
+            if let Some(sep) = sep
+                && s.contains(sep.as_str())
+            {
+                return None;
+            }
+            Some(elem)
+        }
+        _ => None,
+    }
+}
+
 fn str_method_value(method: StrMethod, arg: Option<&str>, want: bool) -> Option<Value> {
     match method {
         StrMethod::StartsWith => {
@@ -66,6 +126,24 @@ fn compare_value(deriv: &Derivation, op: CmpOp, literal: &Literal, shape: &Shape
             mod_value(*k, op, *r, want)
         }
         Derivation::Element { field, arity } => element_value(*field, *arity, op, literal, want),
+        // A comparison directly against the split list, or a bare split element, isn't a
+        // recognized extracted form (extraction only reaches `Compare` through `len()`, which
+        // yields `SplitLen`/`SplitElementLen`) -- only `Truthy`/`ForIter` target `Split`, and only
+        // `StrMethod` targets `SplitElement`, at the top level.
+        Derivation::Split(_) | Derivation::SplitElement(_) => None,
+        Derivation::SplitLen(sep) => {
+            let Literal::Int(c) = literal else { return None };
+            split_join_value(sep, synth_int(op, *c, want))
+        }
+        Derivation::SplitElementLen(sep) => {
+            let Literal::Int(c) = literal else { return None };
+            let n = synth_int(op, *c, want).max(0) as usize;
+            let filler = "x".repeat(n);
+            match sep {
+                Some(s) if !s.is_empty() && filler.contains(s.as_str()) => None,
+                _ => Some(json!(filler)),
+            }
+        }
     }
 }
 
@@ -288,7 +366,12 @@ fn value_for_target(deriv: &Derivation, shape: &Shape, target: i64) -> Option<Va
             arr[idx] = json!(target);
             Some(Value::Array(arr))
         }
-        Derivation::Mod(_) | Derivation::Element { .. } => None,
+        Derivation::Mod(_)
+        | Derivation::Element { .. }
+        | Derivation::Split(_)
+        | Derivation::SplitLen(_)
+        | Derivation::SplitElement(_)
+        | Derivation::SplitElementLen(_) => None,
     }
 }
 
@@ -307,9 +390,18 @@ pub fn synthesize_pair(
     shape_b: &Shape,
     want: bool,
 ) -> Option<(Value, Value)> {
-    if matches!(deriv_a, Derivation::Mod(_) | Derivation::Element { .. })
-        || matches!(deriv_b, Derivation::Mod(_) | Derivation::Element { .. })
-    {
+    let unsupported = |d: &Derivation| {
+        matches!(
+            d,
+            Derivation::Mod(_)
+                | Derivation::Element { .. }
+                | Derivation::Split(_)
+                | Derivation::SplitLen(_)
+                | Derivation::SplitElement(_)
+                | Derivation::SplitElementLen(_)
+        )
+    };
+    if unsupported(deriv_a) || unsupported(deriv_b) {
         return None;
     }
     const REFERENCE: i64 = 5;
@@ -328,12 +420,18 @@ pub fn synthesize(pred: &Predicate, want: bool, shape: &Shape) -> Option<Value> 
     match pred {
         Predicate::Not(inner) => synthesize(inner, !want, shape),
         Predicate::Truthy { .. } => Some(truthy_value(shape, want)),
-        Predicate::ForIter { .. } => Some(container_value(shape, want)),
+        Predicate::ForIter { deriv, .. } => match deriv {
+            Derivation::Split(sep) => split_join_value(sep, if want { 1 } else { 0 }),
+            _ => Some(container_value(shape, want)),
+        },
         Predicate::Membership { negated, items, .. } => membership_value(items, *negated, want),
         Predicate::ContainerMembership { negated, literal, .. } => {
             container_membership_value(literal, *negated, want, shape)
         }
-        Predicate::StrMethod { method, arg, .. } => str_method_value(*method, arg.as_deref(), want),
+        Predicate::StrMethod { deriv, method, arg, .. } => {
+            let elem = str_method_value(*method, arg.as_deref(), want)?;
+            wrap_receiver_value(deriv, elem)
+        }
         Predicate::Compare { deriv, op, literal, .. } => compare_value(deriv, *op, literal, shape, want),
         Predicate::ParamCompare { .. } => None,
     }

@@ -25,6 +25,49 @@ pub(super) fn resolve_param(name: &str, params: &[String], aliases: &Aliases) ->
     }
 }
 
+/// A string-method receiver's derivation: the parameter itself, a plain loop element, or a
+/// [`Derivation::SplitElement`] — the forms [`element_value`]/`wrap_receiver_value` can wrap a
+/// synthesized string value around.
+pub(super) fn resolve_strmethod_receiver(
+    name: &str,
+    params: &[String],
+    aliases: &Aliases,
+) -> Option<(String, Derivation)> {
+    if params.iter().any(|p| p == name) {
+        return Some((name.to_string(), Derivation::Direct));
+    }
+    match aliases.get(name) {
+        Some((param, deriv @ (Derivation::Direct | Derivation::Element { .. } | Derivation::SplitElement(_)))) => {
+            Some((param.clone(), deriv.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// `p.split(sep)` / `p.split()` where `p` resolves directly to a parameter — the receiver of a
+/// [`Derivation::Split`] binding.
+pub(super) fn extract_split(
+    expr: &ast::Expr,
+    params: &[String],
+    aliases: &Aliases,
+) -> Option<(String, Option<String>)> {
+    let ast::Expr::Call(call) = expr else { return None };
+    let ast::Expr::Attribute(attr) = call.func.as_ref() else { return None };
+    if attr.attr.as_str() != "split" {
+        return None;
+    }
+    let ast::Expr::Name(recv) = attr.value.as_ref() else { return None };
+    let param = resolve_param(recv.id.as_str(), params, aliases)?;
+    if !call.arguments.keywords.is_empty() {
+        return None;
+    }
+    match &*call.arguments.args {
+        [] => Some((param, None)),
+        [ast::Expr::StringLiteral(s)] => Some((param, Some(s.value.to_str().to_string()))),
+        _ => None,
+    }
+}
+
 /// Find name's (optionally owner's method) body in a parsed module.
 pub fn find_function_body<'a>(
     module: &'a ast::ModModule,
@@ -89,12 +132,17 @@ pub(super) fn walk(
             ast::Stmt::For(f) => {
                 let line = line_at(f.range().start(), li);
                 let iter_deriv = extract_deriv(&f.iter, params, aliases);
-                if let Some((param, Derivation::Direct)) = &iter_deriv {
-                    out.insert(line, LinePredicates::ForIter(Predicate::ForIter { param: param.clone() }));
+                if let Some((param, deriv @ (Derivation::Direct | Derivation::Split(_)))) = &iter_deriv {
+                    out.insert(
+                        line,
+                        LinePredicates::ForIter(Predicate::ForIter { param: param.clone(), deriv: deriv.clone() }),
+                    );
                 }
                 let pre_loop = aliases.clone();
-                if let Some((param, Derivation::Direct)) = iter_deriv {
-                    bind_for_target(&f.target, &param, aliases);
+                match iter_deriv {
+                    Some((param, Derivation::Direct)) => bind_for_target(&f.target, &param, aliases),
+                    Some((param, Derivation::Split(sep))) => bind_for_target_split(&f.target, &param, &sep, aliases),
+                    _ => {}
                 }
                 walk(&f.body, li, params, aliases, out);
                 walk(&f.orelse, li, params, aliases, out);
@@ -137,17 +185,31 @@ pub(super) fn bind_for_target(target: &ast::Expr, param: &str, aliases: &mut Ali
     }
 }
 
+/// Bind a for loop's target name as Derivation::SplitElement of param — the `part` in
+/// `for part in parts:` where `parts` is a [`Derivation::Split`]-bound local. Tuple unpacking of
+/// a string element isn't a recognized form, so only a plain `Name` target binds.
+pub(super) fn bind_for_target_split(target: &ast::Expr, param: &str, sep: &Option<String>, aliases: &mut Aliases) {
+    if let ast::Expr::Name(n) = target {
+        aliases.insert(n.id.to_string(), (param.to_string(), Derivation::SplitElement(sep.clone())));
+    }
+}
+
 /// Bind (or clear) aliases for one Assign statement.
 pub(super) fn bind_assign(assign: &ast::StmtAssign, params: &[String], aliases: &mut Aliases) {
     match assign.targets.as_slice() {
-        [ast::Expr::Name(target)] => match extract_deriv(&assign.value, params, aliases) {
-            Some(deriv) => {
-                aliases.insert(target.id.to_string(), deriv);
+        [ast::Expr::Name(target)] => {
+            let deriv = extract_split(&assign.value, params, aliases)
+                .map(|(param, sep)| (param, Derivation::Split(sep)))
+                .or_else(|| extract_deriv(&assign.value, params, aliases));
+            match deriv {
+                Some(deriv) => {
+                    aliases.insert(target.id.to_string(), deriv);
+                }
+                None => {
+                    aliases.remove(target.id.as_str());
+                }
             }
-            None => {
-                aliases.remove(target.id.as_str());
-            }
-        },
+        }
         [ast::Expr::Tuple(t)] if !t.elts.is_empty() && t.elts.iter().all(|e| matches!(e, ast::Expr::Name(_))) => {
             let names: Vec<&str> = t
                 .elts
@@ -215,12 +277,13 @@ pub(super) fn extract(expr: &ast::Expr, params: &[String], aliases: &Aliases) ->
     }
 }
 
-/// p.method(...) where method is one of StrMethod's recognized forms and p resolves to
-/// a parameter directly (through resolve_param) -- no subscript/attribute-chained receiver.
+/// p.method(...) where method is one of StrMethod's recognized forms and p resolves to a
+/// parameter, a plain loop element of one, or a split-of-parameter loop element (through
+/// resolve_strmethod_receiver) -- no subscript/attribute-chained receiver.
 pub(super) fn extract_call(call: &ast::ExprCall, params: &[String], aliases: &Aliases) -> Option<Predicate> {
     let ast::Expr::Attribute(attr) = call.func.as_ref() else { return None };
     let ast::Expr::Name(recv) = attr.value.as_ref() else { return None };
-    let param = resolve_param(recv.id.as_str(), params, aliases)?;
+    let (param, deriv) = resolve_strmethod_receiver(recv.id.as_str(), params, aliases)?;
     let method = StrMethod::parse(attr.attr.as_str())?;
     if !call.arguments.keywords.is_empty() {
         return None;
@@ -230,12 +293,12 @@ pub(super) fn extract_call(call: &ast::ExprCall, params: &[String], aliases: &Al
             return None;
         }
         let ast::Expr::StringLiteral(s) = &call.arguments.args[0] else { return None };
-        Some(Predicate::StrMethod { param, method, arg: Some(s.value.to_str().to_string()) })
+        Some(Predicate::StrMethod { param, deriv, method, arg: Some(s.value.to_str().to_string()) })
     } else {
         if !call.arguments.args.is_empty() {
             return None;
         }
-        Some(Predicate::StrMethod { param, method, arg: None })
+        Some(Predicate::StrMethod { param, deriv, method, arg: None })
     }
 }
 
@@ -254,8 +317,17 @@ pub(super) fn extract_deriv(expr: &ast::Expr, params: &[String], aliases: &Alias
                 return None;
             }
             let ast::Expr::Name(argn) = &call.arguments.args[0] else { return None };
-            let param = resolve_param(argn.id.as_str(), params, aliases)?;
-            Some((param, Derivation::Len))
+            if params.iter().any(|p| p == argn.id.as_str()) {
+                return Some((argn.id.to_string(), Derivation::Len));
+            }
+            match aliases.get(argn.id.as_str()) {
+                Some((param, Derivation::Direct)) => Some((param.clone(), Derivation::Len)),
+                Some((param, Derivation::Split(sep))) => Some((param.clone(), Derivation::SplitLen(sep.clone()))),
+                Some((param, Derivation::SplitElement(sep))) => {
+                    Some((param.clone(), Derivation::SplitElementLen(sep.clone())))
+                }
+                _ => None,
+            }
         }
         ast::Expr::Subscript(sub) => {
             let ast::Expr::Name(n) = sub.value.as_ref() else { return None };
