@@ -184,16 +184,32 @@ fn param_shape<'a>(sig: &'a EffectSignature, name: &str) -> Option<&'a Shape> {
     sig.params.iter().find(|p| p.name == name).map(|p| &p.shape)
 }
 
-/// Every `(parameter name, synthesized value)` pair the predicates at `line` produce for `want`,
-/// admissible under `domain` — a domain-excluded synthesized value is dropped here, counting as
-/// unsynthesizable for this outcome (see the module doc's `no_synthesizer` reason).
+/// One predicate's synthesized result: the set of `(parameter name, value)` overrides that must
+/// be applied *together* to one input for the predicate to evaluate to `want` — one entry for
+/// every predicate but [`Predicate::ParamCompare`], which needs both of its parameters' slots
+/// overridden at once.
+fn override_set(sig: &EffectSignature, pred: &Predicate, want: bool) -> Option<Vec<(String, Value)>> {
+    if let Predicate::ParamCompare { param_a, deriv_a, op, param_b, deriv_b } = pred {
+        let shape_a = param_shape(sig, param_a)?;
+        let shape_b = param_shape(sig, param_b)?;
+        let (value_a, value_b) = predicate::synthesize_pair(deriv_a, *op, deriv_b, shape_a, shape_b, want)?;
+        return Some(vec![(param_a.clone(), value_a), (param_b.clone(), value_b)]);
+    }
+    let shape = param_shape(sig, pred.param())?;
+    let value = predicate::synthesize(pred, want, shape)?;
+    Some(vec![(pred.param().to_string(), value)])
+}
+
+/// Every override set the predicates at `line` produce for `want`, admissible under `domain` — a
+/// set with any domain-excluded value is dropped whole, counting as unsynthesizable for this
+/// outcome (see the module doc's `no_synthesizer` reason).
 fn candidate_values(
     sig: &EffectSignature,
     predicates: &HashMap<u32, LinePredicates>,
     line: u32,
     want: bool,
     domain: Option<&ValueDomain>,
-) -> Vec<(String, Value)> {
+) -> Vec<Vec<(String, Value)>> {
     let preds: Vec<&Predicate> = match predicates.get(&line) {
         Some(LinePredicates::Test(ps)) => ps.iter().collect(),
         Some(LinePredicates::ForIter(p)) => vec![p],
@@ -201,36 +217,35 @@ fn candidate_values(
     };
     let mut out = Vec::new();
     for pred in preds {
-        let Some(shape) = param_shape(sig, pred.param()) else { continue };
-        let Some(value) = predicate::synthesize(pred, want, shape) else { continue };
+        let Some(set) = override_set(sig, pred, want) else { continue };
         if let Some(d) = domain
-            && !d.allows(&value)
+            && !set.iter().all(|(_, v)| d.allows(v))
         {
             continue;
         }
-        out.push((pred.param().to_string(), value));
+        out.push(set);
     }
     out
 }
 
-/// Clone `template` (the all-base [`GenInput`], see [`super::gen_inputs`]) with `param_name`'s
-/// slot overridden to `value`. `None` if `param_name` names neither a positional nor a
-/// keyword-only parameter of `sig` (shouldn't happen — `param_name` always comes from a
-/// [`Predicate`] extracted against `sig`'s own parameter names).
-fn build_targeted_input(sig: &EffectSignature, template: &GenInput, param_name: &str, value: Value) -> Option<GenInput> {
+/// Clone `template` (the all-base [`GenInput`], see [`super::gen_inputs`]) with every
+/// `(parameter name, value)` in `overrides` applied to its slot. `None` if any name in `overrides`
+/// names neither a positional nor a keyword-only parameter of `sig` (shouldn't happen — every
+/// name always comes from a [`Predicate`] extracted against `sig`'s own parameter names).
+fn build_targeted_input(sig: &EffectSignature, template: &GenInput, overrides: &[(String, Value)]) -> Option<GenInput> {
     let mut gi = template.clone();
-    if let Some(idx) = positional_params(sig).iter().position(|p| p.name == param_name) {
-        if idx < gi.positional.len() {
-            gi.positional[idx] = value;
-            return Some(gi);
+    let positional = positional_params(sig);
+    for (param_name, value) in overrides {
+        if let Some(idx) = positional.iter().position(|p| &p.name == param_name) {
+            if idx >= gi.positional.len() {
+                return None;
+            }
+            gi.positional[idx] = value.clone();
+            continue;
         }
-        return None;
+        gi.kwargs.iter_mut().find(|(n, _)| n == param_name)?.1 = value.clone();
     }
-    if let Some(slot) = gi.kwargs.iter_mut().find(|(n, _)| n == param_name) {
-        slot.1 = value;
-        return Some(gi);
-    }
-    None
+    Some(gi)
 }
 
 /// How to invoke the function under test — a free function call, or a method call against an
@@ -309,11 +324,11 @@ pub(super) fn run_loop(
         let mut executed_this_round = false;
         'outer: for (line, kind, outcome_name) in &uncovered {
             let Some(want) = outcome_polarity(*kind, outcome_name) else { continue };
-            for (param_name, value) in candidate_values(sig, &predicates, *line, want, opts.domain) {
+            for overrides in candidate_values(sig, &predicates, *line, want, opts.domain) {
                 if cases.len() >= opts.max_inputs || super::deadline_passed(opts.deadline) {
                     break 'outer;
                 }
-                let Some(gi) = build_targeted_input(sig, &template, &param_name, value) else { continue };
+                let Some(gi) = build_targeted_input(sig, &template, &overrides) else { continue };
                 let result = call(&gi.positional, &gi.kwargs)?;
                 let mut case = build_case(sig, &gi, ctor_args_for_case.clone(), &result, CaseSource::Generated);
                 if case.outcome == "raised" {

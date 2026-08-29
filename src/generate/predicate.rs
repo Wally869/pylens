@@ -1,14 +1,20 @@
 //! Predicate-targeted synthesis for `pylens record --cover-branches`: extracts the handled forms
-//! of a branch test expression (`if`/`elif`/`while`'s test, `for`'s iterated expression) over a
-//! single positional parameter, and produces satisfying/violating values for it. Feeds
-//! `record::cover`'s loop, which builds a full input vector around a synthesized value and
-//! executes it as an ordinary generated case — synthesis never bypasses the sandbox, so it can't
-//! break soundness; a wrong guess just wastes a slot of the case budget like any other candidate.
+//! of a branch test expression (`if`/`elif`/`while`'s test, `for`'s iterated expression), and
+//! produces satisfying/violating values for the parameter(s) it names. Feeds `record::cover`'s
+//! loop, which builds a full input vector around the synthesized value(s) and executes it as an
+//! ordinary generated case — synthesis never bypasses the sandbox, so it can't break soundness; a
+//! wrong guess just wastes a slot of the case budget like any other candidate.
 //!
-//! Extraction is over the raw AST, independent of the analyzer's alias tracking: a predicate is
-//! recognized only when it names a parameter directly (`p`, `len(p)`, `p[i]` with a literal
-//! index, `p % k` with a literal modulus) — no cross-variable reasoning, matching the scope the
-//! task spec draws.
+//! Extraction is over the raw AST, mostly independent of the analyzer's alias tracking. A
+//! predicate is recognized when it names a parameter directly (`p`, `not p`, `len(p)`, `p[i]`
+//! with a literal index, `p % k` with a literal modulus), through one of the string methods in
+//! [`StrMethod`] called on a parameter, through membership either direction (`p in C` for a
+//! literal container `C`, or `v in p` for a literal `v`), or — the one piece of cross-variable
+//! reasoning this module does — through a local variable this function's own body assigns
+//! directly from one of the forms above (`n = len(s)`) and then tests, or a comparison between
+//! two parameters (`a < b`). Two-variable coordination and attribute-based forms (`x.attr`,
+//! `hasattr`) stay out of scope — see [`Predicate::ParamCompare`] and the module's absence of any
+//! attribute-truthiness form.
 
 use std::collections::HashMap;
 
@@ -50,25 +56,83 @@ pub enum Literal {
     Str(String),
 }
 
-/// One handled predicate over a single named parameter, extracted from a branch test.
+/// A no-argument or single-string-literal-argument string method called on a parameter — the
+/// method forms this module recognizes as a branch predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrMethod {
+    StartsWith,
+    EndsWith,
+    IsDigit,
+    IsAlpha,
+    IsUpper,
+    IsLower,
+    IsSpace,
+    IsAlnum,
+}
+
+impl StrMethod {
+    fn parse(name: &str) -> Option<StrMethod> {
+        match name {
+            "startswith" => Some(StrMethod::StartsWith),
+            "endswith" => Some(StrMethod::EndsWith),
+            "isdigit" => Some(StrMethod::IsDigit),
+            "isalpha" => Some(StrMethod::IsAlpha),
+            "isupper" => Some(StrMethod::IsUpper),
+            "islower" => Some(StrMethod::IsLower),
+            "isspace" => Some(StrMethod::IsSpace),
+            "isalnum" => Some(StrMethod::IsAlnum),
+            _ => None,
+        }
+    }
+
+    /// Whether this method takes the one string-literal argument this module can extract
+    /// (`startswith`/`endswith`) rather than none (the `is*` predicates).
+    fn takes_str_arg(self) -> bool {
+        matches!(self, StrMethod::StartsWith | StrMethod::EndsWith)
+    }
+}
+
+/// One handled predicate, extracted from a branch test. Every variant but
+/// [`Predicate::ParamCompare`] names exactly one parameter (see [`Predicate::param`]);
+/// `ParamCompare` coordinates two, and is synthesized separately by
+/// [`synthesize_pair`] since satisfying it means overriding both parameters' slots together in
+/// one input, not choosing one value in isolation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Predicate {
     Compare { param: String, deriv: Derivation, op: CmpOp, literal: Literal },
-    /// A bare-name truthiness test (`if p:`).
+    /// A bare-name truthiness test (`if p:`), including a local assigned directly or via `len`
+    /// from a parameter.
     Truthy { param: String },
     /// `p in C` / `p not in C` against a literal container.
     Membership { param: String, negated: bool, items: Vec<Literal> },
+    /// `v in p` / `v not in p` — `p` is the container (a parameter), `v` a literal tested for
+    /// membership.
+    ContainerMembership { param: String, negated: bool, literal: Literal },
+    /// A [`StrMethod`] call on a parameter, e.g. `p.startswith("x")`, `p.isdigit()`.
+    StrMethod { param: String, method: StrMethod, arg: Option<String> },
     /// `for p2 in p:` — iterating a parameter.
     ForIter { param: String },
+    /// `not <inner>` — negates the inner predicate's outcome polarity at synthesis time.
+    Not(Box<Predicate>),
+    /// `a <op> b`, both operands resolving to a parameter (or a derivation of one) — a
+    /// coordinated pair, synthesized by [`synthesize_pair`], not [`synthesize`].
+    ParamCompare { param_a: String, deriv_a: Derivation, op: CmpOp, param_b: String, deriv_b: Derivation },
 }
 
 impl Predicate {
+    /// The predicate's one named parameter. For [`Predicate::ParamCompare`] — which names two —
+    /// this returns `param_a`; callers that need both must match the variant directly (see
+    /// `record::cover::override_set`).
     pub fn param(&self) -> &str {
         match self {
             Predicate::Compare { param, .. }
             | Predicate::Truthy { param }
             | Predicate::Membership { param, .. }
+            | Predicate::ContainerMembership { param, .. }
+            | Predicate::StrMethod { param, .. }
             | Predicate::ForIter { param } => param,
+            Predicate::Not(inner) => inner.param(),
+            Predicate::ParamCompare { param_a, .. } => param_a,
         }
     }
 }
@@ -106,16 +170,24 @@ pub fn find_function_body<'a>(
     }
 }
 
+/// Local-name → derivation aliases discovered so far in a sequential walk of a function body: a
+/// local assigned directly from one of the recognized derivations of a parameter (`n = len(s)`,
+/// `y = s`) resolves through this map exactly as if the parameter's own name had been written —
+/// see the module doc's "one piece of cross-variable reasoning".
+type Aliases = HashMap<String, (String, Derivation)>;
+
 /// Collect every handled predicate in `body`, keyed by the branch point's line — the same line
 /// `analyze::collect::branches::collect_branches` assigns its `BranchPoint`. `params` names the
-/// function's positional parameters; only a test naming one of them directly is handled.
+/// function's positional parameters; only a test naming one of them (directly, or through an
+/// [`Aliases`] entry discovered earlier in the same body) is handled.
 pub fn collect_predicates(
     body: &[ast::Stmt],
     line_index: &LineIndex,
     params: &[String],
 ) -> HashMap<u32, LinePredicates> {
     let mut out = HashMap::new();
-    walk(body, line_index, params, &mut out);
+    let mut aliases = Aliases::new();
+    walk(body, line_index, params, &mut aliases, &mut out);
     out
 }
 
@@ -123,51 +195,59 @@ fn line_at(offset: ruff_text_size::TextSize, li: &LineIndex) -> u32 {
     li.line_index(offset).get() as u32
 }
 
-fn walk(body: &[ast::Stmt], li: &LineIndex, params: &[String], out: &mut HashMap<u32, LinePredicates>) {
+fn walk(
+    body: &[ast::Stmt],
+    li: &LineIndex,
+    params: &[String],
+    aliases: &mut Aliases,
+    out: &mut HashMap<u32, LinePredicates>,
+) {
     for stmt in body {
         match stmt {
             ast::Stmt::FunctionDef(_) | ast::Stmt::ClassDef(_) => {}
+            ast::Stmt::Assign(assign) => {
+                if let [ast::Expr::Name(target)] = assign.targets.as_slice()
+                    && let Some(deriv) = extract_deriv(&assign.value, params, aliases)
+                {
+                    aliases.insert(target.id.to_string(), deriv);
+                }
+            }
             ast::Stmt::If(if_stmt) => {
-                insert_test(out, line_at(if_stmt.range().start(), li), &if_stmt.test, params);
-                walk(&if_stmt.body, li, params, out);
+                insert_test(out, line_at(if_stmt.range().start(), li), &if_stmt.test, params, aliases);
+                walk(&if_stmt.body, li, params, aliases, out);
                 for clause in &if_stmt.elif_else_clauses {
                     if let Some(test) = &clause.test {
-                        insert_test(out, line_at(clause.range().start(), li), test, params);
+                        insert_test(out, line_at(clause.range().start(), li), test, params, aliases);
                     }
-                    walk(&clause.body, li, params, out);
+                    walk(&clause.body, li, params, aliases, out);
                 }
             }
             ast::Stmt::While(w) => {
-                insert_test(out, line_at(w.range().start(), li), &w.test, params);
-                walk(&w.body, li, params, out);
-                walk(&w.orelse, li, params, out);
+                insert_test(out, line_at(w.range().start(), li), &w.test, params, aliases);
+                walk(&w.body, li, params, aliases, out);
+                walk(&w.orelse, li, params, aliases, out);
             }
             ast::Stmt::For(f) => {
                 let line = line_at(f.range().start(), li);
-                if let ast::Expr::Name(n) = f.iter.as_ref()
-                    && params.iter().any(|p| p == n.id.as_str())
-                {
-                    out.insert(
-                        line,
-                        LinePredicates::ForIter(Predicate::ForIter { param: n.id.to_string() }),
-                    );
+                if let Some((param, Derivation::Direct)) = extract_deriv(&f.iter, params, aliases) {
+                    out.insert(line, LinePredicates::ForIter(Predicate::ForIter { param }));
                 }
-                walk(&f.body, li, params, out);
-                walk(&f.orelse, li, params, out);
+                walk(&f.body, li, params, aliases, out);
+                walk(&f.orelse, li, params, aliases, out);
             }
-            ast::Stmt::With(w) => walk(&w.body, li, params, out),
+            ast::Stmt::With(w) => walk(&w.body, li, params, aliases, out),
             ast::Stmt::Try(t) => {
-                walk(&t.body, li, params, out);
+                walk(&t.body, li, params, aliases, out);
                 for handler in &t.handlers {
                     let ast::ExceptHandler::ExceptHandler(h) = handler;
-                    walk(&h.body, li, params, out);
+                    walk(&h.body, li, params, aliases, out);
                 }
-                walk(&t.orelse, li, params, out);
-                walk(&t.finalbody, li, params, out);
+                walk(&t.orelse, li, params, aliases, out);
+                walk(&t.finalbody, li, params, aliases, out);
             }
             ast::Stmt::Match(m) => {
                 for case in &m.cases {
-                    walk(&case.body, li, params, out);
+                    walk(&case.body, li, params, aliases, out);
                 }
             }
             _ => {}
@@ -175,8 +255,14 @@ fn walk(body: &[ast::Stmt], li: &LineIndex, params: &[String], out: &mut HashMap
     }
 }
 
-fn insert_test(out: &mut HashMap<u32, LinePredicates>, line: u32, test: &ast::Expr, params: &[String]) {
-    let preds = extract(test, params);
+fn insert_test(
+    out: &mut HashMap<u32, LinePredicates>,
+    line: u32,
+    test: &ast::Expr,
+    params: &[String],
+    aliases: &Aliases,
+) {
+    let preds = extract(test, params, aliases);
     if !preds.is_empty() {
         out.insert(line, LinePredicates::Test(preds));
     }
@@ -185,22 +271,57 @@ fn insert_test(out: &mut HashMap<u32, LinePredicates>, line: u32, test: &ast::Ex
 /// Decompose `expr` into every handled leaf predicate — `and`/`or` operands are treated
 /// independently (see the module doc): each one that fits a handled form contributes its own
 /// candidate, without trying to jointly satisfy the whole compound expression.
-fn extract(expr: &ast::Expr, params: &[String]) -> Vec<Predicate> {
+fn extract(expr: &ast::Expr, params: &[String], aliases: &Aliases) -> Vec<Predicate> {
     match expr {
-        ast::Expr::BoolOp(b) => b.values.iter().flat_map(|v| extract(v, params)).collect(),
-        ast::Expr::Compare(c) => extract_compare(c, params),
-        ast::Expr::Name(n) if params.iter().any(|p| p == n.id.as_str()) => {
-            vec![Predicate::Truthy { param: n.id.to_string() }]
-        }
-        _ => Vec::new(),
+        ast::Expr::BoolOp(b) => b.values.iter().flat_map(|v| extract(v, params, aliases)).collect(),
+        ast::Expr::UnaryOp(u) if matches!(u.op, ast::UnaryOp::Not) => extract(&u.operand, params, aliases)
+            .into_iter()
+            .map(|p| Predicate::Not(Box::new(p)))
+            .collect(),
+        ast::Expr::Compare(c) => extract_compare(c, params, aliases),
+        ast::Expr::Call(call) => match extract_call(call, params, aliases) {
+            Some(p) => vec![p],
+            None => match extract_deriv(expr, params, aliases) {
+                Some((param, Derivation::Direct | Derivation::Len)) => vec![Predicate::Truthy { param }],
+                _ => Vec::new(),
+            },
+        },
+        _ => match extract_deriv(expr, params, aliases) {
+            Some((param, Derivation::Direct | Derivation::Len)) => vec![Predicate::Truthy { param }],
+            _ => Vec::new(),
+        },
     }
 }
 
-fn extract_compare(c: &ast::ExprCompare, params: &[String]) -> Vec<Predicate> {
+/// `p.method(...)` where `method` is one of [`StrMethod`]'s recognized forms and `p` resolves to
+/// a parameter directly (through [`resolve_param`]) — no subscript/attribute-chained receiver.
+fn extract_call(call: &ast::ExprCall, params: &[String], aliases: &Aliases) -> Option<Predicate> {
+    let ast::Expr::Attribute(attr) = call.func.as_ref() else { return None };
+    let ast::Expr::Name(recv) = attr.value.as_ref() else { return None };
+    let param = resolve_param(recv.id.as_str(), params, aliases)?;
+    let method = StrMethod::parse(attr.attr.as_str())?;
+    if !call.arguments.keywords.is_empty() {
+        return None;
+    }
+    if method.takes_str_arg() {
+        if call.arguments.args.len() != 1 {
+            return None;
+        }
+        let ast::Expr::StringLiteral(s) = &call.arguments.args[0] else { return None };
+        Some(Predicate::StrMethod { param, method, arg: Some(s.value.to_str().to_string()) })
+    } else {
+        if !call.arguments.args.is_empty() {
+            return None;
+        }
+        Some(Predicate::StrMethod { param, method, arg: None })
+    }
+}
+
+fn extract_compare(c: &ast::ExprCompare, params: &[String], aliases: &Aliases) -> Vec<Predicate> {
     let mut out = Vec::new();
     let mut left: &ast::Expr = &c.left;
     for (op, right) in c.ops.iter().zip(c.comparators.iter()) {
-        if let Some(p) = single_compare(left, *op, right, params) {
+        if let Some(p) = single_compare(left, *op, right, params, aliases) {
             out.push(p);
         }
         left = right;
@@ -213,21 +334,44 @@ fn single_compare(
     op: ast::CmpOp,
     right: &ast::Expr,
     params: &[String],
+    aliases: &Aliases,
 ) -> Option<Predicate> {
     match op {
         ast::CmpOp::In | ast::CmpOp::NotIn => {
-            let (param, Derivation::Direct) = extract_deriv(left, params)? else { return None };
-            let items = literal_container(right)?;
-            Some(Predicate::Membership { param, negated: matches!(op, ast::CmpOp::NotIn), items })
+            let negated = matches!(op, ast::CmpOp::NotIn);
+            if let Some((param, Derivation::Direct)) = extract_deriv(left, params, aliases)
+                && let Some(items) = literal_container(right)
+            {
+                return Some(Predicate::Membership { param, negated, items });
+            }
+            if let Some((param, Derivation::Direct)) = extract_deriv(right, params, aliases)
+                && let Some(literal) = extract_literal(left)
+            {
+                return Some(Predicate::ContainerMembership { param, negated, literal });
+            }
+            None
         }
         ast::CmpOp::Is | ast::CmpOp::IsNot => None,
         _ => {
             let cmp_op = to_cmp_op(op)?;
-            if let Some((param, deriv)) = extract_deriv(left, params) {
-                let literal = extract_literal(right)?;
-                return Some(Predicate::Compare { param, deriv, op: cmp_op, literal });
+            if let Some((param, deriv)) = extract_deriv(left, params, aliases) {
+                if let Some(literal) = extract_literal(right) {
+                    return Some(Predicate::Compare { param, deriv, op: cmp_op, literal });
+                }
+                if let Some((param_b, deriv_b)) = extract_deriv(right, params, aliases)
+                    && param_b != param
+                {
+                    return Some(Predicate::ParamCompare {
+                        param_a: param,
+                        deriv_a: deriv,
+                        op: cmp_op,
+                        param_b,
+                        deriv_b,
+                    });
+                }
+                return None;
             }
-            if let Some((param, deriv)) = extract_deriv(right, params) {
+            if let Some((param, deriv)) = extract_deriv(right, params, aliases) {
                 let literal = extract_literal(left)?;
                 return Some(Predicate::Compare { param, deriv, op: flip(cmp_op), literal });
             }
@@ -259,11 +403,25 @@ fn flip(op: CmpOp) -> CmpOp {
     }
 }
 
-fn extract_deriv(expr: &ast::Expr, params: &[String]) -> Option<(String, Derivation)> {
+/// `name` resolved to a parameter: either `name` itself is one, or [`Aliases`] maps it directly
+/// (not through `len`/index/mod) to one — the receiver-resolution `extract_call`'s method
+/// predicates and `extract_deriv`'s `len(...)`/`p[i]`/`p % k` forms both use.
+fn resolve_param(name: &str, params: &[String], aliases: &Aliases) -> Option<String> {
+    if params.iter().any(|p| p == name) {
+        return Some(name.to_string());
+    }
+    match aliases.get(name) {
+        Some((param, Derivation::Direct)) => Some(param.clone()),
+        _ => None,
+    }
+}
+
+fn extract_deriv(expr: &ast::Expr, params: &[String], aliases: &Aliases) -> Option<(String, Derivation)> {
     match expr {
         ast::Expr::Name(n) if params.iter().any(|p| p == n.id.as_str()) => {
             Some((n.id.to_string(), Derivation::Direct))
         }
+        ast::Expr::Name(n) => aliases.get(n.id.as_str()).cloned(),
         ast::Expr::Call(call) => {
             let ast::Expr::Name(fname) = call.func.as_ref() else { return None };
             if fname.id.as_str() != "len" {
@@ -273,26 +431,20 @@ fn extract_deriv(expr: &ast::Expr, params: &[String]) -> Option<(String, Derivat
                 return None;
             }
             let ast::Expr::Name(argn) = &call.arguments.args[0] else { return None };
-            if !params.iter().any(|p| p == argn.id.as_str()) {
-                return None;
-            }
-            Some((argn.id.to_string(), Derivation::Len))
+            let param = resolve_param(argn.id.as_str(), params, aliases)?;
+            Some((param, Derivation::Len))
         }
         ast::Expr::Subscript(sub) => {
             let ast::Expr::Name(n) = sub.value.as_ref() else { return None };
-            if !params.iter().any(|p| p == n.id.as_str()) {
-                return None;
-            }
+            let param = resolve_param(n.id.as_str(), params, aliases)?;
             let idx = literal_int(&sub.slice)?;
-            Some((n.id.to_string(), Derivation::Index(idx)))
+            Some((param, Derivation::Index(idx)))
         }
         ast::Expr::BinOp(bin) if matches!(bin.op, ast::Operator::Mod) => {
             let ast::Expr::Name(n) = bin.left.as_ref() else { return None };
-            if !params.iter().any(|p| p == n.id.as_str()) {
-                return None;
-            }
+            let param = resolve_param(n.id.as_str(), params, aliases)?;
             let k = literal_int(&bin.right)?;
-            Some((n.id.to_string(), Derivation::Mod(k)))
+            Some((param, Derivation::Mod(k)))
         }
         _ => None,
     }
@@ -508,6 +660,73 @@ fn membership_value(items: &[Literal], negated: bool, want: bool) -> Option<Valu
     if want_in { Some(literal_to_value(&items[0])) } else { not_in_value(items) }
 }
 
+/// A sentinel value overwhelmingly unlikely to appear as a substring/element of an ordinarily
+/// generated container — used as the "definitely excludes `literal`" side of
+/// [`container_membership_value`], the same role `not_in_value`'s `z`-padding plays for
+/// [`Predicate::Membership`].
+const EXCLUSION_SENTINEL: &str = "\u{1}\u{2}\u{3}pylens_no_match\u{1}\u{2}\u{3}";
+
+/// A value for `v in p` / `v not in p`'s parameter `p` (the container) such that the whole
+/// expression evaluates to `want`. `None` when `literal` is a string and empty — `"" in s` is
+/// always `True` for any string `s`, so no string value can violate it, and no non-degenerate
+/// value can be constructed to prove `"" not in s`.
+fn container_membership_value(literal: &Literal, negated: bool, want: bool, shape: &Shape) -> Option<Value> {
+    let want_contains = if negated { !want } else { want };
+    match effective_shape(shape) {
+        Shape::Str => {
+            let Literal::Str(s) = literal else { return None };
+            if s.is_empty() {
+                return None;
+            }
+            if want_contains {
+                Some(json!(format!("pre_{s}_post")))
+            } else {
+                Some(json!(EXCLUSION_SENTINEL))
+            }
+        }
+        Shape::Set(_) => {
+            let elem = literal_to_value(literal);
+            let items = if want_contains { vec![elem] } else { Vec::new() };
+            Some(json!({ "__t__": "set", "items": items }))
+        }
+        _ => {
+            let elem = literal_to_value(literal);
+            if want_contains { Some(Value::Array(vec![elem])) } else { Some(Value::Array(Vec::new())) }
+        }
+    }
+}
+
+fn str_method_value(method: StrMethod, arg: Option<&str>, want: bool) -> Option<Value> {
+    match method {
+        StrMethod::StartsWith => {
+            let s = arg?;
+            if want {
+                Some(json!(format!("{s}_rest")))
+            } else if s.is_empty() {
+                None
+            } else {
+                Some(json!(EXCLUSION_SENTINEL))
+            }
+        }
+        StrMethod::EndsWith => {
+            let s = arg?;
+            if want {
+                Some(json!(format!("rest_{s}")))
+            } else if s.is_empty() {
+                None
+            } else {
+                Some(json!(EXCLUSION_SENTINEL))
+            }
+        }
+        StrMethod::IsDigit => Some(json!(if want { "42" } else { "not42" })),
+        StrMethod::IsAlpha => Some(json!(if want { "abc" } else { "abc123" })),
+        StrMethod::IsUpper => Some(json!(if want { "ABC" } else { "abc" })),
+        StrMethod::IsLower => Some(json!(if want { "abc" } else { "ABC" })),
+        StrMethod::IsSpace => Some(json!(if want { "   " } else { "abc" })),
+        StrMethod::IsAlnum => Some(json!(if want { "abc123" } else { "abc 123" })),
+    }
+}
+
 fn compare_value(deriv: &Derivation, op: CmpOp, literal: &Literal, shape: &Shape, want: bool) -> Option<Value> {
     match deriv {
         Derivation::Direct => match literal {
@@ -526,16 +745,70 @@ fn compare_value(deriv: &Derivation, op: CmpOp, literal: &Literal, shape: &Shape
     }
 }
 
-/// Synthesize a value for `pred`'s parameter such that `pred` evaluates to `want`. `shape` is the
-/// parameter's inferred shape (used to decide a container/string vs. scalar candidate). `None`
-/// when the predicate's op/derivation/literal combination isn't handled — see the module doc for
-/// the closed set of forms this recognizes.
+/// A concrete value for a derivation's underlying parameter such that the derived quantity
+/// (`p` itself, `len(p)`, or `p[i]`) equals `target` exactly — the building block
+/// [`synthesize_pair`] uses for the *other* side of a [`Predicate::ParamCompare`], whose own
+/// value is picked by `target`'s relation to the pairing's [`CmpOp`], not by equality. `None` for
+/// [`Derivation::Mod`] (no obvious single value realizes an exact target through a modulus) or a
+/// negative [`Derivation::Index`].
+fn value_for_target(deriv: &Derivation, shape: &Shape, target: i64) -> Option<Value> {
+    match deriv {
+        Derivation::Direct => Some(json!(target)),
+        Derivation::Len => Some(len_value(shape, target)),
+        Derivation::Index(i) => {
+            if *i < 0 {
+                return None;
+            }
+            let idx = *i as usize;
+            let mut arr = vec![json!(0); idx + 1];
+            arr[idx] = json!(target);
+            Some(Value::Array(arr))
+        }
+        Derivation::Mod(_) => None,
+    }
+}
+
+/// Synthesize a coordinated pair of values for [`Predicate::ParamCompare`]'s two parameters such
+/// that `a <op> b` evaluates to `want`: `b` is pinned to an arbitrary reference integer, and `a`
+/// is synthesized against that reference the same way [`compare_value`] synthesizes against any
+/// other integer literal. `None` when either derivation is [`Derivation::Mod`] (no reference value
+/// composes cleanly through a modulus on both sides) or either shape can't realize its side.
+pub fn synthesize_pair(
+    deriv_a: &Derivation,
+    op: CmpOp,
+    deriv_b: &Derivation,
+    shape_a: &Shape,
+    shape_b: &Shape,
+    want: bool,
+) -> Option<(Value, Value)> {
+    if matches!(deriv_a, Derivation::Mod(_)) || matches!(deriv_b, Derivation::Mod(_)) {
+        return None;
+    }
+    const REFERENCE: i64 = 5;
+    let value_b = value_for_target(deriv_b, shape_b, REFERENCE)?;
+    let value_a = compare_value(deriv_a, op, &Literal::Int(REFERENCE), shape_a, want)?;
+    Some((value_a, value_b))
+}
+
+/// Synthesize a value for `pred`'s parameter (see [`Predicate::param`]) such that `pred`
+/// evaluates to `want`. `shape` is that parameter's inferred shape (used to decide a
+/// container/string vs. scalar candidate). `None` when the predicate's form isn't handled — see
+/// the module doc for the closed set of forms this recognizes.
+///
+/// [`Predicate::ParamCompare`] always returns `None` here — synthesizing it means choosing values
+/// for *two* parameters together, which [`synthesize_pair`] does instead.
 pub fn synthesize(pred: &Predicate, want: bool, shape: &Shape) -> Option<Value> {
     match pred {
+        Predicate::Not(inner) => synthesize(inner, !want, shape),
         Predicate::Truthy { .. } => Some(truthy_value(shape, want)),
         Predicate::ForIter { .. } => Some(container_value(shape, want)),
         Predicate::Membership { negated, items, .. } => membership_value(items, *negated, want),
+        Predicate::ContainerMembership { negated, literal, .. } => {
+            container_membership_value(literal, *negated, want, shape)
+        }
+        Predicate::StrMethod { method, arg, .. } => str_method_value(*method, arg.as_deref(), want),
         Predicate::Compare { deriv, op, literal, .. } => compare_value(deriv, *op, literal, shape, want),
+        Predicate::ParamCompare { .. } => None,
     }
 }
 
@@ -557,10 +830,14 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    fn no_aliases() -> Aliases {
+        Aliases::new()
+    }
+
     #[test]
     fn eq_int_yields_the_literal_and_a_violator() {
         let test = test_expr_of("if p == 42:\n    pass\n");
-        let preds = extract(&test, &params(&["p"]));
+        let preds = extract(&test, &params(&["p"]), &no_aliases());
         assert_eq!(preds.len(), 1);
         let satisfy = synthesize(&preds[0], true, &Shape::Int).expect("satisfying value");
         let violate = synthesize(&preds[0], false, &Shape::Int).expect("violating value");
@@ -571,7 +848,7 @@ mod tests {
     #[test]
     fn len_gt_yields_a_long_and_a_short_list() {
         let test = test_expr_of("if len(p) > 3:\n    pass\n");
-        let preds = extract(&test, &params(&["p"]));
+        let preds = extract(&test, &params(&["p"]), &no_aliases());
         assert_eq!(preds.len(), 1);
         let shape = Shape::any_seq();
         let satisfy = synthesize(&preds[0], true, &shape).expect("satisfying value");
@@ -585,7 +862,7 @@ mod tests {
     #[test]
     fn mod_eq_yields_even_and_odd() {
         let test = test_expr_of("if p % 2 == 0:\n    pass\n");
-        let preds = extract(&test, &params(&["p"]));
+        let preds = extract(&test, &params(&["p"]), &no_aliases());
         assert_eq!(preds.len(), 1);
         let satisfy = synthesize(&preds[0], true, &Shape::Int).expect("satisfying value");
         let violate = synthesize(&preds[0], false, &Shape::Int).expect("violating value");
@@ -596,7 +873,7 @@ mod tests {
     #[test]
     fn bare_name_test_yields_truthiness() {
         let test = test_expr_of("if p:\n    pass\n");
-        let preds = extract(&test, &params(&["p"]));
+        let preds = extract(&test, &params(&["p"]), &no_aliases());
         assert_eq!(preds, vec![Predicate::Truthy { param: "p".to_string() }]);
         let truthy = synthesize(&preds[0], true, &Shape::Int).expect("truthy value");
         let falsy = synthesize(&preds[0], false, &Shape::Int).expect("falsy value");
@@ -607,7 +884,7 @@ mod tests {
     #[test]
     fn and_decomposes_into_its_operands() {
         let test = test_expr_of("if p == 1 and q == 2:\n    pass\n");
-        let preds = extract(&test, &params(&["p", "q"]));
+        let preds = extract(&test, &params(&["p", "q"]), &no_aliases());
         assert_eq!(preds.len(), 2);
         assert!(preds.iter().any(|p| p.param() == "p"));
         assert!(preds.iter().any(|p| p.param() == "q"));
@@ -616,7 +893,7 @@ mod tests {
     #[test]
     fn unhandled_predicate_yields_nothing() {
         let test = test_expr_of("if hash(p) == 0:\n    pass\n");
-        let preds = extract(&test, &params(&["p"]));
+        let preds = extract(&test, &params(&["p"]), &no_aliases());
         assert!(preds.is_empty(), "hash(p) is not a handled derivation");
     }
 }
