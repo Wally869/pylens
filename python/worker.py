@@ -164,39 +164,156 @@ def _nested_fine_codes(code):
             yield from _nested_fine_codes(const)
 
 
+def _line_candidates(codes, line, fallthrough_of):
+    """Every `_FINE_TEST_OPS` instruction compiled from `line`, across `codes`, in encounter
+    order — also fills `fallthrough_of` for every instruction along the way."""
+    out = []
+    for code in codes:
+        instrs = list(dis.get_instructions(code))
+        for i, instr in enumerate(instrs):
+            fallthrough_of[(id(code), instr.offset)] = instrs[i + 1].offset if i + 1 < len(instrs) else None
+        current_line = None
+        for instr in instrs:
+            if instr.starts_line is not None:
+                current_line = instr.starts_line
+            if current_line == line and instr.opname in _FINE_TEST_OPS:
+                out.append((code, instr))
+    return out
+
+
+def _resolve_landing_chain(codes, line, fallthrough_of):
+    """The landing-offset scheme (see `analyze::collect::branches`'s module doc): resolves every
+    `_FINE_TEST_OPS` instruction on `line` to a `(true, false)` landing-offset pair PROVEN by the
+    bytecode itself, or gives up entirely (returns `None`) if that proof fails — never a guess.
+    Returns `(entries, canonical)` — `entries` maps `(id(code), offset) -> per-instruction
+    resolution info` (consumed by [`_resolve_fine_probe`]); `canonical` is the `(true_offset,
+    false_offset)` pair (needed by callers that also want the associated test-position `BoolOp`'s
+    own short-circuit signal — same instructions, different outcome labels, no separate scan).
+
+    Does NOT try to split same-line `while`'s loop-rotation-duplicated test into "pre-loop" vs
+    "retest" instruction groups — a same-line `while`'s BODY shares the exact physical line as its
+    test, so there is no line-table boundary between them, and no reliable OPCODE-based signal
+    either: a store-free body (`while xs: xs.pop()`, `while x: print(x.next())`) compiles to
+    `LOAD_METHOD`/`CALL_METHOD`/`POP_TOP`, none of which differ in kind from a test operand's own
+    value computation. A prior version of this scheme tried exactly that grouping and, for
+    `while xs: xs.pop()`, silently INVERTED `enter`/`skip` (derived the canonical pair from the
+    wrong, polarity-flipped retest run) — the bug this scheme now avoids by construction, not just
+    by convention:
+
+    1. A retest's own loop-continuation jump is the ONLY instruction on the line that can ever
+       jump BACKWARD (`argval < offset`) — a pre-loop test's jump always targets code that comes
+       AFTER it (skip the body, or an intermediate operand still ahead). This is unconditionally
+       true of CPython's codegen, not a heuristic: nothing exists before the very first instruction
+       of a straight-line test for an EARLIER instruction to jump back into. So: at most one
+       backward-jumping instruction is trusted (more than one is an unrecognized shape — refuse);
+       when found, its OWN jump target IS the true-landing (jumping backward always means
+       "continue the loop" = enter), read directly off that one instruction — no run grouping, no
+       "which instructions precede the body" reasoning needed at all.
+    2. Every OTHER (forward-jumping) instruction on the line must target the SAME single offset —
+       that shared offset is the false-landing. This holds for BOTH the pre-loop test's forward
+       jump and a retest's own EARLIER, still-forward-jumping members (e.g. `while a and b:`'s
+       retest also forward-jumps if `a` alone is false at the retest) — grouping never mattered to
+       this per-instruction check.
+    3. With NO backward-jumping instruction at all (every ordinary same-line construct — ternary,
+       inline-if, comprehension-if, or a while whose test CPython didn't rotate), the true/false
+       landing pair is instead the ORIGINAL derivation: the LAST instruction (offset order)'s own
+       fallthrough is the true-landing, its jump target the false-landing.
+    4. Every instruction's own jump target must land on the canonical pair, whichever way it was
+       derived (step 1+2 or step 3) — this alone still rejects a nested ternary's duplicated
+       instructions, `(a and b) or (c and d)`'s intermediate jump into the right OR's own test, and
+       a chained comparison's `a < b < c` `POP_TOP`-cleanup shape (an intermediate offset, not
+       either landing) — none of those flatten regardless of which derivation path found the pair.
+    5. A given instruction's FALLTHROUGH (the non-jump case) is only ever trusted as evidence when
+       it ALSO lands on the canonical pair — never inferred from "is this the run's last
+       instruction" (there are no runs). A non-last operand's fallthrough naturally lands on
+       another instruction still evaluating the same test (an intermediate offset) and is
+       correctly never treated as meaningful.
+    """
+    candidates = _line_candidates(codes, line, fallthrough_of)
+    if not candidates:
+        return None
+
+    backward = [(code, instr) for code, instr in candidates if instr.argval < instr.offset]
+    forward = [(code, instr) for code, instr in candidates if instr.argval >= instr.offset]
+    if len(backward) > 1:
+        return None
+
+    if backward:
+        true_offset = backward[0][1].argval
+        if not forward:
+            return None
+        false_offset = forward[0][1].argval
+        if any(instr.argval != false_offset for _code, instr in forward):
+            return None
+    else:
+        last_code, last_instr = candidates[-1]
+        fallthrough = fallthrough_of.get((id(last_code), last_instr.offset))
+        if fallthrough is None:
+            return None
+        true_offset, false_offset = fallthrough, last_instr.argval
+    if true_offset == false_offset:
+        return None
+    canonical = (true_offset, false_offset)
+
+    entries = {}
+    for code, instr in candidates:
+        if instr.argval not in canonical:
+            return None
+        own_fallthrough = fallthrough_of.get((id(code), instr.offset))
+        fallthrough_meaningful = own_fallthrough in canonical
+        entries[(id(code), instr.offset)] = {
+            "line": line,
+            "jump_target": instr.argval,
+            "outcome_if_jump": "true" if instr.argval == true_offset else "false",
+            "fallthrough_meaningful": fallthrough_meaningful,
+            "outcome_if_fallthrough": ("true" if own_fallthrough == true_offset else "false")
+            if fallthrough_meaningful
+            else None,
+        }
+    return entries, canonical
+
+
 def _build_fine_plan(top_code, fine_targets):
-    """Resolve every requested same-line branch point (`{"line", "kind", "ordinal"}`, from
-    `model::branch::FineTarget`) to the bytecode probe that proves which outcome fires — see
+    """Resolve every requested same-line branch point (`{"line", "kind", "ordinal", "compound"}`,
+    from `model::branch::FineTarget`) to the bytecode probe that proves which outcome fires — see
     `OutcomeEvidence::FineGrained`. Returns `{(id(code), offset): entry}` where `entry` is what
     `_resolve_fine_probe` needs to classify the outcome once the *next* opcode executed in that
     frame is known.
 
-    `ternary` / `inline_if` / `comprehension_if`: CPython compiles the test to a single
-    `POP_JUMP_IF_FALSE`/`POP_JUMP_IF_TRUE` — landing on its jump target is the negative outcome,
-    falling through to the next instruction the positive one (or the reverse for `_IF_TRUE`).
+    `compound: false` — the original single-instruction shapes: `ternary`/`inline_if`/
+    `comprehension_if` compile the test to a single `POP_JUMP_IF_FALSE`/`POP_JUMP_IF_TRUE`
+    (landing on its jump target is the negative outcome, falling through the positive one, or the
+    reverse for `_IF_TRUE`); `bool_op` in VALUE position compiles to a *chain* of
+    `JUMP_IF_*_OR_POP` instructions sharing one target — any instruction jumping means
+    `short_circuit`, falling through the chain's LAST instruction means `full_evaluation`.
+    Multiple same-`compound: false` points of the same kind can share a physical line (rare — two
+    ternaries via a tuple literal); `ordinal` (assigned by AST left-to-right order in
+    `collect_branches`) then picks the `ordinal`-th matching instruction/chain in bytecode offset
+    order — the same order for ordinary code.
 
-    `bool_op` (the wire form of `BranchKind::BoolOp`): `and`/`or` compile to a *chain* of
-    `JUMP_IF_*_OR_POP` instructions that all share one target offset (the end of the whole boolop
-    expression) — one per operand but the last.
-    Any instruction in the chain jumping means `short_circuit`; falling through the chain's LAST
-    instruction (reaching the final operand) means `full_evaluation`.
+    `compound: true` — the landing-offset scheme (see [`_resolve_landing_chain`] and
+    `analyze::collect::branches`'s module doc): `ternary`/`inline_if`/`comprehension_if`/`while`
+    resolved via the construct's own (true, false) landing pair; `bool_op` in TEST position gets
+    its `short_circuit`/`full_evaluation` from the SAME resolved chain. Only ever requested for a
+    line hosting exactly one test position, so there is at most one `compound: true` target per
+    `(line, kind)` — no ordinal disambiguation needed, and the landing-chain resolution (or its
+    failure) is computed once per line and shared between a Test-category target and its
+    associated `bool_op` target.
 
-    Multiple fine-grained points of the same kind can share one physical line (rare — e.g. two
-    ternaries on one line via a tuple literal); `ordinal` (assigned by AST left-to-right order in
-    `collect_branches`) picks the `ordinal`-th matching instruction/chain in bytecode offset
-    order, which is the same order for ordinary code. A target whose ordinal has no bytecode
-    counterpart (should not happen — every ordinal comes from an actual AST node) is silently
-    unresolved rather than guessed: its outcome then just never appears in `fine_hits`, and the
-    outcome stays whatever the aggregate evidence already says.
+    A target with no bytecode counterpart, or whose shape the worker's own dynamic verification
+    can't prove safe (see [`_resolve_landing_chain`]), is silently left unresolved rather than
+    guessed: its outcome then just never appears in `fine_hits`, and the outcome stays whatever the
+    aggregate evidence already says (`uncovered`, never falsely `covered`).
     """
     wanted = {}
     for t in fine_targets:
-        wanted.setdefault(t["line"], {}).setdefault(t["kind"], []).append(t["ordinal"])
+        wanted.setdefault(t["line"], {}).setdefault(t["kind"], []).append((t["ordinal"], t["compound"]))
 
+    codes = list(_nested_fine_codes(top_code))
     test_groups = {}
     chain_groups = {}
     fallthrough_of = {}
-    for code in _nested_fine_codes(top_code):
+    for code in codes:
         instrs = list(dis.get_instructions(code))
         current_line = None
         for i, instr in enumerate(instrs):
@@ -218,12 +335,20 @@ def _build_fine_plan(top_code, fine_targets):
                 ).append((code, instr))
 
     plan = {}
+    landing_cache = {}
     for line, by_kind in wanted.items():
-        single_ordinals = by_kind.get("ternary", []) + by_kind.get("inline_if", []) + by_kind.get(
-            "comprehension_if", []
+        single_targets = (
+            by_kind.get("ternary", [])
+            + by_kind.get("inline_if", [])
+            + by_kind.get("comprehension_if", [])
+            + by_kind.get("while", [])
         )
+        simple_ordinals = [ordinal for ordinal, compound in single_targets if not compound]
+        wants_compound_test = any(compound for _ordinal, compound in single_targets)
+        wants_compound_boolop = any(compound for _ordinal, compound in by_kind.get("bool_op", []))
+
         group = sorted(test_groups.get(line, []), key=lambda ci: ci[1].offset)
-        for ordinal in single_ordinals:
+        for ordinal in simple_ordinals:
             if ordinal >= len(group):
                 continue
             code, instr = group[ordinal]
@@ -236,11 +361,38 @@ def _build_fine_plan(top_code, fine_targets):
                 "jump_target": instr.argval,
                 "true_on_fallthrough": instr.opname == "POP_JUMP_IF_FALSE",
             }
+
+        if wants_compound_test or wants_compound_boolop:
+            if line not in landing_cache:
+                landing_cache[line] = _resolve_landing_chain(codes, line, fallthrough_of)
+            resolved = landing_cache[line]
+            if resolved is not None:
+                entries, _canonical = resolved
+                # `_resolve_landing_chain` labels generically ("true"/"false" — the true-landing
+                # is always the construct's ENTER/true side); `while`'s own outcome names are
+                # "enter"/"skip", not "true"/"false", so its request must remap the label here —
+                # everything else (ternary/inline_if/comprehension_if) already agrees.
+                while_compound = any(compound for _ordinal, compound in by_kind.get("while", []))
+                relabel = {"true": "enter", "false": "skip"} if while_compound else {}
+                for (code_id, offset), entry in entries.items():
+                    remapped = dict(entry)
+                    remapped["outcome_if_jump"] = relabel.get(entry["outcome_if_jump"], entry["outcome_if_jump"])
+                    if entry["outcome_if_fallthrough"] is not None:
+                        remapped["outcome_if_fallthrough"] = relabel.get(
+                            entry["outcome_if_fallthrough"], entry["outcome_if_fallthrough"]
+                        )
+                    remapped["ordinal"] = 0
+                    plan[(code_id, offset)] = remapped
+                    if wants_compound_boolop:
+                        plan[(code_id, offset)]["boolop_ordinal"] = 0
+
         chains = sorted(
             chain_groups.get(line, {}).values(),
             key=lambda members: min(ci[1].offset for ci in members),
         )
-        for ordinal in by_kind.get("bool_op", []):
+        for ordinal, compound in by_kind.get("bool_op", []):
+            if compound:
+                continue  # handled by the landing-chain branch above, shared with the Test target.
             if ordinal >= len(chains):
                 continue
             chain = sorted(chains[ordinal], key=lambda ci: ci[1].offset)
@@ -266,10 +418,23 @@ def _resolve_fine_probe(entry, next_offset, fine_hits):
     if "true_on_fallthrough" in entry:
         true_hit = (not jumped) if entry["true_on_fallthrough"] else jumped
         fine_hits.add((entry["line"], entry["ordinal"], "true" if true_hit else "false"))
-    elif jumped:
-        fine_hits.add((entry["line"], entry["ordinal"], "short_circuit"))
-    elif entry["boolop_last"]:
-        fine_hits.add((entry["line"], entry["ordinal"], "full_evaluation"))
+        return
+    if "boolop_last" in entry:
+        if jumped:
+            fine_hits.add((entry["line"], entry["ordinal"], "short_circuit"))
+        elif entry["boolop_last"]:
+            fine_hits.add((entry["line"], entry["ordinal"], "full_evaluation"))
+        return
+    # The landing-offset scheme (`compound: true`) — see `_resolve_landing_chain`.
+    outcome = entry["outcome_if_jump"] if jumped else (entry["outcome_if_fallthrough"] if entry["fallthrough_meaningful"] else None)
+    if outcome is not None:
+        fine_hits.add((entry["line"], entry["ordinal"], outcome))
+    boolop_ordinal = entry.get("boolop_ordinal")
+    if boolop_ordinal is not None:
+        if entry["fallthrough_meaningful"]:
+            fine_hits.add((entry["line"], boolop_ordinal, "full_evaluation"))
+        elif jumped:
+            fine_hits.add((entry["line"], boolop_ordinal, "short_circuit"))
 
 
 def _make_tracer(executed, arcs, fine_plan, fine_hits):

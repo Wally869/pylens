@@ -27,17 +27,55 @@
 //! ternary/`and`/`or` nested anywhere inside one — see [`contains_conditional`]) compiles to
 //! MULTIPLE `POP_JUMP_IF_*` instructions instead of the single one a simple test does (CPython
 //! duplicates a nested ternary's own decision across each of the enclosing consumer's branches,
-//! and expands a compound boolop into one jump per operand). This pass does not attempt to
-//! attribute an outcome across that — the construct's own outcome, and any `BoolOp` folded into
-//! its jump chain (see [`mark_boolop_chain`]), stay `Unobservable`.
+//! and expands a compound boolop into one jump per operand).
 //!
-//! Demoting only the complex construct itself isn't enough, though: `python/worker.py` indexes a
-//! flat, offset-sorted `test_groups[line]` built from EVERY `POP_JUMP_IF_*` instruction physically
-//! on a line, regardless of which AST node it came from — so a demoted-but-still-compiled
-//! instruction still shifts the index any OTHER, otherwise-simple, `FineGrained` Test-category
-//! sibling on that SAME line would land on. `collect_branches`'s final pass therefore demotes
-//! EVERY Test-category outcome on a line carrying any such test to `Unobservable`, not just the
-//! complex construct's own — see `polluted_lines`.
+//! **Recovering compound tests (the landing-offset scheme).** A test whose ONLY source of
+//! complexity is `BoolOp` nesting (`a and b`, `(a and b) or c`, arbitrarily deep `and`/`or`, no
+//! ternary anywhere) still compiles to a well-understood shape: CPython backpatches every
+//! short-circuiting jump in the chain to land DIRECTLY on one of exactly two offsets — the
+//! construct's own true-landing (the fallthrough of the chain's last instruction) or its
+//! false-landing (that instruction's own jump target) — never an intermediate offset internal to
+//! the test. `python/worker.py`'s `_resolve_landing_chain` verifies this dynamically, against the
+//! ACTUAL compiled bytecode, before trusting it: every instruction physically on the line must
+//! target one of those two offsets, or the whole line's resolution is abandoned (no `fine_hits`
+//! ever recorded for it — safe by construction, since an unresolved `FineGrained` outcome just
+//! reports `uncovered`, never `covered`). This same check also naturally REJECTS the shapes that
+//! don't flatten (a nested ternary duplicating the outer construct's instructions across its
+//! branches; `(a and b) or (c and d)`, whose left AND's failure must jump into the middle of the
+//! right OR's own test, an intermediate offset) — the worker's dynamic proof is the actual safety
+//! net; this pass's own `contains_unprovable_shape` gate (see below) is only a cheap pre-filter that rules
+//! out the ternary case before ever asking the worker to try.
+//!
+//! `while`'s same-line test additionally gets CPython's loop-rotation treatment: the test is
+//! compiled TWICE (once before the loop, once as the bottom-of-loop retest), and the retest's
+//! polarity is flipped (whichever operand used to jump on failure now jumps on success) to save an
+//! instruction. The retest shares the exact same physical line as the loop body (that is what
+//! "same-line" means), so there is no line-table boundary — and no reliable OPCODE-based signal
+//! either, a store-free body (`while xs: xs.pop()`) compiles to ordinary `LOAD_METHOD`/
+//! `CALL_METHOD`/`POP_TOP` indistinguishable from a test operand's own value computation — to
+//! split "pre-loop test" from "retest" instructions. `_resolve_landing_chain` doesn't try:
+//! CPython's codegen guarantees the retest's own loop-continuation jump is the ONLY instruction on
+//! the line that ever jumps BACKWARD (nothing before the very first instruction of a straight-line
+//! test could target an earlier offset), so that one instruction's own jump target IS the
+//! true-landing, read directly off it — every OTHER (forward-jumping) instruction on the line,
+//! from either the pre-loop test or the retest's own non-final operands, must then share ONE
+//! common target, the false-landing. No run grouping is needed at all.
+
+
+//!
+//! A `BoolOp` used AS a test (`if a and b:`, `x if (a or b) else y`, a comprehension guard `if a
+//! and b`) additionally gets its own `short_circuit`/`full_evaluation` resolution from the exact
+//! same per-line instruction plan — see [`suppress_test_boolops`]/`ExprCollector`'s
+//! `test_position_boolops`.
+//!
+//! This recovery only ever applies to a line hosting EXACTLY ONE test position (an `if`/`elif`
+//! test, a `while` test, a ternary's test, a comprehension guard): `python/worker.py` groups a
+//! line's `POP_JUMP_IF_*` instructions by PHYSICAL LINE, not by which AST node compiled them, so a
+//! SECOND test position sharing the line (even a simple one) risks the worker attributing an
+//! instruction to the wrong construct — see [`reconcile_fine_grained`]/`CollectCtx::positions`,
+//! the generalization of the old `polluted_lines`-demotes-everything rule this pass used before
+//! this recovery existed. Same-line `for` (`FOR_ITER`) is out of this pass's scope — its same-line
+//! outcome always stays `Unobservable`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -48,13 +86,17 @@ use ruff_text_size::{Ranged, TextSize};
 
 use crate::model::branch::{BranchKind, BranchPoint, BranchPointOutcome, OutcomeEvidence};
 
-/// Whether `expr` contains, anywhere within it, a `BoolOp` (`a and b`, `a or b`) or a ternary
-/// (`Expr::If`) — either compiles to MULTIPLE jump instructions when embedded in a test position
-/// (a compound boolop expands to a chain; a nested ternary's own decision gets duplicated across
-/// the branches of whatever consumes its value), never the single instruction a simple test
-/// compiles to. Does not descend into a nested comprehension's or lambda's own body: those compile
-/// to a SEPARATE code object, called once, so whatever conditional logic lives inside one can
-/// never duplicate or chain-expand the ENCLOSING test's instructions.
+/// Whether `expr` contains, anywhere within it, a `BoolOp` (`a and b`, `a or b`), a ternary
+/// (`Expr::If`), or a CHAINED comparison (`a < b < c`, more than one operator in one `Compare`
+/// node) — every one of these compiles to MULTIPLE jump instructions when embedded in a test
+/// position (a compound boolop expands to a chain; a nested ternary's own decision gets
+/// duplicated across the branches of whatever consumes its value; a chained comparison emits one
+/// `POP_JUMP_IF_FALSE` per operator plus a `POP_TOP` cleanup on the early-exit path — `dis` on
+/// 3.10 confirms `a < b < c`'s first operator's failure jumps to that `POP_TOP`, an offset outside
+/// both landing offsets), never the single instruction a simple test compiles to. Does not descend
+/// into a nested comprehension's or lambda's own body: those compile to a SEPARATE code object,
+/// called once, so whatever conditional logic lives inside one can never duplicate or chain-expand
+/// the ENCLOSING test's instructions.
 fn contains_conditional(expr: &ast::Expr) -> bool {
     struct Finder {
         found: bool,
@@ -66,6 +108,51 @@ fn contains_conditional(expr: &ast::Expr) -> bool {
             }
             match expr {
                 ast::Expr::BoolOp(_) | ast::Expr::If(_) => {
+                    self.found = true;
+                }
+                ast::Expr::Compare(cmp) if cmp.ops.len() > 1 => {
+                    self.found = true;
+                }
+                ast::Expr::ListComp(_)
+                | ast::Expr::SetComp(_)
+                | ast::Expr::DictComp(_)
+                | ast::Expr::Generator(_)
+                | ast::Expr::Lambda(_) => {}
+                _ => visitor::walk_expr(self, expr),
+            }
+        }
+    }
+    let mut finder = Finder { found: false };
+    finder.visit_expr(expr);
+    finder.found
+}
+
+/// Whether `expr` contains an `Expr::If` (ternary) or a chained comparison anywhere within it — a
+/// strict subset of [`contains_conditional`] that ignores pure `BoolOp` nesting. A test flagged
+/// by this is never eligible for the landing-offset chain recovery (see the module doc's
+/// "Recovering compound tests" section): a nested ternary duplicates the enclosing construct's
+/// own decision across each of its branches, and a chained comparison's early-exit path routes
+/// through a `POP_TOP` cleanup instruction — both produce an intermediate jump target the chain
+/// can't attribute safely; a pure `and`/`or` tree never does (`python/worker.py`'s
+/// `_resolve_landing_chain` would eventually reject either dynamically too, since neither one's
+/// instructions all land on a single proven pair — this is only a cheap pre-filter that skips the
+/// attempt and reports the honest `unobservable_line_granularity` instead of a permanent, wasted
+/// `uncovered`). Same traversal shape as `contains_conditional` (does not descend into a nested
+/// comprehension's or lambda's own body).
+fn contains_unprovable_shape(expr: &ast::Expr) -> bool {
+    struct Finder {
+        found: bool,
+    }
+    impl<'ast> Visitor<'ast> for Finder {
+        fn visit_expr(&mut self, expr: &'ast ast::Expr) {
+            if self.found {
+                return;
+            }
+            match expr {
+                ast::Expr::If(_) => {
+                    self.found = true;
+                }
+                ast::Expr::Compare(cmp) if cmp.ops.len() > 1 => {
                     self.found = true;
                 }
                 ast::Expr::ListComp(_)
@@ -97,6 +184,31 @@ fn mark_boolop_chain(expr: &ast::Expr, suppress: &mut HashSet<TextSize>) {
     }
 }
 
+/// Suppresses every `BoolOp` nested inside `bool_op`'s own operands (as [`mark_boolop_chain`]),
+/// but NOT `bool_op` itself. Used at a test position whose test is *directly* a `BoolOp` (`if a
+/// and b:`, `a if (x or y) else b`, a comprehension guard `if a and b`) — that outer node is the
+/// landing-offset chain recovery's other target (see [`ExprCollector`]'s `test_position_boolops`),
+/// so it must stay eligible for its own `FineGrained` outcome instead of being unconditionally
+/// suppressed like a value-position boolop.
+fn mark_boolop_children(bool_op: &ast::ExprBoolOp, suppress: &mut HashSet<TextSize>) {
+    for value in &bool_op.values {
+        mark_boolop_chain(value, suppress);
+    }
+}
+
+/// Suppresses `test`'s boolop content for [`ExprCollector`]'s `suppress` set, and returns whether
+/// `test` is itself directly a `BoolOp` (the landing-offset recovery's other target — see
+/// [`mark_boolop_children`]).
+fn suppress_test_boolops(test: &ast::Expr, suppress: &mut HashSet<TextSize>) -> bool {
+    if let ast::Expr::BoolOp(bool_op) = test {
+        mark_boolop_children(bool_op, suppress);
+        true
+    } else {
+        mark_boolop_chain(test, suppress);
+        false
+    }
+}
+
 /// Which bytecode shape a [`OutcomeEvidence::FineGrained`] point resolves against — must match
 /// `python/worker.py`'s `_build_fine_plan`, which keeps a SEPARATE ordinal-indexed group per
 /// category (`test_groups` vs `chain_groups`), never one shared list. `ordinal` is therefore
@@ -123,10 +235,18 @@ struct CollectCtx {
     ordinals: Ordinals,
     /// Lines carrying a test whose [`contains_conditional`] is true, from ANY test position
     /// (`if`/`elif`, `while`, a ternary's test, a comprehension guard) — regardless of whether
-    /// that particular test's own construct ends up `FineGrained` or not. See the module doc's
-    /// second paragraph for why every Test-category outcome on such a line is demoted, not just
-    /// the complex test's own.
+    /// that particular test's own construct ends up `FineGrained` or not.
     polluted_lines: HashSet<u32>,
+    /// Per-line count of test positions anchored there (an `if`/`elif` test, a `while` test, a
+    /// ternary's test, a comprehension guard) — same-line or not, resolvable or not. The
+    /// landing-offset recovery (see [`reconcile_fine_grained`]) only ever trusts a `polluted_lines`
+    /// line whose count here is exactly 1: with two or more test positions sharing one physical
+    /// line, the worker's bytecode scan for one of them could observe instructions that actually
+    /// belong to the other.
+    positions: HashMap<u32, u32>,
+    /// Lines carrying a test position whose own test [`contains_unprovable_shape`] — never recoverable
+    /// (see [`contains_unprovable_shape`]'s doc), regardless of `positions`' count.
+    unprovable_lines: HashSet<u32>,
 }
 
 fn next_ordinal(ctx: &mut CollectCtx, line: u32, category: ProbeCategory) -> u32 {
@@ -136,28 +256,58 @@ fn next_ordinal(ctx: &mut CollectCtx, line: u32, category: ProbeCategory) -> u32
     ordinal
 }
 
-/// Records `line` as polluted when `test`'s [`contains_conditional`] — called at EVERY test
-/// position (if/elif/while tests in the statement walk; ternary tests and comprehension guards in
-/// [`ExprCollector`]), regardless of that test's own resolvability.
-fn mark_if_polluted(ctx: &mut CollectCtx, test: &ast::Expr, line: u32) {
+/// Records one test-position anchor at `line` (an `if`/`elif`/`while` test, a ternary's test, a
+/// comprehension guard) into [`CollectCtx`]'s `positions`/`unprovable_lines`/`polluted_lines` —
+/// called at EVERY test position (if/elif/while tests in the statement walk; ternary tests and
+/// comprehension guards in [`ExprCollector`]), regardless of that test's own resolvability. See
+/// [`reconcile_fine_grained`] for how these three facts gate the landing-offset recovery.
+fn record_test_position(ctx: &mut CollectCtx, test: &ast::Expr, line: u32) {
+    *ctx.positions.entry(line).or_insert(0) += 1;
+    if contains_unprovable_shape(test) {
+        ctx.unprovable_lines.insert(line);
+    }
     if contains_conditional(test) {
         ctx.polluted_lines.insert(line);
     }
 }
 
-/// Demotes every Test-category (`Ternary`/`InlineIf`/`ComprehensionIf`) outcome on a
-/// `polluted_lines` line to `Unobservable` — the final step of `collect_branches`, applied after
-/// both passes (and thus every `polluted_lines` entry) are complete. `Chain`-category (`BoolOp`)
-/// outcomes are untouched: a compound or nested-conditional test never contributes the
-/// `JUMP_IF_*_OR_POP` instructions a value-position boolop chain resolves against, so `BoolOp`'s
-/// own ordinal-indexed group on the worker side is never polluted by this.
-fn demote_polluted_lines(out: &mut [BranchPoint], polluted_lines: &HashSet<u32>) {
-    for bp in out {
-        if matches!(bp.kind, BranchKind::Ternary | BranchKind::InlineIf | BranchKind::ComprehensionIf)
-            && polluted_lines.contains(&bp.line)
+/// Reconciles every `FineGrained` outcome assigned optimistically during the two enumeration
+/// passes against the now-complete `positions`/`unprovable_lines`/`polluted_lines` facts — the final
+/// step of `collect_branches`. A same-line Test-category outcome
+/// (`Ternary`/`InlineIf`/`ComprehensionIf`/`While`) or a test-position `BoolOp` (one whose
+/// evidence already carries `compound: true` — see [`suppress_test_boolops`]; a value-position
+/// `BoolOp` never does and is left untouched here) demotes to `Unobservable` UNLESS its line is
+/// either not `polluted_lines` at all (nothing on it was ever compound — the legacy
+/// single-instruction resolution, still `compound: false`, is exactly as reliable as before this
+/// recovery pass existed) or hosts EXACTLY ONE test position with no ternary anywhere in that
+/// position's own test (the landing-offset scheme's precondition — see the module doc). Anything
+/// else — two or more test positions sharing a line, or a ternary anywhere in the sole one's own
+/// test — stays conservatively demoted, exactly as `demote_polluted_lines` did before this pass
+/// existed.
+fn reconcile_fine_grained(out: &mut [BranchPoint], ctx: &CollectCtx) {
+    for bp in out.iter_mut() {
+        let is_boolop = bp.kind == BranchKind::BoolOp;
+        let is_test_category = matches!(
+            bp.kind,
+            BranchKind::Ternary | BranchKind::InlineIf | BranchKind::ComprehensionIf | BranchKind::While
+        );
+        if !is_test_category && !is_boolop {
+            continue;
+        }
+        if is_boolop
+            && !bp.outcomes.iter().any(|o| matches!(o.evidence, OutcomeEvidence::FineGrained(_, _, true)))
         {
+            continue;
+        }
+        if !ctx.polluted_lines.contains(&bp.line) {
+            continue;
+        }
+        let recoverable = ctx.positions.get(&bp.line) == Some(&1) && !ctx.unprovable_lines.contains(&bp.line);
+        if !recoverable {
             for outcome in &mut bp.outcomes {
-                outcome.evidence = OutcomeEvidence::Unobservable;
+                if matches!(outcome.evidence, OutcomeEvidence::FineGrained(..)) {
+                    outcome.evidence = OutcomeEvidence::Unobservable;
+                }
             }
         }
     }
@@ -174,12 +324,13 @@ pub(in crate::analyze) fn collect_branches(
         line_index,
         ctx: &mut ctx,
         suppress: HashSet::new(),
+        test_position_boolops: HashSet::new(),
         out: &mut out,
     };
     for stmt in body {
         expr_collector.visit_stmt(stmt);
     }
-    demote_polluted_lines(&mut out, &ctx.polluted_lines);
+    reconcile_fine_grained(&mut out, &ctx);
     out
 }
 
@@ -197,28 +348,34 @@ fn is_same_line(test_line: u32, body_line: u32) -> bool {
     body_line == test_line
 }
 
-/// `same_line`'s second element (`resolvable_same_line`): whether a same-line occurrence of this
-/// construct can be resolved via opcode-level tracing (`true` for `if`/`elif` — a single
-/// `POP_JUMP_IF_*` the worker can match; `false` for `for`/`while`, whose same-line iteration
-/// test uses `FOR_ITER`/its own opcode and isn't decoded here — out of this pass's scope, so it
-/// stays `Unobservable`).
+/// `same_line`'s second element: `None` when a same-line occurrence of this construct has no
+/// opcode shape this pass knows how to resolve at all (`for`'s same-line iteration test uses
+/// `FOR_ITER`, out of this pass's scope — stays `Unobservable`); `Some((test, force_compound))`
+/// when it does (`if`/`elif`, whose `test` decides `compound` itself — see
+/// [`OutcomeEvidence::FineGrained`] — and `while`, which always needs the landing-offset chain
+/// resolution regardless of its own test's complexity, since CPython's loop-rotation duplicates
+/// even a simple test into two differently-polarized copies — see the module doc). The
+/// optimistic `FineGrained` assigned here is reconciled against the line's final pollution facts
+/// by [`reconcile_fine_grained`], once both enumeration passes are complete.
 fn two_way(
     kind: BranchKind,
     line: u32,
     outcome_names: (&str, &str),
     body_line: Option<u32>,
     false_target: Option<u32>,
-    same_line: (BranchKind, bool),
+    same_line: (BranchKind, Option<(&ast::Expr, bool)>),
     ctx: &mut CollectCtx,
 ) -> Option<BranchPoint> {
     let (true_outcome, false_outcome) = outcome_names;
-    let (same_line_kind, resolvable_same_line) = same_line;
+    let (same_line_kind, same_line_test) = same_line;
     let body_line = body_line?;
     if is_same_line(line, body_line) {
-        let evidence = if resolvable_same_line {
-            OutcomeEvidence::FineGrained(line, next_ordinal(ctx, line, ProbeCategory::Test))
-        } else {
-            OutcomeEvidence::Unobservable
+        let evidence = match same_line_test {
+            Some((test, force_compound)) => {
+                let compound = force_compound || contains_conditional(test);
+                OutcomeEvidence::FineGrained(line, next_ordinal(ctx, line, ProbeCategory::Test), compound)
+            }
+            None => OutcomeEvidence::Unobservable,
         };
         return Some(BranchPoint {
             kind: same_line_kind,
@@ -325,7 +482,7 @@ fn walk_if(
         ("true", "false"),
         body_line,
         false_target,
-        (BranchKind::InlineIf, !contains_conditional(&if_stmt.test)),
+        (BranchKind::InlineIf, Some((&if_stmt.test, false))),
         ctx,
     ) {
         out.push(bp);
@@ -343,7 +500,7 @@ fn walk_if(
                 ("true", "false"),
                 clause_body_line,
                 false_target,
-                (BranchKind::InlineIf, !contains_conditional(test)),
+                (BranchKind::InlineIf, Some((test, false))),
                 ctx,
             ) {
                 out.push(bp);
@@ -373,7 +530,7 @@ fn walk_for(
         ("iterate", "empty"),
         body_line,
         empty_target,
-        (BranchKind::For, false),
+        (BranchKind::For, None),
         ctx,
     ) {
         out.push(bp);
@@ -402,7 +559,7 @@ fn walk_while(
         ("enter", "skip"),
         body_line,
         skip_target,
-        (BranchKind::While, false),
+        (BranchKind::While, Some((&while_stmt.test, true))),
         ctx,
     ) {
         out.push(bp);
@@ -470,32 +627,25 @@ fn walk_match(
 /// Finds every same-line construct (ternary, boolop, comprehension guard) anywhere in the body —
 /// these need no fall-through context, just every expression reached.
 ///
-/// `suppress` holds the range-start of every `BoolOp` CPython compiles into an enclosing
-/// construct's own control-flow jump chain rather than as a value (a control construct's — `if`,
-/// `while`, a ternary's test, a comprehension guard — compound test, and any `BoolOp` nested
-/// inside one through further `BoolOp` operands) — see [`mark_boolop_chain`]. A node in
-/// `suppress` is reported `Unobservable`, never `FineGrained`: its instructions aren't the
-/// single test or uniform-target chain this pass knows how to attribute an outcome to.
+/// `suppress` holds the range-start of every `BoolOp` CPython folds into an enclosing construct's
+/// own control-flow jump chain rather than compiling as a value — every `BoolOp` reached only
+/// through further `BoolOp` operands (`a and (b or c)`'s inner `b or c`), which never gets its own
+/// attributable instruction group — see [`mark_boolop_chain`]/[`mark_boolop_children`]. A node in
+/// `suppress` is reported `Unobservable`, never `FineGrained`.
+///
+/// `test_position_boolops` holds the range-start of every `BoolOp` that IS directly a test's own
+/// expression (`if a and b:`, `x if (a or b) else y`, a comprehension guard `if a and b`) — see
+/// [`suppress_test_boolops`]. Never suppressed, but its evidence's `compound` bit is set from
+/// membership here rather than always `true`: unlike Test-category outcomes, this is the ONLY way
+/// to tell a test-position `BoolOp` (needs the landing-offset chain resolution — see the module
+/// doc) from an ordinary value-position one (needs the older `JUMP_IF_*_OR_POP` chain lookup,
+/// `compound: false`) once both have become plain `Expr::BoolOp` nodes in the walk.
 struct ExprCollector<'a> {
     line_index: &'a LineIndex,
     ctx: &'a mut CollectCtx,
     suppress: HashSet<TextSize>,
+    test_position_boolops: HashSet<TextSize>,
     out: &'a mut Vec<BranchPoint>,
-}
-
-/// `Unobservable` when `unresolvable`, else `FineGrained(line, next ordinal)` — no ordinal is
-/// spent for an `Unobservable` outcome.
-fn fine_or_unobservable(
-    unresolvable: bool,
-    line: u32,
-    category: ProbeCategory,
-    ctx: &mut CollectCtx,
-) -> OutcomeEvidence {
-    if unresolvable {
-        OutcomeEvidence::Unobservable
-    } else {
-        OutcomeEvidence::FineGrained(line, next_ordinal(ctx, line, category))
-    }
 }
 
 impl<'ast> Visitor<'ast> for ExprCollector<'_> {
@@ -504,20 +654,26 @@ impl<'ast> Visitor<'ast> for ExprCollector<'_> {
             ast::Stmt::FunctionDef(_) | ast::Stmt::ClassDef(_) => return,
             ast::Stmt::If(if_stmt) => {
                 let line = line_at(if_stmt.range().start(), self.line_index);
-                mark_if_polluted(self.ctx, &if_stmt.test, line);
-                mark_boolop_chain(&if_stmt.test, &mut self.suppress);
+                record_test_position(self.ctx, &if_stmt.test, line);
+                if suppress_test_boolops(&if_stmt.test, &mut self.suppress) {
+                    self.test_position_boolops.insert(if_stmt.test.range().start());
+                }
                 for clause in &if_stmt.elif_else_clauses {
                     if let Some(test) = &clause.test {
                         let clause_line = line_at(clause.range().start(), self.line_index);
-                        mark_if_polluted(self.ctx, test, clause_line);
-                        mark_boolop_chain(test, &mut self.suppress);
+                        record_test_position(self.ctx, test, clause_line);
+                        if suppress_test_boolops(test, &mut self.suppress) {
+                            self.test_position_boolops.insert(test.range().start());
+                        }
                     }
                 }
             }
             ast::Stmt::While(while_stmt) => {
                 let line = line_at(while_stmt.range().start(), self.line_index);
-                mark_if_polluted(self.ctx, &while_stmt.test, line);
-                mark_boolop_chain(&while_stmt.test, &mut self.suppress);
+                record_test_position(self.ctx, &while_stmt.test, line);
+                if suppress_test_boolops(&while_stmt.test, &mut self.suppress) {
+                    self.test_position_boolops.insert(while_stmt.test.range().start());
+                }
             }
             _ => {}
         }
@@ -528,14 +684,16 @@ impl<'ast> Visitor<'ast> for ExprCollector<'_> {
         match expr {
             ast::Expr::If(if_expr) => {
                 let line = line_at(if_expr.range().start(), self.line_index);
-                // The ternary's OWN start differs from its `test`'s start, so its resolvability
-                // is a direct `contains_conditional` check, not a `suppress` lookup (that's only
-                // for the nested `BoolOp` node itself, marked below and consulted when the walk
-                // reaches it in the `Expr::BoolOp` arm).
+                // Optimistically assigned regardless of the test's own complexity — a compound
+                // test is still resolvable via the landing-offset chain (`compound: true`) — and
+                // reconciled against the line's final pollution facts by `reconcile_fine_grained`.
+                let compound = contains_conditional(&if_expr.test);
                 let evidence =
-                    fine_or_unobservable(contains_conditional(&if_expr.test), line, ProbeCategory::Test, self.ctx);
-                mark_if_polluted(self.ctx, &if_expr.test, line);
-                mark_boolop_chain(&if_expr.test, &mut self.suppress);
+                    OutcomeEvidence::FineGrained(line, next_ordinal(self.ctx, line, ProbeCategory::Test), compound);
+                record_test_position(self.ctx, &if_expr.test, line);
+                if suppress_test_boolops(&if_expr.test, &mut self.suppress) {
+                    self.test_position_boolops.insert(if_expr.test.range().start());
+                }
                 self.out.push(BranchPoint {
                     kind: BranchKind::Ternary,
                     line,
@@ -547,8 +705,13 @@ impl<'ast> Visitor<'ast> for ExprCollector<'_> {
             }
             ast::Expr::BoolOp(bool_op) => {
                 let line = line_at(bool_op.range().start(), self.line_index);
-                let unresolvable = self.suppress.contains(&bool_op.range().start());
-                let evidence = fine_or_unobservable(unresolvable, line, ProbeCategory::Chain, self.ctx);
+                let start = bool_op.range().start();
+                let evidence = if self.suppress.contains(&start) {
+                    OutcomeEvidence::Unobservable
+                } else {
+                    let compound = self.test_position_boolops.contains(&start);
+                    OutcomeEvidence::FineGrained(line, next_ordinal(self.ctx, line, ProbeCategory::Chain), compound)
+                };
                 self.out.push(BranchPoint {
                     kind: BranchKind::BoolOp,
                     line,
@@ -566,12 +729,15 @@ impl<'ast> Visitor<'ast> for ExprCollector<'_> {
     fn visit_comprehension(&mut self, comprehension: &'ast ast::Comprehension) {
         for cond in &comprehension.ifs {
             let line = line_at(cond.range().start(), self.line_index);
-            // A comprehension guard's own range IS its test's range, so `contains_conditional(cond)`
-            // and a `suppress` lookup on `cond`'s own start agree — using the direct check keeps
-            // this symmetric with the ternary arm above.
-            let evidence = fine_or_unobservable(contains_conditional(cond), line, ProbeCategory::Test, self.ctx);
-            mark_if_polluted(self.ctx, cond, line);
-            mark_boolop_chain(cond, &mut self.suppress);
+            // A comprehension guard's own range IS its test's range, so `contains_conditional`
+            // and `suppress_test_boolops` here agree with the direct check used above.
+            let compound = contains_conditional(cond);
+            let evidence =
+                OutcomeEvidence::FineGrained(line, next_ordinal(self.ctx, line, ProbeCategory::Test), compound);
+            record_test_position(self.ctx, cond, line);
+            if suppress_test_boolops(cond, &mut self.suppress) {
+                self.test_position_boolops.insert(cond.range().start());
+            }
             self.out.push(BranchPoint {
                 kind: BranchKind::ComprehensionIf,
                 line,

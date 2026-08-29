@@ -145,16 +145,16 @@ fn enumerates_inline_if_and_ternary_and_boolop_as_fine_grained() {
     let points = &sig(&sigs, "f").branch_points;
 
     let inline = branch_at(points, BranchKind::InlineIf, 2);
-    assert_eq!(*outcome(inline, "true"), OutcomeEvidence::FineGrained(2, 0));
-    assert_eq!(*outcome(inline, "false"), OutcomeEvidence::FineGrained(2, 0));
+    assert_eq!(*outcome(inline, "true"), OutcomeEvidence::FineGrained(2, 0, false));
+    assert_eq!(*outcome(inline, "false"), OutcomeEvidence::FineGrained(2, 0, false));
 
     let ternary = branch_at(points, BranchKind::Ternary, 3);
-    assert_eq!(*outcome(ternary, "true"), OutcomeEvidence::FineGrained(3, 0));
-    assert_eq!(*outcome(ternary, "false"), OutcomeEvidence::FineGrained(3, 0));
+    assert_eq!(*outcome(ternary, "true"), OutcomeEvidence::FineGrained(3, 0, false));
+    assert_eq!(*outcome(ternary, "false"), OutcomeEvidence::FineGrained(3, 0, false));
 
     let boolop = branch_at(points, BranchKind::BoolOp, 4);
-    assert_eq!(*outcome(boolop, "short_circuit"), OutcomeEvidence::FineGrained(4, 0));
-    assert_eq!(*outcome(boolop, "full_evaluation"), OutcomeEvidence::FineGrained(4, 0));
+    assert_eq!(*outcome(boolop, "short_circuit"), OutcomeEvidence::FineGrained(4, 0, false));
+    assert_eq!(*outcome(boolop, "full_evaluation"), OutcomeEvidence::FineGrained(4, 0, false));
 }
 
 #[test]
@@ -166,8 +166,8 @@ fn enumerates_comprehension_if_as_fine_grained() {
     .expect("parse");
     let points = &sig(&sigs, "f").branch_points;
     let bp = branch_at(points, BranchKind::ComprehensionIf, 2);
-    assert_eq!(*outcome(bp, "true"), OutcomeEvidence::FineGrained(2, 0));
-    assert_eq!(*outcome(bp, "false"), OutcomeEvidence::FineGrained(2, 0));
+    assert_eq!(*outcome(bp, "true"), OutcomeEvidence::FineGrained(2, 0, false));
+    assert_eq!(*outcome(bp, "false"), OutcomeEvidence::FineGrained(2, 0, false));
 }
 
 #[test]
@@ -183,36 +183,39 @@ fn same_line_ordinal_disambiguates_two_ternaries_on_one_line() {
         .filter(|b| b.kind == BranchKind::Ternary && b.line == 2)
         .collect();
     assert_eq!(ternaries.len(), 2, "expected two ternaries on line 2: {points:?}");
-    assert_eq!(*outcome(ternaries[0], "true"), OutcomeEvidence::FineGrained(2, 0));
-    assert_eq!(*outcome(ternaries[1], "true"), OutcomeEvidence::FineGrained(2, 1));
+    assert_eq!(*outcome(ternaries[0], "true"), OutcomeEvidence::FineGrained(2, 0, false));
+    assert_eq!(*outcome(ternaries[1], "true"), OutcomeEvidence::FineGrained(2, 1, false));
 }
 
 #[test]
-fn compound_ternary_test_stays_unobservable_not_fine_grained() {
+fn compound_ternary_test_resolves_via_landing_offset_chain() {
     // `a and b` compiles to a CHAIN of test jumps, not the single instruction a simple test
-    // does — attaching the probe to the first jump would only prove `a`'s truthiness, not the
-    // whole construct's outcome, so this must stay conservatively `Unobservable`.
+    // does — but every jump in that chain lands on exactly one of two proven offsets (the
+    // ternary's own true/false landing), so the landing-offset scheme (see
+    // `analyze::collect::branches`'s module doc) resolves it: `compound: true`, sole test
+    // position on the line, no nested ternary.
     let sigs = analyze_source("def f(a, b):\n    return 1 if a and b else 2\n").expect("parse");
     let points = &sig(&sigs, "f").branch_points;
     let ternary = branch_at(points, BranchKind::Ternary, 2);
-    assert_eq!(*outcome(ternary, "true"), OutcomeEvidence::Unobservable);
-    assert_eq!(*outcome(ternary, "false"), OutcomeEvidence::Unobservable);
-    // The nested `and`'s own boolop branch point is folded into the ternary's jump chain too —
-    // also `Unobservable`, never resolved against the wrong (or a nonexistent) instruction.
+    assert_eq!(*outcome(ternary, "true"), OutcomeEvidence::FineGrained(2, 0, true));
+    assert_eq!(*outcome(ternary, "false"), OutcomeEvidence::FineGrained(2, 0, true));
+    // The nested `and` IS the ternary's whole test (a test-position `BoolOp`) — resolved from the
+    // exact same instruction plan, not suppressed.
     let boolop = branch_at(points, BranchKind::BoolOp, 2);
-    assert_eq!(*outcome(boolop, "short_circuit"), OutcomeEvidence::Unobservable);
-    assert_eq!(*outcome(boolop, "full_evaluation"), OutcomeEvidence::Unobservable);
+    assert_eq!(*outcome(boolop, "short_circuit"), OutcomeEvidence::FineGrained(2, 0, true));
+    assert_eq!(*outcome(boolop, "full_evaluation"), OutcomeEvidence::FineGrained(2, 0, true));
 }
 
 #[test]
-fn compound_or_ternary_test_stays_unobservable_not_fine_grained() {
+fn compound_or_ternary_test_resolves_via_landing_offset_chain() {
     // `or` mixes `POP_JUMP_IF_TRUE` (short-circuit success) and `POP_JUMP_IF_FALSE` (failure) in
-    // the same chain — still not a single instruction, so still conservatively `Unobservable`.
+    // the same chain — still not a single instruction, but every jump still lands on one of the
+    // two proven landing offsets, so this also resolves.
     let sigs = analyze_source("def f(a, b):\n    return 1 if a or b else 2\n").expect("parse");
     let points = &sig(&sigs, "f").branch_points;
     let ternary = branch_at(points, BranchKind::Ternary, 2);
-    assert_eq!(*outcome(ternary, "true"), OutcomeEvidence::Unobservable);
-    assert_eq!(*outcome(ternary, "false"), OutcomeEvidence::Unobservable);
+    assert_eq!(*outcome(ternary, "true"), OutcomeEvidence::FineGrained(2, 0, true));
+    assert_eq!(*outcome(ternary, "false"), OutcomeEvidence::FineGrained(2, 0, true));
 }
 
 #[test]
@@ -245,6 +248,74 @@ fn boolop_with_nested_ternary_value_pollutes_the_shared_line() {
     assert_eq!(*outcome(inline, "true"), OutcomeEvidence::Unobservable);
     let ternary = branch_at(points, BranchKind::Ternary, 2);
     assert_eq!(*outcome(ternary, "true"), OutcomeEvidence::Unobservable);
+}
+
+#[test]
+fn same_line_while_resolves_enter_and_skip_via_landing_offset_chain() {
+    // `while a and b: a -= 1` — same-line, so line-tracing alone can't tell `enter` from `skip`
+    // (item 2: `while`'s loop-rotation-duplicated test, resolved via the SAME landing-offset
+    // scheme as a compound ternary — see `_resolve_landing_chain`'s module doc).
+    let sigs = analyze_source("def f(a, b):\n    while a and b: a -= 1\n    return a\n").expect("parse");
+    let points = &sig(&sigs, "f").branch_points;
+    let bp = branch_at(points, BranchKind::While, 2);
+    assert_eq!(*outcome(bp, "enter"), OutcomeEvidence::FineGrained(2, 0, true));
+    assert_eq!(*outcome(bp, "skip"), OutcomeEvidence::FineGrained(2, 0, true));
+}
+
+#[test]
+fn same_line_while_with_simple_test_also_resolves() {
+    // A same-line `while` needs the landing-offset scheme's multi-run handling regardless of its
+    // own test's complexity — CPython's loop rotation duplicates even a plain test.
+    let sigs = analyze_source("def f(n): \n    while n: n -= 1\n    return n\n").expect("parse");
+    let points = &sig(&sigs, "f").branch_points;
+    let bp = branch_at(points, BranchKind::While, 2);
+    assert_eq!(*outcome(bp, "enter"), OutcomeEvidence::FineGrained(2, 0, true));
+    assert_eq!(*outcome(bp, "skip"), OutcomeEvidence::FineGrained(2, 0, true));
+}
+
+#[test]
+fn nested_compound_boolop_test_has_no_ternary_but_still_stays_unobservable_pre_worker() {
+    // `(a and b) or (c and d)` has no ternary anywhere, so `analyze::collect::branches`'s cheap
+    // AST-level gate optimistically marks it `compound: true` — the deliberately-ambiguous shape
+    // this pass CANNOT prove safe from the AST alone: the left AND's failure jumps into the
+    // middle of the right OR's own test (an intermediate offset), which only the WORKER's dynamic
+    // bytecode verification (`_resolve_landing_chain`) can detect and reject — see the sandbox
+    // test `nested_compound_boolop_test_is_never_falsely_covered_by_either_replay` for the actual
+    // safety proof. Statically, this is still `FineGrained` (the AST gate alone can't tell).
+    let sigs = analyze_source("def f(a, b, c, d):\n    return 1 if (a and b) or (c and d) else 2\n")
+        .expect("parse");
+    let points = &sig(&sigs, "f").branch_points;
+    let ternary = branch_at(points, BranchKind::Ternary, 2);
+    assert_eq!(*outcome(ternary, "true"), OutcomeEvidence::FineGrained(2, 0, true));
+}
+
+#[test]
+fn chained_comparison_ternary_test_demotes_to_unobservable() {
+    // `1 if a < b < c else 2` — `dis` on 3.10 shows two `POP_JUMP_IF_FALSE` instructions, but the
+    // FIRST operator's failure jumps to a `POP_TOP` cleanup (discarding the dangling comparison
+    // value) rather than either landing offset — an intermediate offset the landing-offset scheme
+    // can never attribute. `contains_unprovable_shape` catches this at the AST level (a `Compare`
+    // with more than one operator), demoting it up front rather than letting the worker discover
+    // the same thing dynamically and report a permanent, wasted `uncovered`.
+    let sigs = analyze_source("def f(a, b, c):\n    return 1 if a < b < c else 2\n").expect("parse");
+    let points = &sig(&sigs, "f").branch_points;
+    let ternary = branch_at(points, BranchKind::Ternary, 2);
+    assert_eq!(*outcome(ternary, "true"), OutcomeEvidence::Unobservable);
+    assert_eq!(*outcome(ternary, "false"), OutcomeEvidence::Unobservable);
+}
+
+#[test]
+fn comprehension_guard_with_a_method_call_resolves_via_landing_offset_chain() {
+    // `[x for x in xs if x.check()]` — `dis` on 3.10 shows the guard compiles to a single
+    // `LOAD_METHOD`/`CALL_METHOD`/`POP_JUMP_IF_FALSE`, exactly the simple one-instruction shape
+    // (no chain, no intermediate offset) — a call in a guard doesn't itself introduce the
+    // multi-jump complexity a `BoolOp`/ternary/chained-comparison would. Sole test position on its
+    // line, no ternary — resolves.
+    let sigs = analyze_source("def f(xs):\n    return [x for x in xs if x.check()]\n").expect("parse");
+    let points = &sig(&sigs, "f").branch_points;
+    let bp = branch_at(points, BranchKind::ComprehensionIf, 2);
+    assert_eq!(*outcome(bp, "true"), OutcomeEvidence::FineGrained(2, 0, false));
+    assert_eq!(*outcome(bp, "false"), OutcomeEvidence::FineGrained(2, 0, false));
 }
 
 #[test]
@@ -289,12 +360,12 @@ fn if_test_containing_a_ternary_demotes_both_the_inline_if_and_the_ternary() {
 }
 
 #[test]
-fn test_position_boolop_stays_unobservable_not_fine_grained() {
+fn test_position_boolop_resolves_via_landing_offset_chain() {
     // `if a and b:` compiles the boolop into the `if`'s OWN jump chain (plain `POP_JUMP_IF_*`,
-    // never `JUMP_IF_*_OR_POP`) — the `if`'s true/false outcome is still a normal multi-line Arc
-    // (unaffected), but the boolop's own short_circuit/full_evaluation branch point has no
-    // instruction shape this pass knows how to resolve, so it must stay `Unobservable` rather
-    // than a permanently `uncovered` outcome the cover loop can never satisfy.
+    // never `JUMP_IF_*_OR_POP`) — the `if`'s own true/false outcome is still a normal multi-line
+    // Arc (unaffected, non-same-line), but the boolop's own short_circuit/full_evaluation branch
+    // point now resolves from the SAME chain via the landing-offset scheme (the `if` is the sole
+    // test position on this line, its test is a pure `and`, no ternary).
     let sigs = analyze_source(
         "def f(a, b):\n\
          \x20   if a and b:\n\
@@ -307,8 +378,8 @@ fn test_position_boolop_stays_unobservable_not_fine_grained() {
     assert_eq!(*outcome(if_bp, "true"), OutcomeEvidence::Arc(2, 3));
     assert_eq!(*outcome(if_bp, "false"), OutcomeEvidence::Arc(2, 4));
     let boolop = branch_at(points, BranchKind::BoolOp, 2);
-    assert_eq!(*outcome(boolop, "short_circuit"), OutcomeEvidence::Unobservable);
-    assert_eq!(*outcome(boolop, "full_evaluation"), OutcomeEvidence::Unobservable);
+    assert_eq!(*outcome(boolop, "short_circuit"), OutcomeEvidence::FineGrained(2, 0, true));
+    assert_eq!(*outcome(boolop, "full_evaluation"), OutcomeEvidence::FineGrained(2, 0, true));
 }
 
 #[test]
@@ -320,9 +391,9 @@ fn mixed_ternary_and_boolop_on_one_line_get_independent_per_category_ordinals() 
     let sigs = analyze_source("def f(a, b, c):\n    return (a if b else c), (b and c)\n").expect("parse");
     let points = &sig(&sigs, "f").branch_points;
     let ternary = branch_at(points, BranchKind::Ternary, 2);
-    assert_eq!(*outcome(ternary, "true"), OutcomeEvidence::FineGrained(2, 0));
+    assert_eq!(*outcome(ternary, "true"), OutcomeEvidence::FineGrained(2, 0, false));
     let boolop = branch_at(points, BranchKind::BoolOp, 2);
-    assert_eq!(*outcome(boolop, "short_circuit"), OutcomeEvidence::FineGrained(2, 0));
+    assert_eq!(*outcome(boolop, "short_circuit"), OutcomeEvidence::FineGrained(2, 0, false));
 }
 
 #[test]
@@ -448,6 +519,111 @@ fn while_loop_skip_is_covered() {
 }
 
 #[test]
+fn same_line_while_enter_and_skip_are_covered_via_landing_offset_chain() {
+    // Item 2 end to end: a same-line `while a and b: a -= 1` — both outcomes resolved from the
+    // worker's opcode-level landing-offset chain, not line arcs.
+    if !ready("same_line_while_enter_and_skip_are_covered_via_landing_offset_chain") {
+        return;
+    }
+    let src = "def f(a, b):\n    while a and b: a -= 1\n    return a\n";
+    let mut replay = ReplayMap::new();
+    replay.insert(
+        "f".to_string(),
+        vec![vec![json!(0), json!(1)], vec![json!(2), json!(1)]],
+    );
+    let rec = record_file(src, 0, &replay, RecordFlags::default()).expect("record");
+    let f = find_function(&rec.functions, "f");
+    let branches = f.branches.as_ref().expect("branches present");
+    let bp = branch_report(branches, BranchKind::While, 2);
+    assert_eq!(status_of(bp, "skip"), "covered");
+    assert_eq!(status_of(bp, "enter"), "covered");
+}
+
+#[test]
+fn same_line_while_store_free_body_never_falsely_covers_enter_on_a_skip_only_replay() {
+    // Parent-review repro: `while xs: xs.pop()` — a STORE-FREE body (`.pop()` compiles to
+    // `LOAD_METHOD`/`CALL_METHOD`/`POP_TOP`, none of which a naive opcode-based "body boundary"
+    // heuristic can tell apart from a test operand's own value computation — an earlier version of
+    // this scheme merged the pre-loop test and the loop-rotated retest into one run and derived the
+    // canonical (true, false) pair from the wrong, polarity-flipped retest, silently INVERTING
+    // `enter`/`skip`). Replaying only the empty list never enters the loop at all — `enter` must
+    // stay uncovered, not (as the inverted bug reported) `covered`.
+    if !ready("same_line_while_store_free_body_never_falsely_covers_enter_on_a_skip_only_replay") {
+        return;
+    }
+    let src = "def f(xs):\n    while xs: xs.pop()\n    return 1\n";
+    let mut replay = ReplayMap::new();
+    replay.insert("f".to_string(), vec![vec![json!([])]]);
+    // Forces the always-present floor-of-one generated case (`--inputs 0` still yields 1) to a
+    // falsy `None` (never a truthy scalar filler candidate, which `while xs:` would still enter
+    // on before failing inside `.pop()`) — so it can't independently prove `enter` and mask what
+    // this test is about.
+    let domain = pylens::generate::ValueDomain::parse(r#"{"scalars": ["none"]}"#).expect("domain");
+    let rec = record_file(
+        src,
+        0,
+        &replay,
+        RecordFlags { domain: Some(&domain), ..RecordFlags::default() },
+    )
+    .expect("record");
+    let f = find_function(&rec.functions, "f");
+    let branches = f.branches.as_ref().expect("branches present");
+    let bp = branch_report(branches, BranchKind::While, 2);
+    assert_ne!(status_of(bp, "enter"), "covered", "the loop body never ran on an empty list");
+    assert_eq!(status_of(bp, "enter"), "uncovered");
+    assert_eq!(status_of(bp, "skip"), "covered");
+}
+
+#[test]
+fn same_line_while_store_free_body_correctly_covers_enter_when_it_actually_enters() {
+    // Mirror of the sibling test, the other direction: a one-element list DOES enter the loop
+    // (once, then exits after the `.pop()` empties it) — `enter` must show `covered`, not stay
+    // stuck `uncovered` the way an inverted label would (proving the fix isn't just "always report
+    // uncovered").
+    if !ready("same_line_while_store_free_body_correctly_covers_enter_when_it_actually_enters") {
+        return;
+    }
+    let src = "def f(xs):\n    while xs: xs.pop()\n    return 1\n";
+    let mut replay = ReplayMap::new();
+    replay.insert("f".to_string(), vec![vec![json!([1])]]);
+    let rec = record_file(src, 0, &replay, RecordFlags::default()).expect("record");
+    let f = find_function(&rec.functions, "f");
+    let branches = f.branches.as_ref().expect("branches present");
+    let bp = branch_report(branches, BranchKind::While, 2);
+    assert_eq!(status_of(bp, "enter"), "covered");
+    assert_eq!(status_of(bp, "skip"), "covered");
+}
+
+#[test]
+fn nested_compound_boolop_test_is_never_falsely_covered_by_either_replay() {
+    // `(a and b) or (c and d)` — no ternary anywhere, so `analyze::collect::branches`'s AST-level
+    // gate can't rule it out (see the static test pinning that), but the shape doesn't flatten:
+    // the left AND's failure jumps into the middle of the right OR's own test (an intermediate
+    // offset neither the true nor the false landing) — only the worker's dynamic bytecode
+    // verification catches this, at `_build_fine_plan` time, and records no `fine_hits` for it
+    // at all. The hard property this pins: replaying EITHER a semantically-true and a
+    // semantically-false input must never report either outcome `covered`.
+    if !ready("nested_compound_boolop_test_is_never_falsely_covered_by_either_replay") {
+        return;
+    }
+    let src = "def f(a, b, c, d):\n    return 1 if (a and b) or (c and d) else 2\n";
+    let mut replay = ReplayMap::new();
+    replay.insert(
+        "f".to_string(),
+        vec![
+            vec![json!(1), json!(1), json!(0), json!(0)], // (a and b) true -> the ternary's true arm
+            vec![json!(0), json!(0), json!(0), json!(0)], // both false -> the ternary's false arm
+        ],
+    );
+    let rec = record_file(src, 0, &replay, RecordFlags::default()).expect("record");
+    let f = find_function(&rec.functions, "f");
+    let branches = f.branches.as_ref().expect("branches present");
+    let bp = branch_report(branches, BranchKind::Ternary, 2);
+    assert_ne!(status_of(bp, "true"), "covered", "the landing-offset scheme must refuse this shape, not guess");
+    assert_ne!(status_of(bp, "false"), "covered", "the landing-offset scheme must refuse this shape, not guess");
+}
+
+#[test]
 fn ternary_both_outcomes_are_observable_via_opcode_tracing() {
     if !ready("ternary_both_outcomes_are_observable_via_opcode_tracing") {
         return;
@@ -500,27 +676,43 @@ fn inline_if_both_outcomes_are_observable_via_opcode_tracing() {
 
 #[test]
 fn compound_ternary_test_replaying_only_the_else_branch_never_falsely_covers_true() {
-    // Regression for a defect the parent review caught: `1 if a and b else 2` replayed with
-    // (1, 0) takes the ELSE branch (`a and b` is falsy). The old design attached the probe to
-    // the FIRST test jump (`a`'s own `POP_JUMP_IF_FALSE`), which falls through when `a` alone is
-    // truthy — proving nothing about the whole construct — and wrongly reported "true" covered.
+    // The hard property, pinned by the landing-offset scheme's own design: `1 if a and b else 2`
+    // replayed with (1, 0) takes the ELSE branch (`a and b` is falsy, short-circuiting on `b`). A
+    // naive scheme attaching the probe to the FIRST test jump (`a`'s own `POP_JUMP_IF_FALSE`,
+    // which falls through when `a` alone is truthy) would prove nothing about the whole construct
+    // and wrongly report "true" covered — the landing-offset scheme instead watches which of the
+    // construct's two PROVEN landing offsets the frame actually reaches, so "true" stays
+    // uncovered no matter which single instruction along the way jumped or fell through.
     if !ready("compound_ternary_test_replaying_only_the_else_branch_never_falsely_covers_true") {
         return;
     }
     let src = "def f(a, b):\n    return 1 if a and b else 2\n";
     let mut replay = ReplayMap::new();
     replay.insert("f".to_string(), vec![vec![json!(1), json!(0)]]);
-    let rec = record_file(src, 0, &replay, RecordFlags::default()).expect("record");
+    // A `--value-domain` admitting only `none` for scalars keeps the always-present floor-of-one
+    // generated case (`gen_inputs` never drops below 1 even at `--inputs 0`) at `(None, None)` —
+    // falsy, so it can't independently prove "true" and mask what THIS test is actually about:
+    // whether the (1, 0) replay alone gets misattributed.
+    let domain = pylens::generate::ValueDomain::parse(r#"{"scalars": ["none"]}"#).expect("domain");
+    let rec = record_file(
+        src,
+        0,
+        &replay,
+        RecordFlags { domain: Some(&domain), ..RecordFlags::default() },
+    )
+    .expect("record");
     let f = find_function(&rec.functions, "f");
     let branches = f.branches.as_ref().expect("branches present");
     let bp = branch_report(branches, BranchKind::Ternary, 2);
     assert_ne!(status_of(bp, "true"), "covered", "no observation proves the true branch ran");
-    assert_eq!(status_of(bp, "true"), "unobservable_line_granularity");
-    assert_eq!(status_of(bp, "false"), "unobservable_line_granularity");
+    assert_eq!(status_of(bp, "true"), "uncovered");
+    assert_eq!(status_of(bp, "false"), "covered");
 }
 
 #[test]
 fn compound_or_ternary_test_is_never_falsely_covered() {
+    // Positive companion to the sibling `and` test: two replays exercising BOTH outcomes must
+    // both resolve `covered` — the landing-offset scheme's proof holds either direction.
     if !ready("compound_or_ternary_test_is_never_falsely_covered") {
         return;
     }
@@ -534,15 +726,16 @@ fn compound_or_ternary_test_is_never_falsely_covered() {
     let f = find_function(&rec.functions, "f");
     let branches = f.branches.as_ref().expect("branches present");
     let bp = branch_report(branches, BranchKind::Ternary, 2);
-    assert_eq!(status_of(bp, "true"), "unobservable_line_granularity");
-    assert_eq!(status_of(bp, "false"), "unobservable_line_granularity");
+    assert_eq!(status_of(bp, "true"), "covered");
+    assert_eq!(status_of(bp, "false"), "covered");
 }
 
 #[test]
 fn test_position_boolop_is_never_permanently_uncovered() {
-    // Before the fix this was reported "uncovered" forever (the worker's `JUMP_IF_*_OR_POP`
-    // chain lookup found nothing, since `if a and b:` compiles plain `POP_JUMP_IF_*`s), which
-    // would make `--cover-branches` burn its whole budget chasing an outcome it can never prove.
+    // Before the landing-offset scheme this was reported `unobservable_line_granularity` forever
+    // (the worker's `JUMP_IF_*_OR_POP` chain lookup found nothing, since `if a and b:` compiles
+    // plain `POP_JUMP_IF_*`s) — now it resolves from the `if`'s own chain, and a small
+    // `--cover-branches` budget covers both outcomes.
     if !ready("test_position_boolop_is_never_permanently_uncovered") {
         return;
     }
@@ -557,10 +750,10 @@ fn test_position_boolop_is_never_permanently_uncovered() {
     let f = find_function(&rec.functions, "f");
     let branches = f.branches.as_ref().expect("branches present");
     let bp = branch_report(branches, BranchKind::BoolOp, 2);
-    assert_ne!(status_of(bp, "short_circuit"), "uncovered");
-    assert_ne!(status_of(bp, "full_evaluation"), "uncovered");
-    assert_eq!(status_of(bp, "short_circuit"), "unobservable_line_granularity");
-    assert_eq!(status_of(bp, "full_evaluation"), "unobservable_line_granularity");
+    assert_ne!(status_of(bp, "short_circuit"), "unobservable_line_granularity");
+    assert_ne!(status_of(bp, "full_evaluation"), "unobservable_line_granularity");
+    assert_eq!(status_of(bp, "short_circuit"), "covered");
+    assert_eq!(status_of(bp, "full_evaluation"), "covered");
 }
 
 #[test]

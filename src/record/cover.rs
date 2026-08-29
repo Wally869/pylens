@@ -139,7 +139,7 @@ fn evidence_status(
         OutcomeEvidence::Line(l) => {
             if lines_seen.contains(&l) { "covered" } else { "uncovered" }
         }
-        OutcomeEvidence::FineGrained(line, ordinal) => {
+        OutcomeEvidence::FineGrained(line, ordinal, _) => {
             if fine_seen.contains(&(line, ordinal, outcome.to_string())) { "covered" } else { "uncovered" }
         }
     }

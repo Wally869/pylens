@@ -44,11 +44,17 @@ pub enum OutcomeEvidence {
     /// handler can be entered from any line inside the `try` body).
     Line(u32),
     /// A same-line construct (ternary, boolop short-circuit, single-line `if x: y`, comprehension
-    /// guard) resolved via opcode-level tracing instead of line arcs — `(line, ordinal)`, where
-    /// `ordinal` disambiguates multiple fine-grained branch points sharing one physical line
-    /// (assigned by encounter order in `analyze::collect::branches::collect_branches`). See
-    /// [`FineTarget`]/[`FineHit`].
-    FineGrained(u32, u32),
+    /// guard, same-line `while`) resolved via opcode-level tracing instead of line arcs — `(line,
+    /// ordinal, compound)`, where `ordinal` disambiguates multiple fine-grained branch points
+    /// sharing one physical line (assigned by encounter order in
+    /// `analyze::collect::branches::collect_branches`), and `compound` tells the worker which
+    /// resolution strategy to use: `false` is the original single-instruction probe (a test whose
+    /// own compiled shape is exactly one `POP_JUMP_IF_*`, or a value-position boolop's
+    /// `JUMP_IF_*_OR_POP` chain); `true` is the landing-offset, multi-instruction/multi-run chain
+    /// resolution (a compound `and`/`or` test, a test-position boolop's own short-circuit signal,
+    /// or a same-line `while`'s loop-rotation-duplicated test) — see `python/worker.py`'s
+    /// `_resolve_landing_chain`. See [`FineTarget`]/[`FineHit`].
+    FineGrained(u32, u32, bool),
     /// No runtime evidence exists at all for this outcome — a branch whose false-arc target
     /// itself isn't known (e.g. an else-less `if` that is a function's last statement, so there
     /// is no line to land on after it). Enumerated like every other outcome, never dropped — the
@@ -65,6 +71,8 @@ pub struct FineTarget {
     pub line: u32,
     pub kind: BranchKind,
     pub ordinal: u32,
+    /// See [`OutcomeEvidence::FineGrained`]'s third field.
+    pub compound: bool,
 }
 
 /// One fine-grained outcome the worker's opcode tracer actually observed during a call — the
@@ -91,10 +99,10 @@ pub fn fine_targets(points: &[BranchPoint]) -> Vec<FineTarget> {
     let mut out = Vec::new();
     for bp in points {
         for o in &bp.outcomes {
-            if let OutcomeEvidence::FineGrained(line, ordinal) = o.evidence
+            if let OutcomeEvidence::FineGrained(line, ordinal, compound) = o.evidence
                 && seen.insert((line, bp.kind, ordinal))
             {
-                out.push(FineTarget { line, kind: bp.kind, ordinal });
+                out.push(FineTarget { line, kind: bp.kind, ordinal, compound });
             }
         }
     }
