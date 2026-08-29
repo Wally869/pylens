@@ -26,6 +26,8 @@ use std::sync::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::model::branch::{FineHit, FineTarget};
+
 #[derive(Serialize)]
 struct Request<'a> {
     source: &'a str,
@@ -43,6 +45,12 @@ struct Request<'a> {
     /// Constructor arguments for `class`.
     #[serde(skip_serializing_if = "Option::is_none")]
     ctor_args: Option<&'a [Value]>,
+    /// Same-line branch points to resolve via opcode-level tracing — see
+    /// [`crate::model::branch::OutcomeEvidence::FineGrained`]. Empty (the common case) means the
+    /// worker never enables opcode tracing, so a function with no same-line constructs pays
+    /// nothing extra.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    fine_targets: &'a [FineTarget],
 }
 
 /// One item of a batched request: positional and keyword-only arguments for a single call
@@ -66,6 +74,9 @@ struct BatchRequest<'a> {
     class: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ctor_args: Option<&'a [Value]>,
+    /// Shared across the whole batch — see [`Request::fine_targets`].
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    fine_targets: &'a [FineTarget],
     batch: Vec<BatchItem<'a>>,
 }
 
@@ -153,6 +164,11 @@ pub struct CallResult {
     /// which turns these into per-branch-outcome coverage.
     #[serde(default)]
     pub arcs: Vec<(u32, u32)>,
+    /// Fine-grained (opcode-resolved) same-line outcomes observed during the call — the response
+    /// counterpart of the request's `fine_targets`. Empty whenever the request sent none. See
+    /// `record::branch_report_for`.
+    #[serde(default)]
+    pub fine_hits: Vec<FineHit>,
 }
 
 /// One `(positional args, keyword-only args)` pair for a batched call — see
@@ -165,29 +181,35 @@ pub trait Sandbox {
     /// Send one already-encoded request to a jailed worker and parse its response.
     fn transport(&self, body: &[u8]) -> Result<CallResult, String>;
 
-    /// Execute free function `fn_name(*args, **kwargs)`.
+    /// Execute free function `fn_name(*args, **kwargs)`. `fine_targets`: same-line branch points
+    /// to resolve via opcode-level tracing — see [`Request::fine_targets`]. Pass `&[]` when the
+    /// function has none (the common case; the worker then never enables opcode tracing).
     fn call(
         &self,
         source: &str,
         fn_name: &str,
         args: &[Value],
         kwargs: &[(String, Value)],
+        fine_targets: &[FineTarget],
     ) -> Result<CallResult, String> {
-        let body = encode_request(source, Some(fn_name), args, kwargs, None, None)?;
+        let body = encode_request(source, Some(fn_name), args, kwargs, None, None, fine_targets)?;
         self.transport(&body)
     }
 
     /// Execute `class(*ctor_args).method(*args, **kwargs)`, capturing receiver pre/post state.
+    /// `input` bundles `(args, kwargs)` — see [`CallInput`] — to keep the argument count under
+    /// clippy's `too_many_arguments` threshold.
     fn call_method(
         &self,
         source: &str,
         class: &str,
         ctor_args: &[Value],
         method: &str,
-        args: &[Value],
-        kwargs: &[(String, Value)],
+        input: CallInput,
+        fine_targets: &[FineTarget],
     ) -> Result<CallResult, String> {
-        let body = encode_request(source, Some(method), args, kwargs, Some(class), Some(ctor_args))?;
+        let (args, kwargs) = input;
+        let body = encode_request(source, Some(method), args, kwargs, Some(class), Some(ctor_args), fine_targets)?;
         self.transport(&body)
     }
 
@@ -201,7 +223,7 @@ pub trait Sandbox {
         class: Option<&str>,
         ctor_args: Option<&[Value]>,
     ) -> Result<CallResult, String> {
-        let body = encode_request(source, None, &[], &[], class, ctor_args)?;
+        let body = encode_request(source, None, &[], &[], class, ctor_args, &[])?;
         self.transport(&body)
     }
 
@@ -218,12 +240,20 @@ pub trait Sandbox {
         inputs: &[CallInput],
         class: Option<&str>,
         ctor_args: Option<&[Value]>,
+        fine_targets: &[FineTarget],
     ) -> Result<Vec<CallResult>, String> {
         inputs
             .iter()
-            .map(|(args, kwargs)| match class {
-                Some(c) => self.call_method(source, c, ctor_args.unwrap_or(&[]), fn_name, args, kwargs),
-                None => self.call(source, fn_name, args, kwargs),
+            .map(|&(args, kwargs)| match class {
+                Some(c) => self.call_method(
+                    source,
+                    c,
+                    ctor_args.unwrap_or(&[]),
+                    fn_name,
+                    (args, kwargs),
+                    fine_targets,
+                ),
+                None => self.call(source, fn_name, args, kwargs, fine_targets),
             })
             .collect()
     }
@@ -236,6 +266,7 @@ fn encode_request(
     kwargs: &[(String, Value)],
     class: Option<&str>,
     ctor_args: Option<&[Value]>,
+    fine_targets: &[FineTarget],
 ) -> Result<Vec<u8>, String> {
     let req = Request {
         source,
@@ -244,6 +275,7 @@ fn encode_request(
         kwargs: kwargs.iter().cloned().collect(),
         class,
         ctor_args,
+        fine_targets,
     };
     serde_json::to_vec(&req).map_err(|e| e.to_string())
 }
@@ -263,12 +295,14 @@ fn encode_batch_request(
     inputs: &[CallInput],
     class: Option<&str>,
     ctor_args: Option<&[Value]>,
+    fine_targets: &[FineTarget],
 ) -> Result<Vec<u8>, String> {
     let req = BatchRequest {
         source,
         fn_name,
         class,
         ctor_args,
+        fine_targets,
         batch: inputs
             .iter()
             .map(|(args, kwargs)| BatchItem {
@@ -561,11 +595,12 @@ impl Sandbox for NsjailPool {
         inputs: &[CallInput],
         class: Option<&str>,
         ctor_args: Option<&[Value]>,
+        fine_targets: &[FineTarget],
     ) -> Result<Vec<CallResult>, String> {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
-        let body = encode_batch_request(source, fn_name, inputs, class, ctor_args)?;
+        let body = encode_batch_request(source, fn_name, inputs, class, ctor_args, fine_targets)?;
         let expected_len = inputs.len();
         self.with_worker(|w| w.exchange_batch(&body, expected_len))
     }
@@ -589,7 +624,7 @@ mod tests {
         let args_b = [json!(3)];
         let kwargs_b = [("flag".to_string(), json!(true))];
         let inputs: [CallInput; 2] = [(&args_a, &[]), (&args_b, &kwargs_b)];
-        let body = encode_batch_request("SRC", "f", &inputs, None, None).unwrap();
+        let body = encode_batch_request("SRC", "f", &inputs, None, None, &[]).unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(value["source"], json!("SRC"));
@@ -609,7 +644,7 @@ mod tests {
         let args = [json!(1)];
         let ctor_args = [json!("x")];
         let inputs: [CallInput; 1] = [(&args, &[])];
-        let body = encode_batch_request("SRC", "m", &inputs, Some("Widget"), Some(&ctor_args)).unwrap();
+        let body = encode_batch_request("SRC", "m", &inputs, Some("Widget"), Some(&ctor_args), &[]).unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(value["class"], json!("Widget"));

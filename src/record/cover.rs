@@ -17,7 +17,7 @@ use serde_json::Value;
 use crate::exec::{CallResult, Sandbox};
 use crate::generate::predicate::{self, LinePredicates, Predicate};
 use crate::generate::{GenInput, ValueDomain, gen_inputs, positional_params};
-use crate::model::branch::OutcomeEvidence;
+use crate::model::branch::{OutcomeEvidence, fine_targets};
 use crate::model::{BranchKind, EffectSignature, Shape};
 
 use super::{Case, CaseSource, GenOptions, build_case, minimize_raised};
@@ -26,10 +26,11 @@ use super::{Case, CaseSource, GenOptions, build_case, minimize_raised};
 #[derive(Debug, Serialize)]
 pub struct BranchOutcomeReport {
     pub outcome: String,
-    /// `covered` (some case's traced arc/line is the evidence for this outcome) | `uncovered`
-    /// (the evidence was never observed) | `unobservable_line_granularity` (line-level tracing
-    /// cannot distinguish this outcome from its siblings — see
-    /// [`crate::model::branch::OutcomeEvidence::Unobservable`]).
+    /// `covered` (some case's traced arc/line/fine-grained opcode hit is the evidence for this
+    /// outcome) | `uncovered` (the evidence was never observed) | `unobservable_line_granularity`
+    /// (no runtime evidence exists at all — see
+    /// [`crate::model::branch::OutcomeEvidence::Unobservable`]; same-line constructs are usually
+    /// `FineGrained` instead, resolved from opcode-level tracing, not this state).
     pub status: String,
     /// Present exactly when `status == "uncovered"`: `"loop_not_run"` (`--cover-branches` wasn't
     /// passed), `"no_synthesizer"` (no handled predicate form covers this outcome, or every
@@ -102,14 +103,14 @@ pub(super) fn branch_report_for(
     if cases.is_empty() || sig.branch_points.is_empty() {
         return None;
     }
-    let (lines_seen, arcs_seen) = seen_sets(cases);
+    let (lines_seen, arcs_seen, fine_seen) = seen_sets(cases);
 
     let mut rollup = BranchCoverage::default();
     let mut reports = Vec::with_capacity(sig.branch_points.len());
     for bp in &sig.branch_points {
         let mut outcomes = Vec::with_capacity(bp.outcomes.len());
         for o in &bp.outcomes {
-            let status = evidence_status(o.evidence, &lines_seen, &arcs_seen);
+            let status = evidence_status(o.evidence, &o.outcome, &lines_seen, &arcs_seen, &fine_seen);
             match status {
                 "covered" => rollup.covered += 1,
                 "uncovered" => rollup.uncovered += 1,
@@ -123,7 +124,13 @@ pub(super) fn branch_report_for(
     Some((reports, rollup))
 }
 
-fn evidence_status(evidence: OutcomeEvidence, lines_seen: &HashSet<u32>, arcs_seen: &HashSet<(u32, u32)>) -> &'static str {
+fn evidence_status(
+    evidence: OutcomeEvidence,
+    outcome: &str,
+    lines_seen: &HashSet<u32>,
+    arcs_seen: &HashSet<(u32, u32)>,
+    fine_seen: &HashSet<(u32, u32, String)>,
+) -> &'static str {
     match evidence {
         OutcomeEvidence::Unobservable => "unobservable_line_granularity",
         OutcomeEvidence::Arc(a, b) => {
@@ -132,32 +139,43 @@ fn evidence_status(evidence: OutcomeEvidence, lines_seen: &HashSet<u32>, arcs_se
         OutcomeEvidence::Line(l) => {
             if lines_seen.contains(&l) { "covered" } else { "uncovered" }
         }
+        OutcomeEvidence::FineGrained(line, ordinal) => {
+            if fine_seen.contains(&(line, ordinal, outcome.to_string())) { "covered" } else { "uncovered" }
+        }
     }
 }
 
-fn seen_sets(cases: &[Case]) -> (HashSet<u32>, HashSet<(u32, u32)>) {
+/// `(lines seen, arcs seen, fine-grained (line, ordinal, outcome) hits seen)` — see `seen_sets`.
+type SeenEvidence = (HashSet<u32>, HashSet<(u32, u32)>, HashSet<(u32, u32, String)>);
+
+fn seen_sets(cases: &[Case]) -> SeenEvidence {
     let lines_seen = cases.iter().flat_map(|c| c.lines.iter().copied()).collect();
     let arcs_seen = cases.iter().flat_map(|c| c.arcs.iter().copied()).collect();
-    (lines_seen, arcs_seen)
+    let fine_seen = cases
+        .iter()
+        .flat_map(|c| c.fine_hits.iter())
+        .map(|h| (h.line, h.ordinal, h.outcome.clone()))
+        .collect();
+    (lines_seen, arcs_seen, fine_seen)
 }
 
 fn covered_count(sig: &EffectSignature, cases: &[Case]) -> usize {
-    let (lines_seen, arcs_seen) = seen_sets(cases);
+    let (lines_seen, arcs_seen, fine_seen) = seen_sets(cases);
     sig.branch_points
         .iter()
         .flat_map(|bp| &bp.outcomes)
-        .filter(|o| evidence_status(o.evidence, &lines_seen, &arcs_seen) == "covered")
+        .filter(|o| evidence_status(o.evidence, &o.outcome, &lines_seen, &arcs_seen, &fine_seen) == "covered")
         .count()
 }
 
 /// Every currently-uncovered *observable* outcome (unobservable-evidence outcomes are excluded —
 /// they can never be confirmed, so the loop has nothing to aim at).
 fn uncovered_outcomes(sig: &EffectSignature, cases: &[Case]) -> Vec<(u32, BranchKind, String)> {
-    let (lines_seen, arcs_seen) = seen_sets(cases);
+    let (lines_seen, arcs_seen, fine_seen) = seen_sets(cases);
     let mut out = Vec::new();
     for bp in &sig.branch_points {
         for o in &bp.outcomes {
-            if evidence_status(o.evidence, &lines_seen, &arcs_seen) == "uncovered" {
+            if evidence_status(o.evidence, &o.outcome, &lines_seen, &arcs_seen, &fine_seen) == "uncovered" {
                 out.push((bp.line, bp.kind, o.outcome.clone()));
             }
         }
@@ -303,11 +321,12 @@ pub(super) fn run_loop(
         CallTarget::Function => None,
         CallTarget::Method { ctor_args, .. } => Some(ctor_args.to_vec()),
     };
+    let fine = fine_targets(&sig.branch_points);
     let call = |pos: &[Value], kw: &[(String, Value)]| -> Result<CallResult, String> {
         match &target {
-            CallTarget::Function => sandbox.call(src, &sig.name, pos, kw),
+            CallTarget::Function => sandbox.call(src, &sig.name, pos, kw, &fine),
             CallTarget::Method { class, ctor_args } => {
-                sandbox.call_method(src, class, ctor_args, &sig.name, pos, kw)
+                sandbox.call_method(src, class, ctor_args, &sig.name, (pos, kw), &fine)
             }
         }
     };

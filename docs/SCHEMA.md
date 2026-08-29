@@ -167,12 +167,20 @@ The signature fields, and also:
   only> }`. The outcome names are construct-specific (`"true"`/`"false"` for `if`/ternary,
   `"enter"`/`"skip"` for `while`, `"iterate"`/`"empty"` for `for`, `"entered"` for
   `except`/`try_else`/`match`, `"short_circuit"`/`"full_evaluation"` for boolops).
-  `unobservable_line_granularity` means line-level tracing cannot distinguish this outcome from
-  its siblings — same-line constructs (ternaries, `and`/`or` short-circuits, single-line `if x: y`
-  bodies, comprehension guards) are always in that state; every other kind is decided from the
-  traced `(prev_line, cur_line)` arcs (or, for `except`/`try_else`/`match`, the traced
-  handler/clause/case line) aggregated over every case. Omitted under the same conditions as
-  `coverage` (no branch points, or no cases).
+  Same-line constructs (ternaries, `and`/`or` short-circuits, single-line `if x: y` bodies,
+  comprehension guards) are resolved from opcode-level tracing the sandbox turns on only for a
+  call whose function has at least one of them (see `python/worker.py`'s `_build_fine_plan`, and
+  `model::branch::OutcomeEvidence::FineGrained`) — a case's evidence for these is which bytecode
+  jump instruction it observed taken vs. not-taken, not a line arc, but the reported `status` is
+  the same three-way `covered`/`uncovered`/`unobservable_line_granularity`. Every other kind is
+  decided from the traced `(prev_line, cur_line)` arcs (or, for `except`/`try_else`/`match`, the
+  traced handler/clause/case line) aggregated over every case.
+  `unobservable_line_granularity` on any kind means no runtime evidence exists at all for this
+  outcome — in practice only an else-less `if`/`while`/`for`'s false/skip/empty arc when the
+  construct is the function's last statement (no line to land on after it), and a same-line
+  `for`/`while` iteration test (out of the opcode-resolvable set — see the `for`/`while` note in
+  `analyze::collect::branches::two_way`). Omitted under the same conditions as `coverage` (no
+  branch points, or no cases).
   - `reason` is present exactly when `status == "uncovered"`, and says why the `record
     --cover-branches` loop (`src/record/cover.rs`) didn't confirm this outcome: `"loop_not_run"`
     (`--cover-branches` wasn't passed — every uncovered outcome carries this reason in plain

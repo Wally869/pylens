@@ -287,6 +287,7 @@ mod tests {
             minimized: None,
             lines: Vec::new(),
             arcs: Vec::new(),
+            fine_hits: Vec::new(),
         }
     }
 
@@ -307,6 +308,7 @@ mod tests {
             minimized: None,
             lines: Vec::new(),
             arcs: Vec::new(),
+            fine_hits: Vec::new(),
         }
     }
 
@@ -327,6 +329,7 @@ mod tests {
             minimized: None,
             lines: Vec::new(),
             arcs: Vec::new(),
+            fine_hits: Vec::new(),
         }
     }
 

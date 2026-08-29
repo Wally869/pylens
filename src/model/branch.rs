@@ -3,11 +3,18 @@
 //! function's observed cases turn these into `covered` / `uncovered` /
 //! `unobservable_line_granularity`). Not part of the static JSON contract — `EffectSignature`
 //! keeps `branch_points` with `#[serde(skip)]`, exactly like `body_lines`.
+//!
+//! [`OutcomeEvidence::FineGrained`] outcomes (ternaries, boolop short-circuits, single-line
+//! `if x: y`, comprehension guards) need opcode-level evidence the sandbox's tracer only
+//! collects on request — see [`FineTarget`]/[`FineHit`] and `python/worker.py`'s
+//! `_fine_grained` plan.
 
-use serde::Serialize;
+use std::collections::HashSet;
+
+use serde::{Deserialize, Serialize};
 
 /// The closed set of branch-point constructs pylens enumerates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BranchKind {
     If,
@@ -36,10 +43,62 @@ pub enum OutcomeEvidence {
     /// A traced line on its own — used where no single "from" line exists (e.g. an `except`
     /// handler can be entered from any line inside the `try` body).
     Line(u32),
-    /// Line-level tracing cannot distinguish this outcome from its siblings: same-line
-    /// constructs (ternaries, short-circuit boolops, inline `if x: y`, comprehension guards).
-    /// Enumerated like every other outcome, never dropped — the accounting stays closed.
+    /// A same-line construct (ternary, boolop short-circuit, single-line `if x: y`, comprehension
+    /// guard) resolved via opcode-level tracing instead of line arcs — `(line, ordinal)`, where
+    /// `ordinal` disambiguates multiple fine-grained branch points sharing one physical line
+    /// (assigned by encounter order in `analyze::collect::branches::collect_branches`). See
+    /// [`FineTarget`]/[`FineHit`].
+    FineGrained(u32, u32),
+    /// No runtime evidence exists at all for this outcome — a branch whose false-arc target
+    /// itself isn't known (e.g. an else-less `if` that is a function's last statement, so there
+    /// is no line to land on after it). Enumerated like every other outcome, never dropped — the
+    /// accounting stays closed.
     Unobservable,
+}
+
+/// One same-line branch point the sandbox is asked to resolve via opcode-level tracing for one
+/// call — see [`OutcomeEvidence::FineGrained`]. `kind` tells the worker which detection strategy
+/// to use (a single test-and-jump for [`BranchKind::Ternary`]/[`BranchKind::InlineIf`]/
+/// [`BranchKind::ComprehensionIf`], a short-circuit jump chain for [`BranchKind::BoolOp`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct FineTarget {
+    pub line: u32,
+    pub kind: BranchKind,
+    pub ordinal: u32,
+}
+
+/// One fine-grained outcome the worker's opcode tracer actually observed during a call — the
+/// wire-response counterpart of [`FineTarget`]. `kind` isn't echoed back: `(line, ordinal)` is
+/// only unique WITHIN one [`crate::analyze::collect::branches::ProbeCategory`] (ordinals are
+/// assigned per `(line, category)`, not per line alone — a ternary and a value-position boolop on
+/// the same line can both be ordinal 0), but `outcome`'s name is disjoint across categories
+/// (`"true"`/`"false"` vs. `"short_circuit"`/`"full_evaluation"`), so `(line, ordinal, outcome)`
+/// together — the key `record::cover::evidence_status` actually matches on — never collides.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct FineHit {
+    pub line: u32,
+    pub ordinal: u32,
+    pub outcome: String,
+}
+
+/// Every distinct [`FineTarget`] a function's branch points need resolved — deduplicated per
+/// `(line, kind, ordinal)`, since a fine-grained branch point's two outcomes share one such
+/// triple. Keying on `(line, ordinal)` alone would collide across different
+/// `analyze::collect::branches::ProbeCategory`s that legitimately share an ordinal on one line
+/// (see [`FineHit`]) and silently drop one of them.
+pub fn fine_targets(points: &[BranchPoint]) -> Vec<FineTarget> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for bp in points {
+        for o in &bp.outcomes {
+            if let OutcomeEvidence::FineGrained(line, ordinal) = o.evidence
+                && seen.insert((line, bp.kind, ordinal))
+            {
+                out.push(FineTarget { line, kind: bp.kind, ordinal });
+            }
+        }
+    }
+    out
 }
 
 /// One possible outcome of a branch point, and the evidence that would prove it happened.

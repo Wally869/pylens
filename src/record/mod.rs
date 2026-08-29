@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::exec::{CallInput, CallResult, HarnessError, NsjailPool, Sandbox};
 use crate::generate::{GenInput, ValueDomain, gen_inputs};
+use crate::model::branch::fine_targets;
 use crate::model::{DefKind, EffectSignature, Import};
 use crate::shrink::shrink_case;
 use crate::{analyze_source, imports_of};
@@ -415,6 +416,7 @@ fn function_cases(
     replay_inputs: &[Vec<Value>],
     probe_module_load: bool,
 ) -> Result<(Option<HarnessError>, Vec<Case>, cover::CoverContext), String> {
+    let fine = fine_targets(&sig.branch_points);
     let mut cases = Vec::new();
     let inputs = gen_inputs(sig, opts.base_inputs, opts.domain);
     let mut first_chunk = true;
@@ -426,7 +428,7 @@ fn function_cases(
             .iter()
             .map(|input| (input.positional.as_slice(), input.kwargs.as_slice()))
             .collect();
-        let results = sandbox.call_batch(src, &sig.name, &call_inputs, None, None)?;
+        let results = sandbox.call_batch(src, &sig.name, &call_inputs, None, None, &fine)?;
         if probe_module_load && first_chunk
             && let Some(err) = uniform_setup_failure(&results)
         {
@@ -437,7 +439,7 @@ fn function_cases(
             let mut case = build_case(sig, input, None, result, CaseSource::Generated);
             if case.outcome == "raised" {
                 case.minimized = minimize_raised(&case, input, opts.domain, |pos, kw| {
-                    sandbox.call(src, &sig.name, pos, kw)
+                    sandbox.call(src, &sig.name, pos, kw, &fine)
                 })?;
             }
             cases.push(case);
@@ -448,7 +450,7 @@ fn function_cases(
             .iter()
             .map(|tuple| (tuple.as_slice(), EMPTY_KWARGS))
             .collect();
-        let results = sandbox.call_batch(src, &sig.name, &call_inputs, None, None)?;
+        let results = sandbox.call_batch(src, &sig.name, &call_inputs, None, None, &fine)?;
         for (tuple, result) in replay_inputs.iter().zip(&results) {
             let input = GenInput {
                 positional: tuple.clone(),
@@ -535,6 +537,7 @@ fn method_record(
         ));
     }
 
+    let fine = fine_targets(&sig.branch_points);
     let mut cases = Vec::new();
     let inputs = gen_inputs(sig, opts.base_inputs, opts.domain);
     for chunk in inputs.chunks(BATCH_SIZE) {
@@ -546,12 +549,12 @@ fn method_record(
             .map(|input| (input.positional.as_slice(), input.kwargs.as_slice()))
             .collect();
         let results =
-            sandbox.call_batch(src, &sig.name, &call_inputs, Some(class), Some(&ctor_args))?;
+            sandbox.call_batch(src, &sig.name, &call_inputs, Some(class), Some(&ctor_args), &fine)?;
         for (input, result) in chunk.iter().zip(&results) {
             let mut case = build_case(sig, input, Some(ctor_args.clone()), result, CaseSource::Generated);
             if case.outcome == "raised" {
                 case.minimized = minimize_raised(&case, input, opts.domain, |pos, kw| {
-                    sandbox.call_method(src, class, &ctor_args, &sig.name, pos, kw)
+                    sandbox.call_method(src, class, &ctor_args, &sig.name, (pos, kw), &fine)
                 })?;
             }
             cases.push(case);
@@ -563,7 +566,7 @@ fn method_record(
             .map(|tuple| (tuple.as_slice(), EMPTY_KWARGS))
             .collect();
         let results =
-            sandbox.call_batch(src, &sig.name, &call_inputs, Some(class), Some(&ctor_args))?;
+            sandbox.call_batch(src, &sig.name, &call_inputs, Some(class), Some(&ctor_args), &fine)?;
         for (tuple, result) in replay_inputs.iter().zip(&results) {
             let input = GenInput {
                 positional: tuple.clone(),

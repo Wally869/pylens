@@ -21,6 +21,15 @@ one of the arguments. Non-JSON-native types (set / tuple / dict / objects) use a
 so they round-trip and compare stably. Harness/setup failures are returned as a structured
 `error` ({stage, kind, message, module?}), never as a bare string.
 
+Line-level coverage (`lines`, `arcs`) comes from a plain `sys.settrace` line tracer scoped to the
+module under test. A request can additionally carry `fine_targets` — same-line branch points
+(ternaries, boolop short-circuits, single-line `if x: y`, comprehension guards) that line arcs
+can't tell apart — which turns on opcode-level tracing (`f_trace_opcodes`) for the traced call and
+resolves each one to a `fine_hits` entry by watching which bytecode offset a probed jump
+instruction lands on next. See `_build_fine_plan`/`_make_tracer`. Empty `fine_targets` (the
+common case: most functions have no same-line construct) costs nothing — opcode tracing only
+turns on when the request asks for it.
+
 Resource exhaustion (`MemoryError`, `RecursionError`, a call that exceeds the wall-time budget)
 is a sandbox artifact, not the function's behavior — it is reported through `error` with
 `stage="resource"`, distinct from a genuine `raise` inside the function (which stays on
@@ -35,6 +44,7 @@ import time
 import select
 import signal
 import contextlib
+import dis
 
 
 def deserialize(v):
@@ -95,6 +105,7 @@ def base_response():
         "error": None,
         "lines": [],
         "arcs": [],
+        "fine_hits": [],
     }
 
 
@@ -138,7 +149,130 @@ def _state(obj):
         return None
 
 
-def _make_tracer(executed, arcs):
+_COMPREHENSION_CODE_NAMES = ("<listcomp>", "<setcomp>", "<dictcomp>", "<genexpr>", "<lambda>")
+_FINE_TEST_OPS = ("POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE")
+_FINE_CHAIN_OPS = ("JUMP_IF_FALSE_OR_POP", "JUMP_IF_TRUE_OR_POP")
+
+
+def _nested_fine_codes(code):
+    """`code` plus every nested code object CPython compiles as part of the SAME function body —
+    comprehensions, generator expressions, lambdas — never a nested `def`'s own code object,
+    matching `analyze::collect::branches`, which never descends into one either."""
+    yield code
+    for const in code.co_consts:
+        if hasattr(const, "co_code") and const.co_name in _COMPREHENSION_CODE_NAMES:
+            yield from _nested_fine_codes(const)
+
+
+def _build_fine_plan(top_code, fine_targets):
+    """Resolve every requested same-line branch point (`{"line", "kind", "ordinal"}`, from
+    `model::branch::FineTarget`) to the bytecode probe that proves which outcome fires — see
+    `OutcomeEvidence::FineGrained`. Returns `{(id(code), offset): entry}` where `entry` is what
+    `_resolve_fine_probe` needs to classify the outcome once the *next* opcode executed in that
+    frame is known.
+
+    `ternary` / `inline_if` / `comprehension_if`: CPython compiles the test to a single
+    `POP_JUMP_IF_FALSE`/`POP_JUMP_IF_TRUE` — landing on its jump target is the negative outcome,
+    falling through to the next instruction the positive one (or the reverse for `_IF_TRUE`).
+
+    `bool_op` (the wire form of `BranchKind::BoolOp`): `and`/`or` compile to a *chain* of
+    `JUMP_IF_*_OR_POP` instructions that all share one target offset (the end of the whole boolop
+    expression) — one per operand but the last.
+    Any instruction in the chain jumping means `short_circuit`; falling through the chain's LAST
+    instruction (reaching the final operand) means `full_evaluation`.
+
+    Multiple fine-grained points of the same kind can share one physical line (rare — e.g. two
+    ternaries on one line via a tuple literal); `ordinal` (assigned by AST left-to-right order in
+    `collect_branches`) picks the `ordinal`-th matching instruction/chain in bytecode offset
+    order, which is the same order for ordinary code. A target whose ordinal has no bytecode
+    counterpart (should not happen — every ordinal comes from an actual AST node) is silently
+    unresolved rather than guessed: its outcome then just never appears in `fine_hits`, and the
+    outcome stays whatever the aggregate evidence already says.
+    """
+    wanted = {}
+    for t in fine_targets:
+        wanted.setdefault(t["line"], {}).setdefault(t["kind"], []).append(t["ordinal"])
+
+    test_groups = {}
+    chain_groups = {}
+    fallthrough_of = {}
+    for code in _nested_fine_codes(top_code):
+        instrs = list(dis.get_instructions(code))
+        current_line = None
+        for i, instr in enumerate(instrs):
+            # `starts_line` is only set on the FIRST instruction of a source line — every later
+            # instruction compiled from that same line (e.g. the `POP_JUMP_IF_FALSE` after the
+            # `LOAD_FAST` that pushed its operand) carries `None` and inherits the line of the
+            # most recent instruction that did set it.
+            if instr.starts_line is not None:
+                current_line = instr.starts_line
+            next_offset = instrs[i + 1].offset if i + 1 < len(instrs) else None
+            fallthrough_of[(id(code), instr.offset)] = next_offset
+            if current_line is None:
+                continue
+            if instr.opname in _FINE_TEST_OPS:
+                test_groups.setdefault(current_line, []).append((code, instr))
+            elif instr.opname in _FINE_CHAIN_OPS:
+                chain_groups.setdefault(current_line, {}).setdefault(
+                    instr.argval, []
+                ).append((code, instr))
+
+    plan = {}
+    for line, by_kind in wanted.items():
+        single_ordinals = by_kind.get("ternary", []) + by_kind.get("inline_if", []) + by_kind.get(
+            "comprehension_if", []
+        )
+        group = sorted(test_groups.get(line, []), key=lambda ci: ci[1].offset)
+        for ordinal in single_ordinals:
+            if ordinal >= len(group):
+                continue
+            code, instr = group[ordinal]
+            fallthrough = fallthrough_of.get((id(code), instr.offset))
+            if fallthrough is None:
+                continue
+            plan[(id(code), instr.offset)] = {
+                "line": line,
+                "ordinal": ordinal,
+                "jump_target": instr.argval,
+                "true_on_fallthrough": instr.opname == "POP_JUMP_IF_FALSE",
+            }
+        chains = sorted(
+            chain_groups.get(line, {}).values(),
+            key=lambda members: min(ci[1].offset for ci in members),
+        )
+        for ordinal in by_kind.get("bool_op", []):
+            if ordinal >= len(chains):
+                continue
+            chain = sorted(chains[ordinal], key=lambda ci: ci[1].offset)
+            last_offset = chain[-1][1].offset
+            for code, instr in chain:
+                fallthrough = fallthrough_of.get((id(code), instr.offset))
+                if fallthrough is None:
+                    continue
+                plan[(id(code), instr.offset)] = {
+                    "line": line,
+                    "ordinal": ordinal,
+                    "jump_target": instr.argval,
+                    "boolop_last": instr.offset == last_offset,
+                }
+    return plan
+
+
+def _resolve_fine_probe(entry, next_offset, fine_hits):
+    """Classify one probe's outcome from `next_offset` — the offset the SAME frame executed right
+    after the probed instruction (adjacent by construction: a jump/fallthrough always lands on
+    the very next instruction actually run, so no other frame's event can appear in between)."""
+    jumped = next_offset == entry["jump_target"]
+    if "true_on_fallthrough" in entry:
+        true_hit = (not jumped) if entry["true_on_fallthrough"] else jumped
+        fine_hits.add((entry["line"], entry["ordinal"], "true" if true_hit else "false"))
+    elif jumped:
+        fine_hits.add((entry["line"], entry["ordinal"], "short_circuit"))
+    elif entry["boolop_last"]:
+        fine_hits.add((entry["line"], entry["ordinal"], "full_evaluation"))
+
+
+def _make_tracer(executed, arcs, fine_plan, fine_hits):
     """A `sys.settrace` global trace function that records every line reached in the compiled
     module under test (`co_filename == "<pylens>"`), skipping frames from anywhere else (stdlib,
     the harness itself). Python 3.10 predates `sys.monitoring` (3.12+), so `settrace` is the only
@@ -149,8 +283,19 @@ def _make_tracer(executed, arcs):
     test line straight to whatever follows it does). `prev_line` is tracked per-frame (keyed by
     `id(frame)`, cleared on `return`) so a call into another function under trace never creates a
     spurious arc from the caller's line into the callee's.
+
+    `fine_plan` (built by `_build_fine_plan`, empty unless the request carried `fine_targets`):
+    when non-empty, every traced frame also gets `f_trace_opcodes = True` for its WHOLE lifetime
+    — opcode-level tracing is gated per REQUEST (a function with no same-line branch constructs
+    never pays for it), not per line, since a probed instruction's resolution must be the frame's
+    very next opcode event with no gap. On each `opcode` event: resolve any probe left pending
+    from the previous event via `_resolve_fine_probe`, then arm a new pending entry if the
+    instruction about to run is itself a probe (`fine_plan` keyed by `(id(frame.f_code),
+    offset)`, so nested code objects — comprehensions, lambdas — never collide with the outer
+    function's offsets).
     """
     last_line = {}
+    pending = {}
 
     def local_trace(frame, event, arg):
         if event == "line":
@@ -161,8 +306,17 @@ def _make_tracer(executed, arcs):
             if prev is not None:
                 arcs.add((prev, cur))
             last_line[key] = cur
+        elif event == "opcode":
+            fid = id(frame)
+            entry = pending.pop(fid, None)
+            if entry is not None:
+                _resolve_fine_probe(entry, frame.f_lasti, fine_hits)
+            probe = fine_plan.get((id(frame.f_code), frame.f_lasti))
+            if probe is not None:
+                pending[fid] = probe
         elif event == "return":
             last_line.pop(id(frame), None)
+            pending.pop(id(frame), None)
         return local_trace
 
     def global_trace(frame, event, arg):
@@ -172,6 +326,8 @@ def _make_tracer(executed, arcs):
         # calling back into "<pylens>" code still traces: every new call re-enters here.
         if frame.f_code.co_filename != "<pylens>":
             return None
+        if fine_plan:
+            frame.f_trace_opcodes = True
         return local_trace
 
     return global_trace
@@ -212,6 +368,7 @@ def run_request(req, ns=None):
         kwargs_in = req.get("kwargs", {})
         class_name = req.get("class")
         ctor_in = req.get("ctor_args", [])
+        fine_targets_in = req.get("fine_targets", [])
     except Exception as e:
         resp["error"] = make_error("bad_request", type(e).__name__, str(e))
         return resp
@@ -275,6 +432,17 @@ def run_request(req, ns=None):
         resp["error"] = exc_error("setup", e)
         return resp
 
+    # The fine-grained (opcode-level) tracing plan — built once per call, empty (and so free)
+    # unless the request asked for same-line branch points. A failure here is a harness bug, not
+    # the function's behavior, so it's reported like any other setup failure rather than let
+    # `_build_fine_plan` raising land inside the traced-call `except` below and get mistaken for
+    # the function itself raising.
+    try:
+        fine_plan = _build_fine_plan(fn.__code__, fine_targets_in) if fine_targets_in else {}
+    except Exception as e:
+        resp["error"] = exc_error("harness", e)
+        return resp
+
     # Snapshot the arguments in the SAME tagged encoding used for args_post, so mutation
     # detection compares like-with-like (not the raw plain-JSON input against tagged output).
     t0 = time.perf_counter_ns()
@@ -290,11 +458,12 @@ def run_request(req, ns=None):
     err_buf = io.StringIO()
     executed_lines = set()
     executed_arcs = set()
+    fine_hits = set()
     try:
         with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
             # Traced region: the call under test and (if it returns a generator) draining it —
             # not the module load or the receiver construction above.
-            sys.settrace(_make_tracer(executed_lines, executed_arcs))
+            sys.settrace(_make_tracer(executed_lines, executed_arcs, fine_plan, fine_hits))
             try:
                 ret = fn(*args, **kwargs)
                 if hasattr(ret, "__next__"):  # drain generators/iterators to realize effects
@@ -333,6 +502,10 @@ def run_request(req, ns=None):
 
     resp["lines"] = sorted(executed_lines)
     resp["arcs"] = sorted(executed_arcs)
+    resp["fine_hits"] = [
+        {"line": line, "ordinal": ordinal, "outcome": outcome}
+        for line, ordinal, outcome in sorted(fine_hits)
+    ]
 
     out_text = out_buf.getvalue()
     if out_text:

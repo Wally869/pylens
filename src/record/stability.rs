@@ -82,15 +82,18 @@ pub(super) fn stabilize_cases(
             .map(|(c, kw)| (c.input.as_slice(), kw.as_slice()))
             .collect();
         let ctor_args_for_batch = alive[0].ctor_args.clone();
+        // A stability re-run's traces are discarded (see the doc comment above) — fine-grained
+        // hits would be too, so `fine_targets` stays empty and the worker never pays
+        // opcode-tracing overhead here.
         let results = match &ctor_args_for_batch {
             Some(ctor_args) => {
                 let class = sig
                     .owner
                     .as_deref()
                     .ok_or_else(|| format!("method {:?} has no owning class", sig.name))?;
-                sandbox.call_batch(src, &sig.name, &call_inputs, Some(class), Some(ctor_args))?
+                sandbox.call_batch(src, &sig.name, &call_inputs, Some(class), Some(ctor_args), &[])?
             }
-            None => sandbox.call_batch(src, &sig.name, &call_inputs, None, None)?,
+            None => sandbox.call_batch(src, &sig.name, &call_inputs, None, None, &[])?,
         };
 
         let mut next_alive = Vec::with_capacity(alive.len());
@@ -152,6 +155,7 @@ mod tests {
             minimized: None,
             lines: Vec::new(),
             arcs: Vec::new(),
+            fine_hits: Vec::new(),
         }
     }
 
@@ -172,6 +176,7 @@ mod tests {
             minimized: None,
             lines: Vec::new(),
             arcs: Vec::new(),
+            fine_hits: Vec::new(),
         }
     }
 

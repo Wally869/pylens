@@ -335,7 +335,7 @@ fn raised_case_carries_a_smaller_minimized_input() {
     use pylens::exec::Sandbox;
     let sandbox = pylens::exec::Nsjail::new();
     let result = sandbox
-        .call(src, "f", &minimized.input, &[])
+        .call(src, "f", &minimized.input, &[], &[])
         .expect("re-raise minimized input");
     assert!(!result.ok, "minimized input should still raise");
     assert_eq!(

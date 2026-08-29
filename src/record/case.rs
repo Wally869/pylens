@@ -10,6 +10,7 @@ use serde_json::{Map, Value};
 
 use crate::exec::{CallResult, HarnessError};
 use crate::generate::{GenInput, keyword_only_params, positional_params};
+use crate::model::branch::FineHit;
 use crate::model::{EffectSignature, Import, ReturnKind};
 use crate::validate::observable_io_kind;
 
@@ -95,6 +96,11 @@ pub struct Case {
     /// per-function aggregate, not something a consumer needs per case (noisy at N cases).
     #[serde(skip)]
     pub arcs: Vec<(u32, u32)>,
+    /// Fine-grained (opcode-resolved) same-line outcomes this case's call observed — an input to
+    /// `super::cover::branch_report_for`, same as `arcs`. Empty unless the call's request
+    /// carried `fine_targets` (only functions with same-line branch constructs do).
+    #[serde(skip)]
+    pub fine_hits: Vec<FineHit>,
 }
 
 /// A function's executed-line coverage, aggregated over all its cases: how many of its
@@ -381,6 +387,7 @@ pub(super) fn build_case(
             minimized: None,
             lines: r.lines.clone(),
             arcs: r.arcs.clone(),
+            fine_hits: r.fine_hits.clone(),
         };
     }
     if r.ok {
@@ -400,6 +407,7 @@ pub(super) fn build_case(
             minimized: None,
             lines: r.lines.clone(),
             arcs: r.arcs.clone(),
+            fine_hits: r.fine_hits.clone(),
         }
     } else {
         Case {
@@ -418,6 +426,7 @@ pub(super) fn build_case(
             minimized: None,
             lines: r.lines.clone(),
             arcs: r.arcs.clone(),
+            fine_hits: r.fine_hits.clone(),
         }
     }
 }
