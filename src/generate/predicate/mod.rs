@@ -17,11 +17,15 @@ pub enum Derivation {
     /// `p % k`, `k` a literal integer modulus.
     Mod(i64),
     /// A loop-bound element of the parameter (`for x in p:`, or a tuple unpack of that whole
-    /// element, `for t in p: a, b = t` / `for a, b in p:`). `field` is `None` for a plain,
-    /// un-unpacked loop target and `Some(i)` for field `i` of an `arity`-wide tuple unpack;
-    /// `arity` is 1 for a plain target. Synthesis builds a one-element list around the field's
-    /// value (see [`element_value`]) — never the empty list, so the `for` body actually runs.
-    Element { field: Option<usize>, arity: usize },
+    /// element, `for t in p: a, b = t` / `for a, b in p:`; also the target of `for x in p[k:]:`,
+    /// `for i, x in enumerate(p):`, `for x in reversed(p)/sorted(p):`). `field` is `None` for a
+    /// plain, un-unpacked loop target and `Some(i)` for field `i` of an `arity`-wide tuple unpack;
+    /// `arity` is 1 for a plain target. `leading` is the minimum count of filler elements that
+    /// must precede the target in the synthesized container — nonzero only for a parameter slice's
+    /// literal lower bound (`p[k:]`), zero for every other source. Synthesis builds a
+    /// `leading`-filler-then-target list around the field's value (see [`element_value`]) — the
+    /// target slot is never empty, so the `for` body actually runs.
+    Element { field: Option<usize>, arity: usize, leading: usize },
     /// `p.split(sep)` (`sep` a string literal) or `p.split()` (`None`, whitespace) — the whole
     /// result list, bound to a local by `parts = p.split(sep)`.
     Split(Option<String>),

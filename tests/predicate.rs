@@ -149,7 +149,7 @@ fn plain_loop_element_synthesizes_a_one_element_list() {
     match &preds[0] {
         Predicate::Compare { param, deriv, .. } => {
             assert_eq!(param, "commands");
-            assert_eq!(*deriv, predicate::Derivation::Element { field: None, arity: 1 });
+            assert_eq!(*deriv, predicate::Derivation::Element { field: None, arity: 1, leading: 0 });
         }
         other => panic!("expected a Compare over the loop element, got {other:?}"),
     }
@@ -172,7 +172,7 @@ fn tuple_unpacked_for_target_synthesizes_a_matching_tagged_tuple() {
     match &preds[0] {
         Predicate::Compare { param, deriv, .. } => {
             assert_eq!(param, "pairs");
-            assert_eq!(*deriv, predicate::Derivation::Element { field: Some(0), arity: 2 });
+            assert_eq!(*deriv, predicate::Derivation::Element { field: Some(0), arity: 2, leading: 0 });
         }
         other => panic!("expected a Compare over field 0 of the tuple element, got {other:?}"),
     }
@@ -202,7 +202,7 @@ fn assign_unpack_of_a_whole_loop_element_binds_each_field() {
     match &preds[0] {
         Predicate::Compare { param, deriv, .. } => {
             assert_eq!(param, "transactions");
-            assert_eq!(*deriv, predicate::Derivation::Element { field: Some(0), arity: 2 });
+            assert_eq!(*deriv, predicate::Derivation::Element { field: Some(0), arity: 2, leading: 0 });
         }
         other => panic!("expected a Compare over field 0 of the unpacked element, got {other:?}"),
     }
@@ -355,4 +355,127 @@ fn rebind_with_an_unrecognized_rhs_clears_the_prior_alias() {
     let src = "def f(s):\n    n = len(s)\n    n = hash(s)\n    if n > 3:\n        pass\n";
     let preds = predicates_at(src, "f", &["s"], 4);
     assert!(preds.is_empty(), "the rebind to hash(s) must clear the stale `n = len(s)` alias: {preds:?}");
+}
+
+#[test]
+fn slice_lower_bound_puts_the_element_inside_the_sliced_region() {
+    let src = "def f(commands):\n    for command in commands[1:]:\n        if command == 'N':\n            pass\n";
+    let preds = predicates_at(src, "f", &["commands"], 3);
+    assert_eq!(preds.len(), 1);
+    match &preds[0] {
+        Predicate::Compare { param, deriv, .. } => {
+            assert_eq!(param, "commands");
+            assert_eq!(*deriv, predicate::Derivation::Element { field: None, arity: 1, leading: 1 });
+        }
+        other => panic!("expected a Compare over the sliced loop element, got {other:?}"),
+    }
+    let shape = Shape::any_seq();
+    let satisfy = predicate::synthesize(&preds[0], true, &shape).expect("satisfying value");
+    let violate = predicate::synthesize(&preds[0], false, &shape).expect("violating value");
+    let satisfy_items = satisfy.as_array().expect("array");
+    assert_eq!(satisfy_items.len(), 2, "one filler element ahead of the target: {satisfy_items:?}");
+    assert_eq!(satisfy_items[1], "N");
+    let violate_items = violate.as_array().expect("array");
+    assert_eq!(violate_items.len(), 2);
+    assert_ne!(violate_items[1], "N");
+}
+
+#[test]
+fn slice_upper_bound_synthesizes_a_single_leading_element() {
+    let src = "def f(commands):\n    for command in commands[:3]:\n        if command == 'N':\n            pass\n";
+    let preds = predicates_at(src, "f", &["commands"], 3);
+    assert_eq!(preds.len(), 1);
+    match &preds[0] {
+        Predicate::Compare { param, deriv, .. } => {
+            assert_eq!(param, "commands");
+            assert_eq!(*deriv, predicate::Derivation::Element { field: None, arity: 1, leading: 0 });
+        }
+        other => panic!("expected a Compare over the sliced loop element, got {other:?}"),
+    }
+}
+
+#[test]
+fn slice_both_bounds_synthesizes_the_start_offset_element() {
+    let src = "def f(commands):\n    for command in commands[1:3]:\n        if command == 'N':\n            pass\n";
+    let preds = predicates_at(src, "f", &["commands"], 3);
+    assert_eq!(preds.len(), 1);
+    match &preds[0] {
+        Predicate::Compare { param, deriv, .. } => {
+            assert_eq!(param, "commands");
+            assert_eq!(*deriv, predicate::Derivation::Element { field: None, arity: 1, leading: 1 });
+        }
+        other => panic!("expected a Compare over the sliced loop element, got {other:?}"),
+    }
+}
+
+#[test]
+fn slice_with_negative_or_empty_bounds_stays_unhandled() {
+    let negative = "def f(commands):\n    for command in commands[-1:]:\n        if command == 'N':\n            pass\n";
+    let preds = predicates_at(negative, "f", &["commands"], 3);
+    assert!(preds.is_empty(), "a negative slice bound is refused: {preds:?}");
+
+    let empty = "def f(commands):\n    for command in commands[3:1]:\n        if command == 'N':\n            pass\n";
+    let preds = predicates_at(empty, "f", &["commands"], 3);
+    assert!(preds.is_empty(), "start >= end can never iterate, so the target is refused: {preds:?}");
+
+    let stepped = "def f(commands):\n    for command in commands[1::2]:\n        if command == 'N':\n            pass\n";
+    let preds = predicates_at(stepped, "f", &["commands"], 3);
+    assert!(preds.is_empty(), "a step is refused: {preds:?}");
+}
+
+#[test]
+fn enumerate_binds_the_element_name_not_the_index() {
+    let src = "def f(commands):\n    for i, command in enumerate(commands):\n        if command == 'N':\n            pass\n";
+    let preds = predicates_at(src, "f", &["commands"], 3);
+    assert_eq!(preds.len(), 1);
+    match &preds[0] {
+        Predicate::Compare { param, deriv, .. } => {
+            assert_eq!(param, "commands");
+            assert_eq!(*deriv, predicate::Derivation::Element { field: None, arity: 1, leading: 0 });
+        }
+        other => panic!("expected a Compare over the enumerate element, got {other:?}"),
+    }
+}
+
+#[test]
+fn enumerate_with_a_literal_start_still_binds_the_element() {
+    let src = "def f(commands):\n    for i, command in enumerate(commands, 1):\n        if command == 'N':\n            pass\n";
+    let preds = predicates_at(src, "f", &["commands"], 3);
+    assert_eq!(preds.len(), 1);
+    assert!(matches!(&preds[0], Predicate::Compare { deriv: predicate::Derivation::Element { .. }, .. }));
+}
+
+#[test]
+fn reversed_binds_the_target_as_a_plain_element() {
+    let src = "def f(commands):\n    for command in reversed(commands):\n        if command == 'N':\n            pass\n";
+    let preds = predicates_at(src, "f", &["commands"], 3);
+    assert_eq!(preds.len(), 1);
+    match &preds[0] {
+        Predicate::Compare { param, deriv, .. } => {
+            assert_eq!(param, "commands");
+            assert_eq!(*deriv, predicate::Derivation::Element { field: None, arity: 1, leading: 0 });
+        }
+        other => panic!("expected a Compare over the reversed element, got {other:?}"),
+    }
+}
+
+#[test]
+fn sorted_binds_the_target_as_a_plain_element() {
+    let src = "def f(commands):\n    for command in sorted(commands):\n        if command == 'N':\n            pass\n";
+    let preds = predicates_at(src, "f", &["commands"], 3);
+    assert_eq!(preds.len(), 1);
+    match &preds[0] {
+        Predicate::Compare { param, deriv, .. } => {
+            assert_eq!(param, "commands");
+            assert_eq!(*deriv, predicate::Derivation::Element { field: None, arity: 1, leading: 0 });
+        }
+        other => panic!("expected a Compare over the sorted element, got {other:?}"),
+    }
+}
+
+#[test]
+fn zip_of_two_parameters_stays_unhandled() {
+    let src = "def f(xs, ys):\n    for x, y in zip(xs, ys):\n        if x == 'N':\n            pass\n";
+    let preds = predicates_at(src, "f", &["xs", "ys"], 3);
+    assert!(preds.is_empty(), "zip is explicitly out of scope: {preds:?}");
 }

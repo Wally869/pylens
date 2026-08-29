@@ -46,13 +46,13 @@ fn split_join_value(sep: &Option<String>, count: i64) -> Option<Value> {
 
 /// Wrap a synthesized string method value (the receiver's own value) around the underlying
 /// parameter, per `deriv`: `Direct` returns it as-is, `Element` matches [`element_value`]'s
-/// one-element-list convention, `SplitElement` returns the value itself as the whole parameter
-/// string (so splitting it back out yields exactly this one part) -- `None` if the value would
-/// contain the separator, which would produce more than one part.
+/// leading-filler-then-target convention, `SplitElement` returns the value itself as the whole
+/// parameter string (so splitting it back out yields exactly this one part) -- `None` if the
+/// value would contain the separator, which would produce more than one part.
 fn wrap_receiver_value(deriv: &Derivation, elem: Value) -> Option<Value> {
     match deriv {
         Derivation::Direct => Some(elem),
-        Derivation::Element { field, arity } => {
+        Derivation::Element { field, arity, leading } => {
             let item = if *arity <= 1 {
                 elem
             } else {
@@ -64,7 +64,9 @@ fn wrap_receiver_value(deriv: &Derivation, elem: Value) -> Option<Value> {
                 fields[field] = elem;
                 json!({ "__t__": "tuple", "items": fields })
             };
-            Some(Value::Array(vec![item]))
+            let mut arr = vec![json!(0); *leading];
+            arr.push(item);
+            Some(Value::Array(arr))
         }
         Derivation::SplitElement(sep) => {
             let s = elem.as_str()?;
@@ -125,7 +127,7 @@ fn compare_value(deriv: &Derivation, op: CmpOp, literal: &Literal, shape: &Shape
             let Literal::Int(r) = literal else { return None };
             mod_value(*k, op, *r, want)
         }
-        Derivation::Element { field, arity } => element_value(*field, *arity, op, literal, want),
+        Derivation::Element { field, arity, leading } => element_value(*leading, *field, *arity, op, literal, want),
         // A comparison directly against the split list, or a bare split element, isn't a
         // recognized extracted form (extraction only reaches `Compare` through `len()`, which
         // yields `SplitLen`/`SplitElementLen`) -- only `Truthy`/`ForIter` target `Split`, and only
@@ -240,11 +242,12 @@ fn index_value(idx: i64, op: CmpOp, literal: &Literal, want: bool) -> Option<Val
     Some(Value::Array(arr))
 }
 
-/// A one-element list value for a Derivation::Element: arity <= 1 (a plain, un-unpacked
-/// loop target) wraps the field's own value directly; arity > 1 wraps a tagged tuple with
-/// field's slot set to the field value and every other slot filled with a neutral 0. Always
-/// non-empty by construction.
-fn element_value(field: Option<usize>, arity: usize, op: CmpOp, literal: &Literal, want: bool) -> Option<Value> {
+/// A `leading`-filler-then-target list value for a Derivation::Element: arity <= 1 (a plain,
+/// un-unpacked loop target) wraps the field's own value directly; arity > 1 wraps a tagged tuple
+/// with field's slot set to the field value and every other slot filled with a neutral 0. `leading`
+/// zero-filler elements precede the target so a parameter-slice's lower bound still reaches it.
+/// The target slot is always present by construction.
+fn element_value(leading: usize, field: Option<usize>, arity: usize, op: CmpOp, literal: &Literal, want: bool) -> Option<Value> {
     let elem = match literal {
         Literal::Int(c) => json!(synth_int(op, *c, want)),
         Literal::Str(s) => str_eq_ne(op, s, want)?,
@@ -260,7 +263,9 @@ fn element_value(field: Option<usize>, arity: usize, op: CmpOp, literal: &Litera
         fields[field] = elem;
         json!({ "__t__": "tuple", "items": fields })
     };
-    Some(Value::Array(vec![item]))
+    let mut arr = vec![json!(0); leading];
+    arr.push(item);
+    Some(Value::Array(arr))
 }
 
 fn mod_value(k: i64, op: CmpOp, r: i64, want: bool) -> Option<Value> {
@@ -446,14 +451,17 @@ pub fn synthesize(pred: &Predicate, want: bool, shape: &Shape) -> Option<Value> 
     }
 }
 
-/// A two-element counterpart of a one-element list built by `element_value`/`wrap_receiver_value`
-/// -- the target item moves to the second slot, a neutral filler (matching `arity`) takes the
-/// first. `None` if `one` isn't the one-element array those builders always produce.
+/// A counterpart of the list built by `element_value`/`wrap_receiver_value`, one slot further out
+/// -- the target item moves back a slot behind one extra neutral filler (matching `arity`), past
+/// any leading fillers those builders already placed. `None` if `one` isn't an array those
+/// builders produced (always non-empty).
 fn two_element_variant(one: Value, arity: usize) -> Option<Value> {
     let Value::Array(mut items) = one else { return None };
     let target = items.pop()?;
     let filler = if arity <= 1 { json!(0) } else { json!({ "__t__": "tuple", "items": vec![json!(0); arity] }) };
-    Some(Value::Array(vec![filler, target]))
+    items.push(filler);
+    items.push(target);
+    Some(Value::Array(items))
 }
 
 /// A second synthesized value for `pred`/`want`, distinct from `synthesize`'s -- `None` when no
@@ -471,8 +479,8 @@ pub fn synthesize_variant(pred: &Predicate, want: bool, shape: &Shape) -> Option
         Predicate::Compare { deriv: Derivation::Direct, op: CmpOp::Eq, literal: Literal::Int(c), .. } if !want => {
             Some(json!(c - 1))
         }
-        Predicate::Compare { deriv: Derivation::Element { field, arity }, op, literal, .. } => {
-            let one = element_value(*field, *arity, *op, literal, want)?;
+        Predicate::Compare { deriv: Derivation::Element { field, arity, leading }, op, literal, .. } => {
+            let one = element_value(*leading, *field, *arity, *op, literal, want)?;
             two_element_variant(one, *arity)
         }
         Predicate::StrMethod { deriv: deriv @ Derivation::Element { arity, .. }, method, arg, .. } => {

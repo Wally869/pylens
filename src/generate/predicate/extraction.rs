@@ -148,6 +148,11 @@ pub(super) fn walk(
                 match iter_deriv {
                     Some((param, Derivation::Direct)) => bind_for_target(&f.target, &param, aliases),
                     Some((param, Derivation::Split(sep))) => bind_for_target_split(&f.target, &param, &sep, aliases),
+                    None => {
+                        if let Some(source) = extract_loop_source(&f.iter, params, aliases) {
+                            bind_for_derived_target(&f.target, &source, aliases);
+                        }
+                    }
                     _ => {}
                 }
                 let flag_candidate = direct_param
@@ -287,16 +292,121 @@ fn detect_loop_flag(
 pub(super) fn bind_for_target(target: &ast::Expr, param: &str, aliases: &mut Aliases) {
     match target {
         ast::Expr::Name(n) => {
-            aliases.insert(n.id.to_string(), (param.to_string(), Derivation::Element { field: None, arity: 1 }));
+            aliases.insert(
+                n.id.to_string(),
+                (param.to_string(), Derivation::Element { field: None, arity: 1, leading: 0 }),
+            );
         }
         ast::Expr::Tuple(t) if !t.elts.is_empty() && t.elts.iter().all(|e| matches!(e, ast::Expr::Name(_))) => {
             let arity = t.elts.len();
             for (i, elt) in t.elts.iter().enumerate() {
                 let ast::Expr::Name(n) = elt else { unreachable!("checked all Name above") };
-                aliases.insert(n.id.to_string(), (param.to_string(), Derivation::Element { field: Some(i), arity }));
+                aliases.insert(
+                    n.id.to_string(),
+                    (param.to_string(), Derivation::Element { field: Some(i), arity, leading: 0 }),
+                );
             }
         }
         _ => {}
+    }
+}
+
+/// A parameter-derived iterable recognized as a loop source beyond [`extract_deriv`]'s plain-alias
+/// forms: a literal-bounded slice of a parameter, or a name-preserving wrapper call around one.
+/// Binds only the loop target's per-element derivation — no [`Predicate::ForIter`], since the
+/// container itself isn't what a branch test compares against here.
+enum LoopSource {
+    /// `p[start:end]`: `start`/`end` literal non-negative ints or omitted, no `step`, and
+    /// `start < end` when both are given. `leading` is `start` (0 when omitted).
+    Sliced { param: String, leading: usize },
+    /// `enumerate(p)` / `enumerate(p, start)` (`start` a literal int) — the index name stays
+    /// unbound; only the element name binds.
+    Enumerate { param: String },
+    /// `reversed(p)` / `sorted(p)` — order doesn't matter for a single synthesized element.
+    Wrapped { param: String },
+}
+
+/// Recognize one of [`LoopSource`]'s forms in a `for ... in <iter>:` header. `None` for anything
+/// else (zip, dict methods, a nested combination like `reversed(p[1:])`), which stays unbound.
+fn extract_loop_source(iter: &ast::Expr, params: &[String], aliases: &Aliases) -> Option<LoopSource> {
+    match iter {
+        ast::Expr::Subscript(sub) => {
+            let ast::Expr::Slice(slice) = sub.slice.as_ref() else { return None };
+            if slice.step.is_some() {
+                return None;
+            }
+            let ast::Expr::Name(n) = sub.value.as_ref() else { return None };
+            let param = resolve_param(n.id.as_str(), params, aliases)?;
+            let start = match slice.lower.as_deref() {
+                None => 0,
+                Some(e) => literal_int(e).filter(|v| *v >= 0)?,
+            };
+            if let Some(e) = slice.upper.as_deref() {
+                let end = literal_int(e).filter(|v| *v >= 0)?;
+                if start >= end {
+                    return None;
+                }
+            }
+            Some(LoopSource::Sliced { param, leading: start as usize })
+        }
+        ast::Expr::Call(call) => {
+            if !call.arguments.keywords.is_empty() {
+                return None;
+            }
+            let ast::Expr::Name(fname) = call.func.as_ref() else { return None };
+            match fname.id.as_str() {
+                "enumerate" => match &*call.arguments.args {
+                    [ast::Expr::Name(recv)] => {
+                        Some(LoopSource::Enumerate { param: resolve_param(recv.id.as_str(), params, aliases)? })
+                    }
+                    [ast::Expr::Name(recv), start] => {
+                        literal_int(start)?;
+                        Some(LoopSource::Enumerate { param: resolve_param(recv.id.as_str(), params, aliases)? })
+                    }
+                    _ => None,
+                },
+                "reversed" | "sorted" => {
+                    let [ast::Expr::Name(recv)] = &*call.arguments.args else { return None };
+                    Some(LoopSource::Wrapped { param: resolve_param(recv.id.as_str(), params, aliases)? })
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Bind a for loop's target to a [`LoopSource`]'s element — a plain `Name` target for `Sliced`
+/// and `Wrapped`, the second name of a two-name `Tuple` target (the first, the index, stays
+/// unbound) for `Enumerate`. Any other target shape stays unbound.
+fn bind_for_derived_target(target: &ast::Expr, source: &LoopSource, aliases: &mut Aliases) {
+    match source {
+        LoopSource::Sliced { param, leading } => {
+            if let ast::Expr::Name(n) = target {
+                aliases.insert(
+                    n.id.to_string(),
+                    (param.clone(), Derivation::Element { field: None, arity: 1, leading: *leading }),
+                );
+            }
+        }
+        LoopSource::Enumerate { param } => {
+            if let ast::Expr::Tuple(t) = target
+                && let [ast::Expr::Name(_idx), ast::Expr::Name(elem)] = t.elts.as_slice()
+            {
+                aliases.insert(
+                    elem.id.to_string(),
+                    (param.clone(), Derivation::Element { field: None, arity: 1, leading: 0 }),
+                );
+            }
+        }
+        LoopSource::Wrapped { param } => {
+            if let ast::Expr::Name(n) = target {
+                aliases.insert(
+                    n.id.to_string(),
+                    (param.clone(), Derivation::Element { field: None, arity: 1, leading: 0 }),
+                );
+            }
+        }
     }
 }
 
@@ -356,10 +466,13 @@ pub(super) fn bind_assign(
                 _ => None,
             };
             match rhs {
-                Some((param, Derivation::Element { field: None, arity: 1 })) => {
+                Some((param, Derivation::Element { field: None, arity: 1, leading })) => {
                     let arity = names.len();
                     for (i, name) in names.iter().enumerate() {
-                        aliases.insert(name.to_string(), (param.clone(), Derivation::Element { field: Some(i), arity }));
+                        aliases.insert(
+                            name.to_string(),
+                            (param.clone(), Derivation::Element { field: Some(i), arity, leading }),
+                        );
                     }
                 }
                 _ => {
