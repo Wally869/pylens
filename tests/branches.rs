@@ -906,3 +906,104 @@ fn cover_branches_on_an_opaque_predicate_stays_uncovered_with_no_synthesizer() {
     assert_eq!(status_of(bp, "true"), "uncovered");
     assert_eq!(reason_of(bp, "true"), Some("no_synthesizer"));
 }
+
+// ---------------------------------------------------------------------------------------------
+// `--cover-branches`'s merged-override synthesis for a `BoolOp` conjunction/disjunction: an
+// outcome that needs more than one operand's own predicate satisfied together in ONE input
+// (an `and`'s `true`, an `or`'s `false`) — see `record::cover::merge_group`/`want_for_outcome`.
+// `startswith`/`endswith` targets (not plain integer comparisons): a numeric threshold gets
+// GUARD-SAMPLED (`analyze::collect::guards` seeds the literal and its ±1 neighbors per parameter
+// independently), and the plain ranked initial batch's own per-parameter candidate cross-product
+// was empirically found to stumble onto an arbitrary numeric conjunction on its own once the
+// budget is large enough — which would make the test pass whether or not the merge fix is
+// present. An arbitrary literal string prefix/suffix has no such shortcut: nothing in the seed
+// corpus or guard sampling ever manufactures `"zqx..."`, so `true`/`false` can only be covered by
+// an override that deliberately builds it — confirmed by reverting this change locally and
+// re-running these exact sources: `true`/`false` stayed `uncovered` (`candidates_exhausted`) even
+// at a budget of 300, while `full_evaluation` (which only needs the FIRST operand, not a merge —
+// see `want_for_outcome`'s doc) was already `covered` before the fix, as expected.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn and_conjunction_true_needs_the_merged_pair() {
+    // 130 (not a smaller budget): the initial ranked batch off two `Str` parameters' combined
+    // seed corpus alone can run past 100 cases before the cover loop gets a turn — see
+    // `LEN_EQ_SRC`'s doc for the same headroom concern with one parameter; two multiplies it.
+    if !ready("and_conjunction_true_needs_the_merged_pair") {
+        return;
+    }
+    let src = "def f(a, b):\n    if a.startswith(\"zqx\") and b.endswith(\"vwq\"):\n        return 1\n    return 0\n";
+    let rec = record_file(
+        src,
+        130,
+        &ReplayMap::new(),
+        RecordFlags { cover_branches: true, ..RecordFlags::default() },
+    )
+    .expect("record");
+    let f = find_function(&rec.functions, "f");
+    let branches = f.branches.as_ref().expect("branches present");
+    let if_bp = branch_report(branches, BranchKind::If, 2);
+    assert_eq!(status_of(if_bp, "true"), "covered");
+    let boolop_bp = branch_report(branches, BranchKind::BoolOp, 2);
+    // `full_evaluation` only needs the FIRST operand true (`a.startswith("zqx")`) — reachable off
+    // the existing single-predicate path alone, not a discriminator for this change on its own,
+    // but it must still end up `covered`.
+    assert_eq!(status_of(boolop_bp, "full_evaluation"), "covered");
+    // `short_circuit` needs only the FIRST operand at the opposite polarity — same existing path.
+    assert_eq!(status_of(boolop_bp, "short_circuit"), "covered");
+}
+
+#[test]
+fn or_disjunction_false_needs_the_merged_pair() {
+    // Each operand's usual (default-generated) value already makes it TRUE (`not
+    // x.startswith("zqx")` holds for virtually every generated string) — so `true` is trivially
+    // reachable without any synthesis. The discriminating outcome is `false`, which needs BOTH
+    // operands false at once: `a.startswith("zqx")` AND `b.startswith("zqx")` — the exact mirror
+    // of the `and` case above, reached through `or`'s own merge branch (`want == group.and` with
+    // `group.and == false`).
+    if !ready("or_disjunction_false_needs_the_merged_pair") {
+        return;
+    }
+    let src =
+        "def f(a, b):\n    if not a.startswith(\"zqx\") or not b.startswith(\"zqx\"):\n        return 1\n    return 0\n";
+    let rec = record_file(
+        src,
+        130,
+        &ReplayMap::new(),
+        RecordFlags { cover_branches: true, ..RecordFlags::default() },
+    )
+    .expect("record");
+    let f = find_function(&rec.functions, "f");
+    let branches = f.branches.as_ref().expect("branches present");
+    let if_bp = branch_report(branches, BranchKind::If, 2);
+    assert_eq!(status_of(if_bp, "true"), "covered");
+    assert_eq!(status_of(if_bp, "false"), "covered");
+}
+
+#[test]
+fn conjunction_over_the_same_parameter_never_falsely_covers_via_merge() {
+    // Both operands name the SAME parameter (`a`) — `merge_group` refuses to combine them (no
+    // constraint solving over one parameter's value), so `true` must never be reported `covered`
+    // by a merged guess. The interval is also empty (`> 1_000_010` and `< 1_000_000` can never
+    // both hold), so this also pins that an unsatisfiable conjunction is never falsely covered.
+    if !ready("conjunction_over_the_same_parameter_never_falsely_covers_via_merge") {
+        return;
+    }
+    let src = "def f(a):\n    if a > 1000010 and a < 1000000:\n        return 1\n    return 0\n";
+    let rec = record_file(
+        src,
+        60,
+        &ReplayMap::new(),
+        RecordFlags { cover_branches: true, ..RecordFlags::default() },
+    )
+    .expect("record");
+    let f = find_function(&rec.functions, "f");
+    let branches = f.branches.as_ref().expect("branches present");
+    let if_bp = branch_report(branches, BranchKind::If, 2);
+    assert_ne!(status_of(if_bp, "true"), "covered");
+    // Each single-predicate override IS individually synthesizable (`a > 1_000_010` alone, or
+    // `a < 1_000_000` alone) — the loop tries and exhausts them, it just never gets a candidate
+    // that satisfies both at once, since the merge that would build one refuses same-parameter
+    // operands outright.
+    assert_eq!(reason_of(if_bp, "true"), Some("candidates_exhausted"));
+}

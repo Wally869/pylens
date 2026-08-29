@@ -2,7 +2,7 @@
 //! string-method, negation, container-membership, locals-derived, and two-parameter-coordination
 //! forms, plus one still-unhandled form to confirm it correctly falls back to no synthesizer.
 
-use pylens::generate::predicate::{self, LinePredicates, Predicate};
+use pylens::generate::predicate::{self, BoolOpGroup, LinePredicates, Predicate};
 use pylens::model::Shape;
 use ruff_source_file::LineIndex;
 
@@ -15,7 +15,7 @@ fn predicates_at(src: &str, fn_name: &str, params: &[&str], line: u32) -> Vec<Pr
     let param_names: Vec<String> = params.iter().map(|s| s.to_string()).collect();
     let preds = predicate::collect_predicates(body, &line_index, &param_names);
     match preds.get(&line) {
-        Some(LinePredicates::Test(ps)) => ps.clone(),
+        Some(LinePredicates::Test { flat, .. }) => flat.clone(),
         Some(LinePredicates::ForIter(p)) => vec![p.clone()],
         None => Vec::new(),
     }
@@ -478,4 +478,64 @@ fn zip_of_two_parameters_stays_unhandled() {
     let src = "def f(xs, ys):\n    for x, y in zip(xs, ys):\n        if x == 'N':\n            pass\n";
     let preds = predicates_at(src, "f", &["xs", "ys"], 3);
     assert!(preds.is_empty(), "zip is explicitly out of scope: {preds:?}");
+}
+
+/// Same setup as [`predicates_at`], but returns the line's [`BoolOpGroup`] instead of the flat
+/// predicate list — see `record::cover`'s merged-override synthesis.
+fn boolop_group_at(src: &str, fn_name: &str, params: &[&str], line: u32) -> Option<BoolOpGroup> {
+    let parsed = pylens::parse::parse_source(src).expect("parse");
+    let body = predicate::find_function_body(parsed.syntax(), fn_name, None).expect("function body");
+    let line_index = LineIndex::from_source_text(src);
+    let param_names: Vec<String> = params.iter().map(|s| s.to_string()).collect();
+    let preds = predicate::collect_predicates(body, &line_index, &param_names);
+    match preds.get(&line) {
+        Some(LinePredicates::Test { boolop, .. }) => boolop.clone(),
+        _ => None,
+    }
+}
+
+#[test]
+fn flat_and_test_groups_both_operands_in_order() {
+    let src = "def f(a, b):\n    if a > 3 and b < 2:\n        pass\n";
+    let group = boolop_group_at(src, "f", &["a", "b"], 2).expect("boolop group");
+    assert!(group.and, "`and` must record its own sense");
+    assert_eq!(group.operands.len(), 2);
+    assert_eq!(group.operands[0].len(), 1);
+    assert_eq!(group.operands[0][0].param(), "a");
+    assert_eq!(group.operands[1].len(), 1);
+    assert_eq!(group.operands[1][0].param(), "b");
+}
+
+#[test]
+fn flat_or_test_records_the_or_sense() {
+    let src = "def f(a, b):\n    if a > 3 or b < 2:\n        pass\n";
+    let group = boolop_group_at(src, "f", &["a", "b"], 2).expect("boolop group");
+    assert!(!group.and, "`or` must record its own (non-`and`) sense");
+    assert_eq!(group.operands.len(), 2);
+}
+
+#[test]
+fn three_way_and_chain_flattens_into_one_group() {
+    // `a and b and c` parses as ONE `BoolOp` node with three values (Python already flattens a
+    // run of the same operator) — no nesting to reject here.
+    let src = "def f(a, b, c):\n    if a > 3 and b < 2 and c == 5:\n        pass\n";
+    let group = boolop_group_at(src, "f", &["a", "b", "c"], 2).expect("boolop group");
+    assert!(group.and);
+    assert_eq!(group.operands.len(), 3);
+}
+
+#[test]
+fn mixed_and_or_nesting_stays_ungrouped() {
+    // `a and b or c` nests as `BoolOp(Or, [BoolOp(And, [a, b]), c])` — a mixed operator chain
+    // this extension deliberately doesn't group (see `extract_boolop_group`'s doc).
+    let src = "def f(a, b, c):\n    if a and b or c:\n        pass\n";
+    let group = boolop_group_at(src, "f", &["a", "b", "c"], 2);
+    assert!(group.is_none(), "mixed and/or nesting must not produce a flat group: {group:?}");
+}
+
+#[test]
+fn non_boolop_test_has_no_group() {
+    let src = "def f(a):\n    if a > 3:\n        pass\n";
+    let group = boolop_group_at(src, "f", &["a"], 2);
+    assert!(group.is_none());
 }

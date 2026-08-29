@@ -102,8 +102,26 @@ pub enum Predicate {
 /// predicates (`If`/`While`), or a `for` loop's iterated-parameter predicate.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LinePredicates {
-    Test(Vec<Predicate>),
+    /// `flat` is every predicate the test decomposes to (unchanged from before the boolop-group
+    /// extension — still what drives "any one operand" outcomes: an `and`'s `false`, an `or`'s
+    /// `true`, a `BoolOp`'s own `short_circuit`). `boolop` is `Some` only when the WHOLE test is
+    /// one flat `BoolOp` node (`a and b and c` — Python already merges a run of the same operator
+    /// into one node; a mixed `and`/`or` nests, and grouping a nested mix isn't handled by this
+    /// extension) — see [`BoolOpGroup`], which `record::cover` merges for the outcome that needs
+    /// every operand satisfied together (an `and`'s `true`/`full_evaluation`, an `or`'s
+    /// `false`/`full_evaluation`).
+    Test { flat: Vec<Predicate>, boolop: Option<BoolOpGroup> },
     ForIter(Predicate),
+}
+
+/// A single, flat top-level `BoolOp` test's operands, each decomposed to its own predicate list
+/// (in AST left-to-right order) — see [`LinePredicates::Test`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoolOpGroup {
+    /// `true` for `and` (every operand must hold together for the conjunction to hold), `false`
+    /// for `or` (every operand must FAIL together for the disjunction to fail).
+    pub and: bool,
+    pub operands: Vec<Vec<Predicate>>,
 }
 
 /// Local-name → derivation aliases discovered so far in a sequential walk of a function body: a

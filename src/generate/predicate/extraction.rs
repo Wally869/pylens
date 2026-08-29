@@ -11,7 +11,9 @@ use ruff_python_ast as ast;
 use ruff_source_file::LineIndex;
 use ruff_text_size::{Ranged, TextSize};
 
-use super::{Aliases, BoolInits, CmpOp, Derivation, FlagPreds, LinePredicates, Literal, Predicate, StrMethod};
+use super::{
+    Aliases, BoolInits, BoolOpGroup, CmpOp, Derivation, FlagPreds, LinePredicates, Literal, Predicate, StrMethod,
+};
 
 /// name resolved to a parameter: either name itself is one, or Aliases maps it directly
 /// (not through len/index/mod) to one.
@@ -499,9 +501,32 @@ pub(super) fn insert_test(
     flag_preds: &FlagPreds,
 ) {
     let preds = extract(test, params, aliases, flag_preds);
-    if !preds.is_empty() {
-        out.insert(line, LinePredicates::Test(preds));
+    let boolop = extract_boolop_group(test, params, aliases, flag_preds);
+    if !preds.is_empty() || boolop.is_some() {
+        out.insert(line, LinePredicates::Test { flat: preds, boolop });
     }
+}
+
+/// `test`'s own [`BoolOpGroup`], when `test` is itself a single, flat `BoolOp` node — see
+/// [`LinePredicates::Test`]. Each operand is decomposed with the same [`extract`] used for the
+/// flat predicate list, so an operand that is a chained comparison or a negation still yields its
+/// own predicate(s); `record::cover`'s merge only ever uses an operand whose list is exactly one
+/// predicate long, but every operand is reported here regardless — narrowing that is the merge's
+/// job, not extraction's.
+fn extract_boolop_group(
+    test: &ast::Expr,
+    params: &[String],
+    aliases: &Aliases,
+    flag_preds: &FlagPreds,
+) -> Option<BoolOpGroup> {
+    let ast::Expr::BoolOp(b) = test else { return None };
+    if b.values.iter().any(|v| matches!(v, ast::Expr::BoolOp(_))) {
+        return None;
+    }
+    let and = matches!(b.op, ast::BoolOp::And);
+    let operands: Vec<Vec<Predicate>> =
+        b.values.iter().map(|v| extract(v, params, aliases, flag_preds)).collect();
+    Some(BoolOpGroup { and, operands })
 }
 
 /// Decompose expr into every handled leaf predicate.

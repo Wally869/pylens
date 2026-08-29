@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::exec::{CallResult, Sandbox};
-use crate::generate::predicate::{self, LinePredicates, Predicate};
+use crate::generate::predicate::{self, BoolOpGroup, LinePredicates, Predicate};
 use crate::generate::{GenInput, ValueDomain, gen_inputs, positional_params};
 use crate::model::branch::{OutcomeEvidence, fine_targets};
 use crate::model::{BranchKind, EffectSignature, Shape};
@@ -189,8 +189,72 @@ fn outcome_polarity(kind: BranchKind, outcome: &str) -> Option<bool> {
     }
 }
 
+/// [`outcome_polarity`], extended to [`BranchKind::BoolOp`]'s own `short_circuit`/
+/// `full_evaluation` outcomes — these don't have a fixed per-kind polarity (an `and`'s
+/// `full_evaluation` wants every operand true, an `or`'s wants every operand false), so they
+/// resolve through `line`'s own [`BoolOpGroup`] instead: `full_evaluation` wants every operand at
+/// the group's own sense (`and` → true, `or` → false — exactly what makes the WHOLE expression
+/// true for `and` or false for `or`, so this is also what an enclosing `if`/`while`'s matching
+/// outcome wants — see [`candidate_values`]'s merge trigger); `short_circuit` wants the opposite
+/// (any ONE operand at that polarity already short-circuits, so it stays on the existing
+/// one-predicate-at-a-time path, no merge needed). `None` when `line` has no resolved
+/// [`BoolOpGroup`] (a mixed nested `and`/`or`, or a non-`BoolOp`-only test) — the outcome then
+/// just stays unsynthesizable, never guessed.
+fn want_for_outcome(
+    kind: BranchKind,
+    outcome: &str,
+    predicates: &HashMap<u32, LinePredicates>,
+    line: u32,
+) -> Option<bool> {
+    if kind != BranchKind::BoolOp {
+        return outcome_polarity(kind, outcome);
+    }
+    let Some(LinePredicates::Test { boolop: Some(group), .. }) = predicates.get(&line) else {
+        return None;
+    };
+    match outcome {
+        "full_evaluation" => Some(group.and),
+        "short_circuit" => Some(!group.and),
+        _ => None,
+    }
+}
+
 fn param_shape<'a>(sig: &'a EffectSignature, name: &str) -> Option<&'a Shape> {
     sig.params.iter().find(|p| p.name == name).map(|p| &p.shape)
+}
+
+/// The single override set formed by unioning every operand of `group` at `operand_want`
+/// simultaneously — the outcome that needs the WHOLE conjunction/disjunction to resolve one way
+/// rather than any single operand: an `and`'s `true`/`full_evaluation` (`operand_want = true`), an
+/// `or`'s `false`/`full_evaluation` (`operand_want = false`). `None` when any operand doesn't
+/// decompose to exactly one predicate (no single value represents "this whole operand holds" —
+/// the smallest form this merge supports), when two operands constrain the SAME parameter (no
+/// constraint solving here — a second override would just overwrite the first, silently dropping
+/// one operand's own requirement, so this refuses outright rather than guess), or when any
+/// operand's value can't be synthesized at all or is excluded by `--value-domain`.
+fn merge_group(
+    sig: &EffectSignature,
+    group: &BoolOpGroup,
+    operand_want: bool,
+    domain: Option<&ValueDomain>,
+) -> Option<Vec<(String, Value)>> {
+    let mut merged = Vec::with_capacity(group.operands.len());
+    let mut seen_params = HashSet::new();
+    for operand in &group.operands {
+        let [pred] = operand.as_slice() else { return None };
+        if !seen_params.insert(pred.param()) {
+            return None;
+        }
+        let shape = param_shape(sig, pred.param())?;
+        let value = predicate::synthesize(pred, operand_want, shape)?;
+        if let Some(d) = domain
+            && !d.allows(&value)
+        {
+            return None;
+        }
+        merged.push((pred.param().to_string(), value));
+    }
+    (!merged.is_empty()).then_some(merged)
 }
 
 /// Every override set (each a set of `(parameter name, value)` overrides that must be applied
@@ -225,7 +289,11 @@ fn override_sets(sig: &EffectSignature, pred: &Predicate, want: bool) -> Vec<Vec
 /// Every override set the predicates at `line` produce for `want`, admissible under `domain` — a
 /// set with any domain-excluded value is dropped, counting as unsynthesizable for this outcome
 /// only if every one of its predicate's sets is dropped (see the module doc's `no_synthesizer`
-/// reason).
+/// reason). When `line`'s test is a single flat `BoolOp` (see [`BoolOpGroup`]) and `want` matches
+/// the group's own sense (`want == group.and`), also appends [`merge_group`]'s single merged
+/// candidate — the case that needs every operand satisfied TOGETHER (an `and`'s `true`, an `or`'s
+/// `false`, and the equivalent `BoolOp` `full_evaluation` outcome via [`want_for_outcome`]), which
+/// no single predicate's own override set can produce.
 fn candidate_values(
     sig: &EffectSignature,
     predicates: &HashMap<u32, LinePredicates>,
@@ -233,8 +301,9 @@ fn candidate_values(
     want: bool,
     domain: Option<&ValueDomain>,
 ) -> Vec<Vec<(String, Value)>> {
-    let preds: Vec<&Predicate> = match predicates.get(&line) {
-        Some(LinePredicates::Test(ps)) => ps.iter().collect(),
+    let entry = predicates.get(&line);
+    let preds: Vec<&Predicate> = match entry {
+        Some(LinePredicates::Test { flat, .. }) => flat.iter().collect(),
         Some(LinePredicates::ForIter(p)) => vec![p],
         None => Vec::new(),
     };
@@ -248,6 +317,12 @@ fn candidate_values(
             }
             out.push(set);
         }
+    }
+    if let Some(LinePredicates::Test { boolop: Some(group), .. }) = entry
+        && want == group.and
+        && let Some(merged) = merge_group(sig, group, group.and, domain)
+    {
+        out.push(merged);
     }
     out
 }
@@ -313,10 +388,15 @@ pub(super) fn run_loop(
 
     for bp in &sig.branch_points {
         for outcome in &bp.outcomes {
-            if !matches!(outcome.evidence, OutcomeEvidence::Arc(..) | OutcomeEvidence::Line(_)) {
+            let targetable = match outcome.evidence {
+                OutcomeEvidence::Arc(..) | OutcomeEvidence::Line(_) => true,
+                OutcomeEvidence::FineGrained(..) => bp.kind == BranchKind::BoolOp,
+                OutcomeEvidence::Unobservable => false,
+            };
+            if !targetable {
                 continue;
             }
-            let Some(want) = outcome_polarity(bp.kind, &outcome.outcome) else { continue };
+            let Some(want) = want_for_outcome(bp.kind, &outcome.outcome, &predicates, bp.line) else { continue };
             if !candidate_values(sig, &predicates, bp.line, want, opts.domain).is_empty() {
                 ctx.synthesizable.insert((bp.line, outcome.outcome.clone()));
             }
@@ -355,7 +435,7 @@ pub(super) fn run_loop(
             if !ctx.synthesizable.contains(&key) || ctx.attempted.contains(&key) {
                 continue;
             }
-            let Some(want) = outcome_polarity(*kind, outcome_name) else { continue };
+            let Some(want) = want_for_outcome(*kind, outcome_name, &predicates, *line) else { continue };
             for overrides in candidate_values(sig, &predicates, *line, want, opts.domain) {
                 if cases.len() >= opts.max_inputs || super::deadline_passed(opts.deadline) {
                     break 'outer;
