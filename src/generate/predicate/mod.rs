@@ -187,6 +187,7 @@ impl Predicate {
 }
 
 mod extraction;
+mod loops;
 mod synthesis;
 
 pub use extraction::{collect_predicates, find_function_body};
