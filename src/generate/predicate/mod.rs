@@ -158,7 +158,7 @@ mod extraction;
 mod synthesis;
 
 pub use extraction::{collect_predicates, find_function_body};
-pub use synthesis::{synthesize, synthesize_pair};
+pub use synthesis::{synthesize, synthesize_pair, synthesize_variant};
 
 #[cfg(test)]
 mod tests;

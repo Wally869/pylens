@@ -159,15 +159,6 @@ fn seen_sets(cases: &[Case]) -> SeenEvidence {
     (lines_seen, arcs_seen, fine_seen)
 }
 
-fn covered_count(sig: &EffectSignature, cases: &[Case]) -> usize {
-    let (lines_seen, arcs_seen, fine_seen) = seen_sets(cases);
-    sig.branch_points
-        .iter()
-        .flat_map(|bp| &bp.outcomes)
-        .filter(|o| evidence_status(o.evidence, &o.outcome, &lines_seen, &arcs_seen, &fine_seen) == "covered")
-        .count()
-}
-
 /// Every currently-uncovered *observable* outcome (unobservable-evidence outcomes are excluded —
 /// they can never be confirmed, so the loop has nothing to aim at).
 fn uncovered_outcomes(sig: &EffectSignature, cases: &[Case]) -> Vec<(u32, BranchKind, String)> {
@@ -202,25 +193,39 @@ fn param_shape<'a>(sig: &'a EffectSignature, name: &str) -> Option<&'a Shape> {
     sig.params.iter().find(|p| p.name == name).map(|p| &p.shape)
 }
 
-/// One predicate's synthesized result: the set of `(parameter name, value)` overrides that must
-/// be applied *together* to one input for the predicate to evaluate to `want` — one entry for
-/// every predicate but [`Predicate::ParamCompare`], which needs both of its parameters' slots
-/// overridden at once.
-fn override_set(sig: &EffectSignature, pred: &Predicate, want: bool) -> Option<Vec<(String, Value)>> {
+/// Every override set (each a set of `(parameter name, value)` overrides that must be applied
+/// *together* to one input for the predicate to evaluate to `want`) `pred` can produce — its
+/// primary synthesized set, plus a second, structurally different variant where one is principled
+/// ([`predicate::synthesize_variant`]) for the still-uncovered outcomes a single deterministic
+/// candidate can never flip (an outer guard the primary candidate can't pass, an adjacent
+/// branch's own candidate landing on the same value). Empty for [`Predicate::ParamCompare`] when
+/// either parameter's shape is unknown or the pair can't be synthesized at all.
+fn override_sets(sig: &EffectSignature, pred: &Predicate, want: bool) -> Vec<Vec<(String, Value)>> {
     if let Predicate::ParamCompare { param_a, deriv_a, op, param_b, deriv_b } = pred {
-        let shape_a = param_shape(sig, param_a)?;
-        let shape_b = param_shape(sig, param_b)?;
-        let (value_a, value_b) = predicate::synthesize_pair(deriv_a, *op, deriv_b, shape_a, shape_b, want)?;
-        return Some(vec![(param_a.clone(), value_a), (param_b.clone(), value_b)]);
+        let (Some(shape_a), Some(shape_b)) = (param_shape(sig, param_a), param_shape(sig, param_b)) else {
+            return Vec::new();
+        };
+        let Some((value_a, value_b)) = predicate::synthesize_pair(deriv_a, *op, deriv_b, shape_a, shape_b, want)
+        else {
+            return Vec::new();
+        };
+        return vec![vec![(param_a.clone(), value_a), (param_b.clone(), value_b)]];
     }
-    let shape = param_shape(sig, pred.param())?;
-    let value = predicate::synthesize(pred, want, shape)?;
-    Some(vec![(pred.param().to_string(), value)])
+    let Some(shape) = param_shape(sig, pred.param()) else { return Vec::new() };
+    let mut out = Vec::new();
+    if let Some(value) = predicate::synthesize(pred, want, shape) {
+        out.push(vec![(pred.param().to_string(), value)]);
+    }
+    if let Some(value) = predicate::synthesize_variant(pred, want, shape) {
+        out.push(vec![(pred.param().to_string(), value)]);
+    }
+    out
 }
 
 /// Every override set the predicates at `line` produce for `want`, admissible under `domain` — a
-/// set with any domain-excluded value is dropped whole, counting as unsynthesizable for this
-/// outcome (see the module doc's `no_synthesizer` reason).
+/// set with any domain-excluded value is dropped, counting as unsynthesizable for this outcome
+/// only if every one of its predicate's sets is dropped (see the module doc's `no_synthesizer`
+/// reason).
 fn candidate_values(
     sig: &EffectSignature,
     predicates: &HashMap<u32, LinePredicates>,
@@ -235,13 +240,14 @@ fn candidate_values(
     };
     let mut out = Vec::new();
     for pred in preds {
-        let Some(set) = override_set(sig, pred, want) else { continue };
-        if let Some(d) = domain
-            && !set.iter().all(|(_, v)| d.allows(v))
-        {
-            continue;
+        for set in override_sets(sig, pred, want) {
+            if let Some(d) = domain
+                && !set.iter().all(|(_, v)| d.allows(v))
+            {
+                continue;
+            }
+            out.push(set);
         }
-        out.push(set);
     }
     out
 }
@@ -274,9 +280,13 @@ pub(super) enum CallTarget<'a> {
     Method { class: &'a str, ctor_args: &'a [Value] },
 }
 
-/// Run the predicate-targeted coverage loop for one function, extending `cases` in place.
-/// Iterates until every observable outcome is covered, an iteration adds no newly covered
-/// outcome, or `cases.len()` reaches `opts.max_inputs` (the TOTAL per-function case budget once
+/// Run the predicate-targeted coverage loop for one function, extending `cases` in place. Each
+/// still-uncovered, synthesizable outcome gets exactly one round of attempts across every override
+/// set its predicate(s) produce — `synthesize` is deterministic, so retrying an outcome whose
+/// candidates already ran would only reproduce the identical, already-failed case, starving
+/// outcomes that budget cut off before their first attempt. Iterates until every observable
+/// outcome is covered, a round attempts nothing new (every uncovered outcome already had its
+/// round), or `cases.len()` reaches `opts.max_inputs` (the TOTAL per-function case budget once
 /// `--cover-branches` is set). A no-op — returns [`CoverContext::not_run`] — when
 /// `opts.cover_branches` is false or the function has no branch points.
 pub(super) fn run_loop(
@@ -335,13 +345,16 @@ pub(super) fn run_loop(
         if cases.len() >= opts.max_inputs || super::deadline_passed(opts.deadline) {
             break;
         }
-        let before_covered = covered_count(sig, cases);
         let uncovered = uncovered_outcomes(sig, cases);
         if uncovered.is_empty() {
             break;
         }
         let mut executed_this_round = false;
         'outer: for (line, kind, outcome_name) in &uncovered {
+            let key = (*line, outcome_name.clone());
+            if !ctx.synthesizable.contains(&key) || ctx.attempted.contains(&key) {
+                continue;
+            }
             let Some(want) = outcome_polarity(*kind, outcome_name) else { continue };
             for overrides in candidate_values(sig, &predicates, *line, want, opts.domain) {
                 if cases.len() >= opts.max_inputs || super::deadline_passed(opts.deadline) {
@@ -354,14 +367,13 @@ pub(super) fn run_loop(
                     case.minimized = minimize_raised(&case, &gi, opts.domain, |pos, kw| call(pos, kw))?;
                 }
                 cases.push(case);
-                ctx.attempted.insert((*line, outcome_name.clone()));
                 executed_this_round = true;
             }
+            // Every candidate for this outcome ran exactly once this round; `synthesize` is
+            // deterministic, so a retry next round would only reproduce the same failed case.
+            ctx.attempted.insert(key);
         }
         if !executed_this_round {
-            break;
-        }
-        if covered_count(sig, cases) <= before_covered {
             break;
         }
     }

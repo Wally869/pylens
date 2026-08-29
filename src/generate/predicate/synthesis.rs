@@ -209,6 +209,15 @@ fn truthy_value(shape: &Shape, want: bool) -> Value {
     if want { json!(1) } else { json!(0) }
 }
 
+/// The seed corpus's *second* value of the wanted truthiness, if one exists -- `truthy_value`
+/// always returns the first, so a still-uncovered `Truthy` outcome that keeps failing with that
+/// value (an outer check comparing against it specifically, say) gets a structurally different
+/// candidate to try instead of the identical one again.
+fn truthy_value_variant(shape: &Shape, want: bool) -> Option<Value> {
+    let cands = seeds::candidates(&effective_shape(shape));
+    cands.iter().filter(|c| is_falsy(&c.value) == !want).nth(1).map(|c| c.value.clone())
+}
+
 fn len_value(shape: &Shape, target_len: i64) -> Value {
     let n = target_len.max(0) as usize;
     match effective_shape(shape) {
@@ -434,6 +443,44 @@ pub fn synthesize(pred: &Predicate, want: bool, shape: &Shape) -> Option<Value> 
         }
         Predicate::Compare { deriv, op, literal, .. } => compare_value(deriv, *op, literal, shape, want),
         Predicate::ParamCompare { .. } => None,
+    }
+}
+
+/// A two-element counterpart of a one-element list built by `element_value`/`wrap_receiver_value`
+/// -- the target item moves to the second slot, a neutral filler (matching `arity`) takes the
+/// first. `None` if `one` isn't the one-element array those builders always produce.
+fn two_element_variant(one: Value, arity: usize) -> Option<Value> {
+    let Value::Array(mut items) = one else { return None };
+    let target = items.pop()?;
+    let filler = if arity <= 1 { json!(0) } else { json!({ "__t__": "tuple", "items": vec![json!(0); arity] }) };
+    Some(Value::Array(vec![filler, target]))
+}
+
+/// A second synthesized value for `pred`/`want`, distinct from `synthesize`'s -- `None` when no
+/// second variant is principled for this predicate form. Exists because `synthesize` is
+/// deterministic: a still-uncovered outcome whose one candidate keeps failing (an outer guard the
+/// one-element list can never pass, an adjacent branch's own candidate landing on the same value)
+/// gets no benefit from retrying the identical value, but can from a structurally different one.
+pub fn synthesize_variant(pred: &Predicate, want: bool, shape: &Shape) -> Option<Value> {
+    match pred {
+        Predicate::Not(inner) => synthesize_variant(inner, !want, shape),
+        Predicate::Truthy { .. } => truthy_value_variant(shape, want),
+        // The boundary-adjacent violator: `synthesize`'s own `!=`-violator is `c + 1`, which can
+        // coincide with an adjacent `elif`'s own equality target -- `c - 1` is a second, usually
+        // independent violator.
+        Predicate::Compare { deriv: Derivation::Direct, op: CmpOp::Eq, literal: Literal::Int(c), .. } if !want => {
+            Some(json!(c - 1))
+        }
+        Predicate::Compare { deriv: Derivation::Element { field, arity }, op, literal, .. } => {
+            let one = element_value(*field, *arity, *op, literal, want)?;
+            two_element_variant(one, *arity)
+        }
+        Predicate::StrMethod { deriv: deriv @ Derivation::Element { arity, .. }, method, arg, .. } => {
+            let elem = str_method_value(*method, arg.as_deref(), want)?;
+            let one = wrap_receiver_value(deriv, elem)?;
+            two_element_variant(one, *arity)
+        }
+        _ => None,
     }
 }
 
