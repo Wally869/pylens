@@ -11,7 +11,7 @@ use ruff_python_ast as ast;
 use ruff_source_file::LineIndex;
 use ruff_text_size::{Ranged, TextSize};
 
-use super::{Aliases, CmpOp, Derivation, LinePredicates, Literal, Predicate, StrMethod};
+use super::{Aliases, BoolInits, CmpOp, Derivation, FlagPreds, LinePredicates, Literal, Predicate, StrMethod};
 
 /// name resolved to a parameter: either name itself is one, or Aliases maps it directly
 /// (not through len/index/mod) to one.
@@ -99,7 +99,9 @@ pub fn collect_predicates(
 ) -> HashMap<u32, LinePredicates> {
     let mut out = HashMap::new();
     let mut aliases = Aliases::new();
-    walk(body, line_index, params, &mut aliases, &mut out);
+    let mut bool_inits = BoolInits::new();
+    let mut flag_preds = FlagPreds::new();
+    walk(body, line_index, params, &mut aliases, &mut bool_inits, &mut flag_preds, &mut out);
     out
 }
 
@@ -108,26 +110,28 @@ pub(super) fn walk(
     li: &LineIndex,
     params: &[String],
     aliases: &mut Aliases,
+    bool_inits: &mut BoolInits,
+    flag_preds: &mut FlagPreds,
     out: &mut HashMap<u32, LinePredicates>,
 ) {
     for stmt in body {
         match stmt {
             ast::Stmt::FunctionDef(_) | ast::Stmt::ClassDef(_) => {}
-            ast::Stmt::Assign(assign) => bind_assign(assign, params, aliases),
+            ast::Stmt::Assign(assign) => bind_assign(assign, params, aliases, bool_inits, flag_preds),
             ast::Stmt::If(if_stmt) => {
-                insert_test(out, line_at(if_stmt.range().start(), li), &if_stmt.test, params, aliases);
-                walk(&if_stmt.body, li, params, aliases, out);
+                insert_test(out, line_at(if_stmt.range().start(), li), &if_stmt.test, params, aliases, flag_preds);
+                walk(&if_stmt.body, li, params, aliases, bool_inits, flag_preds, out);
                 for clause in &if_stmt.elif_else_clauses {
                     if let Some(test) = &clause.test {
-                        insert_test(out, line_at(clause.range().start(), li), test, params, aliases);
+                        insert_test(out, line_at(clause.range().start(), li), test, params, aliases, flag_preds);
                     }
-                    walk(&clause.body, li, params, aliases, out);
+                    walk(&clause.body, li, params, aliases, bool_inits, flag_preds, out);
                 }
             }
             ast::Stmt::While(w) => {
-                insert_test(out, line_at(w.range().start(), li), &w.test, params, aliases);
-                walk(&w.body, li, params, aliases, out);
-                walk(&w.orelse, li, params, aliases, out);
+                insert_test(out, line_at(w.range().start(), li), &w.test, params, aliases, flag_preds);
+                walk(&w.body, li, params, aliases, bool_inits, flag_preds, out);
+                walk(&w.orelse, li, params, aliases, bool_inits, flag_preds, out);
             }
             ast::Stmt::For(f) => {
                 let line = line_at(f.range().start(), li);
@@ -139,33 +143,144 @@ pub(super) fn walk(
                     );
                 }
                 let pre_loop = aliases.clone();
+                let direct_param =
+                    if let Some((param, Derivation::Direct)) = &iter_deriv { Some(param.clone()) } else { None };
                 match iter_deriv {
                     Some((param, Derivation::Direct)) => bind_for_target(&f.target, &param, aliases),
                     Some((param, Derivation::Split(sep))) => bind_for_target_split(&f.target, &param, &sep, aliases),
                     _ => {}
                 }
-                walk(&f.body, li, params, aliases, out);
-                walk(&f.orelse, li, params, aliases, out);
+                let flag_candidate = direct_param
+                    .and_then(|param| detect_loop_flag(&f.body, &param, params, aliases, bool_inits));
+                walk(&f.body, li, params, aliases, bool_inits, flag_preds, out);
+                walk(&f.orelse, li, params, aliases, bool_inits, flag_preds, out);
                 *aliases = pre_loop;
+                if let Some((name, pred)) = flag_candidate {
+                    flag_preds.insert(name, pred);
+                }
             }
-            ast::Stmt::With(w) => walk(&w.body, li, params, aliases, out),
+            ast::Stmt::With(w) => walk(&w.body, li, params, aliases, bool_inits, flag_preds, out),
             ast::Stmt::Try(t) => {
-                walk(&t.body, li, params, aliases, out);
+                walk(&t.body, li, params, aliases, bool_inits, flag_preds, out);
                 for handler in &t.handlers {
                     let ast::ExceptHandler::ExceptHandler(h) = handler;
-                    walk(&h.body, li, params, aliases, out);
+                    walk(&h.body, li, params, aliases, bool_inits, flag_preds, out);
                 }
-                walk(&t.orelse, li, params, aliases, out);
-                walk(&t.finalbody, li, params, aliases, out);
+                walk(&t.orelse, li, params, aliases, bool_inits, flag_preds, out);
+                walk(&t.finalbody, li, params, aliases, bool_inits, flag_preds, out);
             }
             ast::Stmt::Match(m) => {
                 for case in &m.cases {
-                    walk(&case.body, li, params, aliases, out);
+                    walk(&case.body, li, params, aliases, bool_inits, flag_preds, out);
                 }
             }
             _ => {}
         }
     }
+}
+
+/// The one [`Derivation`] a per-element predicate carries, unwrapping [`Predicate::Not`] — `None`
+/// for forms that don't name a single derivation this way (`Truthy`, `ForIter`, ...).
+fn predicate_deriv(pred: &Predicate) -> Option<&Derivation> {
+    match pred {
+        Predicate::Compare { deriv, .. } | Predicate::StrMethod { deriv, .. } => Some(deriv),
+        Predicate::Not(inner) => predicate_deriv(inner),
+        _ => None,
+    }
+}
+
+/// Count of `Stmt::Assign`s anywhere in `stmts` (recursively) whose sole target is `Name(name)` —
+/// used to confirm a loop-state flag's only reassignment is the one
+/// [`detect_loop_flag`] already found.
+fn count_name_assigns(stmts: &[ast::Stmt], name: &str) -> usize {
+    let mut count = 0;
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::Assign(a) => {
+                if let [ast::Expr::Name(n)] = a.targets.as_slice()
+                    && n.id.as_str() == name
+                {
+                    count += 1;
+                }
+            }
+            ast::Stmt::If(i) => {
+                count += count_name_assigns(&i.body, name);
+                for clause in &i.elif_else_clauses {
+                    count += count_name_assigns(&clause.body, name);
+                }
+            }
+            ast::Stmt::While(w) => {
+                count += count_name_assigns(&w.body, name) + count_name_assigns(&w.orelse, name);
+            }
+            ast::Stmt::For(f) => {
+                count += count_name_assigns(&f.body, name) + count_name_assigns(&f.orelse, name);
+            }
+            ast::Stmt::With(w) => count += count_name_assigns(&w.body, name),
+            ast::Stmt::Try(t) => {
+                count += count_name_assigns(&t.body, name);
+                for handler in &t.handlers {
+                    let ast::ExceptHandler::ExceptHandler(h) = handler;
+                    count += count_name_assigns(&h.body, name);
+                }
+                count += count_name_assigns(&t.orelse, name) + count_name_assigns(&t.finalbody, name);
+            }
+            ast::Stmt::Match(m) => {
+                for case in &m.cases {
+                    count += count_name_assigns(&case.body, name);
+                }
+            }
+            _ => {}
+        }
+    }
+    count
+}
+
+/// Recognize the loop-state-flag special case in one `for` loop's body: a name previously
+/// initialized to a literal bool (`bool_inits`), reassigned to the opposite literal by exactly
+/// one top-level `if <handled per-element predicate>: flag = <opposite>` (no `elif`/`else`), and
+/// touched nowhere else in the loop body. `aliases` must already carry the loop target's
+/// [`Derivation::Element`] binding. Returns the flag's name and the predicate that fully explains
+/// its value after the loop: `flag == <init>` iff the guard never held, so the guard's
+/// [`Predicate::Not`] when the flag was initialized `true` (post-loop `true` then means "the
+/// guard never held"), or the guard itself when initialized `false`.
+fn detect_loop_flag(
+    for_body: &[ast::Stmt],
+    param: &str,
+    params: &[String],
+    aliases: &Aliases,
+    bool_inits: &BoolInits,
+) -> Option<(String, Predicate)> {
+    let mut found: Option<(String, Predicate, bool)> = None;
+    for stmt in for_body {
+        let ast::Stmt::If(if_stmt) = stmt else { continue };
+        if !if_stmt.elif_else_clauses.is_empty() {
+            continue;
+        }
+        let [ast::Stmt::Assign(assign)] = if_stmt.body.as_slice() else { continue };
+        let [ast::Expr::Name(target)] = assign.targets.as_slice() else { continue };
+        let ast::Expr::BooleanLiteral(lit) = assign.value.as_ref() else { continue };
+        let Some(&init) = bool_inits.get(target.id.as_str()) else { continue };
+        if lit.value == init {
+            continue;
+        }
+        let mut preds = extract(&if_stmt.test, params, aliases, &FlagPreds::new());
+        if preds.len() != 1 {
+            continue;
+        }
+        let pred = preds.remove(0);
+        if pred.param() != param || !matches!(predicate_deriv(&pred), Some(Derivation::Element { .. })) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some((target.id.to_string(), pred, init));
+    }
+    let (name, pred, init) = found?;
+    if count_name_assigns(for_body, &name) != 1 {
+        return None;
+    }
+    Some((name, if init { Predicate::Not(Box::new(pred)) } else { pred }))
 }
 
 /// Bind a for loop's target name(s) as Derivation::Element(s) of param.
@@ -194,10 +309,25 @@ pub(super) fn bind_for_target_split(target: &ast::Expr, param: &str, sep: &Optio
     }
 }
 
-/// Bind (or clear) aliases for one Assign statement.
-pub(super) fn bind_assign(assign: &ast::StmtAssign, params: &[String], aliases: &mut Aliases) {
+/// Bind (or clear) aliases for one Assign statement, and track/invalidate loop-state-flag
+/// bookkeeping (`bool_inits`, `flag_preds`) alongside it: a literal-bool RHS records the name as
+/// a fresh flag candidate; any other assignment to a name clears it (see `detect_loop_flag`,
+/// which relies on a name touched exactly once inside its qualifying loop staying a candidate).
+pub(super) fn bind_assign(
+    assign: &ast::StmtAssign,
+    params: &[String],
+    aliases: &mut Aliases,
+    bool_inits: &mut BoolInits,
+    flag_preds: &mut FlagPreds,
+) {
     match assign.targets.as_slice() {
         [ast::Expr::Name(target)] => {
+            if let ast::Expr::BooleanLiteral(lit) = assign.value.as_ref() {
+                aliases.remove(target.id.as_str());
+                bool_inits.insert(target.id.to_string(), lit.value);
+                flag_preds.remove(target.id.as_str());
+                return;
+            }
             let deriv = extract_split(&assign.value, params, aliases)
                 .map(|(param, sep)| (param, Derivation::Split(sep)))
                 .or_else(|| extract_deriv(&assign.value, params, aliases));
@@ -209,6 +339,8 @@ pub(super) fn bind_assign(assign: &ast::StmtAssign, params: &[String], aliases: 
                     aliases.remove(target.id.as_str());
                 }
             }
+            bool_inits.remove(target.id.as_str());
+            flag_preds.remove(target.id.as_str());
         }
         [ast::Expr::Tuple(t)] if !t.elts.is_empty() && t.elts.iter().all(|e| matches!(e, ast::Expr::Name(_))) => {
             let names: Vec<&str> = t
@@ -231,10 +363,14 @@ pub(super) fn bind_assign(assign: &ast::StmtAssign, params: &[String], aliases: 
                     }
                 }
                 _ => {
-                    for name in names {
-                        aliases.remove(name);
+                    for name in &names {
+                        aliases.remove(*name);
                     }
                 }
+            }
+            for name in names {
+                bool_inits.remove(name);
+                flag_preds.remove(name);
             }
         }
         _ => {}
@@ -247,24 +383,32 @@ pub(super) fn insert_test(
     test: &ast::Expr,
     params: &[String],
     aliases: &Aliases,
+    flag_preds: &FlagPreds,
 ) {
-    let preds = extract(test, params, aliases);
+    let preds = extract(test, params, aliases, flag_preds);
     if !preds.is_empty() {
         out.insert(line, LinePredicates::Test(preds));
     }
 }
 
 /// Decompose expr into every handled leaf predicate.
-pub(super) fn extract(expr: &ast::Expr, params: &[String], aliases: &Aliases) -> Vec<Predicate> {
+pub(super) fn extract(expr: &ast::Expr, params: &[String], aliases: &Aliases, flag_preds: &FlagPreds) -> Vec<Predicate> {
     match expr {
-        ast::Expr::BoolOp(b) => b.values.iter().flat_map(|v| extract(v, params, aliases)).collect(),
-        ast::Expr::UnaryOp(u) if matches!(u.op, ast::UnaryOp::Not) => extract(&u.operand, params, aliases)
+        ast::Expr::BoolOp(b) => b.values.iter().flat_map(|v| extract(v, params, aliases, flag_preds)).collect(),
+        ast::Expr::UnaryOp(u) if matches!(u.op, ast::UnaryOp::Not) => extract(&u.operand, params, aliases, flag_preds)
             .into_iter()
             .map(|p| Predicate::Not(Box::new(p)))
             .collect(),
         ast::Expr::Compare(c) => extract_compare(c, params, aliases),
         ast::Expr::Call(call) => match extract_call(call, params, aliases) {
             Some(p) => vec![p],
+            None => match extract_deriv(expr, params, aliases) {
+                Some((param, Derivation::Direct | Derivation::Len)) => vec![Predicate::Truthy { param }],
+                _ => Vec::new(),
+            },
+        },
+        ast::Expr::Name(n) => match flag_preds.get(n.id.as_str()) {
+            Some(pred) => vec![pred.clone()],
             None => match extract_deriv(expr, params, aliases) {
                 Some((param, Derivation::Direct | Derivation::Len)) => vec![Predicate::Truthy { param }],
                 _ => Vec::new(),

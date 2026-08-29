@@ -319,6 +319,38 @@ fn indexing_a_split_element_stays_unhandled() {
 }
 
 #[test]
+fn loop_state_flag_true_outcome_synthesizes_a_singleton_that_never_flips_it() {
+    let src = "def f(xs):\n    is_asc = True\n    for x in xs:\n        if x < 0:\n            is_asc = False\n    if is_asc:\n        pass\n";
+    let preds = predicates_at(src, "f", &["xs"], 6);
+    assert_eq!(preds.len(), 1);
+    assert!(matches!(preds[0], Predicate::Not(_)));
+    let shape = Shape::any_seq();
+    let satisfy = predicate::synthesize(&preds[0], true, &shape).expect("satisfying value");
+    let items = satisfy.as_array().expect("array");
+    assert_eq!(items.len(), 1, "must be non-empty so the loop actually runs: {items:?}");
+    assert!(items[0].as_i64().expect("int") >= 0, "the element must not satisfy x < 0: {items:?}");
+}
+
+#[test]
+fn loop_state_flag_false_outcome_synthesizes_a_singleton_that_flips_it() {
+    let src = "def f(xs):\n    is_asc = True\n    for x in xs:\n        if x < 0:\n            is_asc = False\n    if is_asc:\n        pass\n";
+    let preds = predicates_at(src, "f", &["xs"], 6);
+    assert_eq!(preds.len(), 1);
+    let shape = Shape::any_seq();
+    let violate = predicate::synthesize(&preds[0], false, &shape).expect("violating value");
+    let items = violate.as_array().expect("array");
+    assert_eq!(items.len(), 1, "must be non-empty so the loop actually runs: {items:?}");
+    assert!(items[0].as_i64().expect("int") < 0, "the element must satisfy x < 0: {items:?}");
+}
+
+#[test]
+fn loop_state_flag_with_a_second_reassignment_stays_unhandled() {
+    let src = "def f(xs):\n    is_asc = True\n    for x in xs:\n        if x < 0:\n            is_asc = False\n        if x == 0:\n            is_asc = False\n    if is_asc:\n        pass\n";
+    let preds = predicates_at(src, "f", &["xs"], 8);
+    assert!(preds.is_empty(), "more than one reassignment of the flag is out of scope: {preds:?}");
+}
+
+#[test]
 fn rebind_with_an_unrecognized_rhs_clears_the_prior_alias() {
     let src = "def f(s):\n    n = len(s)\n    n = hash(s)\n    if n > 3:\n        pass\n";
     let preds = predicates_at(src, "f", &["s"], 4);

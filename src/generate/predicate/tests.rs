@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use crate::model::Shape;
 
-use super::{Aliases, Predicate};
+use super::{Aliases, FlagPreds, Predicate};
 use super::extraction::extract;
 use super::synthesis::synthesize;
 
@@ -29,10 +29,14 @@ fn no_aliases() -> Aliases {
     Aliases::new()
 }
 
+fn no_flags() -> FlagPreds {
+    FlagPreds::new()
+}
+
 #[test]
 fn eq_int_yields_the_literal_and_a_violator() {
     let test = test_expr_of("if p == 42:\n    pass\n");
-    let preds = extract(&test, &params(&["p"]), &no_aliases());
+    let preds = extract(&test, &params(&["p"]), &no_aliases(), &no_flags());
     assert_eq!(preds.len(), 1);
     let satisfy = synthesize(&preds[0], true, &Shape::Int).expect("satisfying value");
     let violate = synthesize(&preds[0], false, &Shape::Int).expect("violating value");
@@ -43,7 +47,7 @@ fn eq_int_yields_the_literal_and_a_violator() {
 #[test]
 fn len_gt_yields_a_long_and_a_short_list() {
     let test = test_expr_of("if len(p) > 3:\n    pass\n");
-    let preds = extract(&test, &params(&["p"]), &no_aliases());
+    let preds = extract(&test, &params(&["p"]), &no_aliases(), &no_flags());
     assert_eq!(preds.len(), 1);
     let shape = Shape::any_seq();
     let satisfy = synthesize(&preds[0], true, &shape).expect("satisfying value");
@@ -57,7 +61,7 @@ fn len_gt_yields_a_long_and_a_short_list() {
 #[test]
 fn mod_eq_yields_even_and_odd() {
     let test = test_expr_of("if p % 2 == 0:\n    pass\n");
-    let preds = extract(&test, &params(&["p"]), &no_aliases());
+    let preds = extract(&test, &params(&["p"]), &no_aliases(), &no_flags());
     assert_eq!(preds.len(), 1);
     let satisfy = synthesize(&preds[0], true, &Shape::Int).expect("satisfying value");
     let violate = synthesize(&preds[0], false, &Shape::Int).expect("violating value");
@@ -68,7 +72,7 @@ fn mod_eq_yields_even_and_odd() {
 #[test]
 fn bare_name_test_yields_truthiness() {
     let test = test_expr_of("if p:\n    pass\n");
-    let preds = extract(&test, &params(&["p"]), &no_aliases());
+    let preds = extract(&test, &params(&["p"]), &no_aliases(), &no_flags());
     assert_eq!(preds, vec![Predicate::Truthy { param: "p".to_string() }]);
     let truthy = synthesize(&preds[0], true, &Shape::Int).expect("truthy value");
     let falsy = synthesize(&preds[0], false, &Shape::Int).expect("falsy value");
@@ -79,7 +83,7 @@ fn bare_name_test_yields_truthiness() {
 #[test]
 fn and_decomposes_into_its_operands() {
     let test = test_expr_of("if p == 1 and q == 2:\n    pass\n");
-    let preds = extract(&test, &params(&["p", "q"]), &no_aliases());
+    let preds = extract(&test, &params(&["p", "q"]), &no_aliases(), &no_flags());
     assert_eq!(preds.len(), 2);
     assert!(preds.iter().any(|p| p.param() == "p"));
     assert!(preds.iter().any(|p| p.param() == "q"));
@@ -88,6 +92,6 @@ fn and_decomposes_into_its_operands() {
 #[test]
 fn unhandled_predicate_yields_nothing() {
     let test = test_expr_of("if hash(p) == 0:\n    pass\n");
-    let preds = extract(&test, &params(&["p"]), &no_aliases());
+    let preds = extract(&test, &params(&["p"]), &no_aliases(), &no_flags());
     assert!(preds.is_empty(), "hash(p) is not a handled derivation");
 }

@@ -108,6 +108,16 @@ pub enum LinePredicates {
 /// see the module doc's "one piece of cross-variable reasoning".
 type Aliases = HashMap<String, (String, Derivation)>;
 
+/// Local-name → literal-bool value, for the pending half of a loop-state-flag candidate: a name
+/// most recently assigned `True`/`False` directly (not through any derivation).
+type BoolInits = HashMap<String, bool>;
+
+/// Flag name → the fully polarity-resolved predicate that explains its value after a qualifying
+/// loop (see `extraction::detect_loop_flag`) — consulted by [`extraction::extract`] exactly like
+/// [`Aliases`], but never cleared when the loop's own scope ends, since the flag's meaning holds
+/// for the rest of the function.
+pub(super) type FlagPreds = HashMap<String, Predicate>;
+
 /// A sentinel value overwhelmingly unlikely to appear as a substring/element of an ordinarily
 /// generated container — used as the "definitely excludes `literal`" side of
 /// [`container_membership_value`], the same role `not_in_value`'s `z`-padding plays for
