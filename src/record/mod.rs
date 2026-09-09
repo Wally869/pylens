@@ -235,7 +235,7 @@ pub fn record_with_signatures(
         // Ground truth for "can anything in this file run": exec the real source once. This
         // respects guards (e.g. `try: import numpy except ImportError: ...`) that per-import
         // probing can't see, and yields the exact blocking module via the structured error.
-        let load = sandbox.probe_load(src, None, None, Limits::default())?;
+        let load = sandbox.probe_load(src, None, Limits::default())?;
         if load.ok { None } else { load.error }
     };
 
@@ -381,7 +381,7 @@ fn probe_dependencies(
 /// Try `import <module>` in the jail. Returns `None` if it resolves, else the structured error.
 fn probe_import(sandbox: &dyn Sandbox, module: &str) -> Result<Option<HarnessError>, String> {
     let src = format!("import {module}\n");
-    let r = sandbox.probe_load(&src, None, None, Limits::default())?;
+    let r = sandbox.probe_load(&src, None, Limits::default())?;
     if r.ok {
         Ok(None)
     } else {
@@ -522,7 +522,7 @@ fn method_record(
     let ctor_args = constructor_args(all, class, opts.domain);
 
     if !ctor_cache.contains_key(class) {
-        let probe = sandbox.probe_load(src, Some(class), Some(&ctor_args), Limits::default())?;
+        let probe = sandbox.probe_load(src, Some((class, ctor_args.as_slice())), Limits::default())?;
         let err = if probe.ok { None } else { probe.error };
         ctor_cache.insert(class.to_string(), err);
     }

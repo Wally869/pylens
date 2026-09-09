@@ -267,18 +267,18 @@ pub trait Sandbox {
         self.transport(&body)
     }
 
-    /// Load-only probe: exec `source` (and, if `class` is given, build the receiver with
-    /// `ctor_args`) without calling anything. `ok` means it loaded; otherwise `error` says why
-    /// (e.g. a `ModuleNotFoundError` at module scope, or a constructor that raised). Lets the
-    /// caller learn a module won't import once, instead of N identical per-case failures.
+    /// Load-only probe: exec `source` (and, if `receiver` is given, build it from
+    /// `(class, ctor_args)` — see [`Receiver`]) without calling anything. `ok` means it loaded;
+    /// otherwise `error` says why (e.g. a `ModuleNotFoundError` at module scope, or a constructor
+    /// that raised). Lets the caller learn a module won't import once, instead of N identical
+    /// per-case failures.
     fn probe_load(
         &self,
         source: &str,
-        class: Option<&str>,
-        ctor_args: Option<&[Value]>,
+        receiver: Option<Receiver>,
         limits: Limits,
     ) -> Result<CallResult, String> {
-        let body = encode_request(source, None, &[], &[], class.zip(ctor_args), &[], limits)?;
+        let body = encode_request(source, None, &[], &[], receiver, &[], limits)?;
         self.transport(&body)
     }
 

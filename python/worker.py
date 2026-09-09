@@ -892,15 +892,19 @@ def _run_batch_primed(base_req, batch, timeout, batch_timeout):
     Each grandchild still gets its own fork (so its mutations to the shared `ns` die with it —
     fork's copy-on-write means siblings never see each other's writes) and its own per-item
     timeout, so a hanging item is killed without sinking the rest of the batch. `batch_timeout` is
-    a SOFT whole-batch deadline computed from the moment this function starts: before starting
-    each item, if the deadline has passed, that item (and every item after it) is never started —
-    it gets a `deadline_skipped` response instead, never a fresh attempt. This is the mechanism
-    that actually enforces the whole-batch limit; the serve parent's own hard kill (see `serve`)
-    is only a backstop against this function itself wedging, so completed items are never thrown
-    away by that backstop firing. Returns the assembled `{"results": [...]}` bytes, always one
-    entry per batch item, in order; a module-load failure here is reported as the same
-    `stage="setup"` error, once per item, that a per-case exec would have produced.
+    a SOFT whole-batch deadline computed from the moment this function starts (before the module
+    is even exec'd, so a slow module exec is charged against the deadline exactly like the serve
+    parent's hard kill timer, which starts at fork — the two must agree on when the clock started,
+    or the hard kill can fire while the soft path still has budget left): before starting each
+    item, if the deadline has passed, that item (and every item after it) is never started — it
+    gets a `deadline_skipped` response instead, never a fresh attempt. This is the mechanism that
+    actually enforces the whole-batch limit; the serve parent's own hard kill (see `serve`) is
+    only a backstop against this function itself wedging, so completed items are never thrown away
+    by that backstop firing. Returns the assembled `{"results": [...]}` bytes, always one entry
+    per batch item, in order; a module-load failure here is reported as the same `stage="setup"`
+    error, once per item, that a per-case exec would have produced.
     """
+    deadline = time.monotonic() + batch_timeout
     timing = bool(base_req.get("timing"))
     t0 = time.perf_counter_ns()
     try:
@@ -915,7 +919,6 @@ def _run_batch_primed(base_req, batch, timeout, batch_timeout):
         return json.dumps({"results": results}, allow_nan=False).encode()
 
     module_exec_us = (time.perf_counter_ns() - t0) // 1000
-    deadline = time.monotonic() + batch_timeout
     results = []
     for item in batch:
         if time.monotonic() >= deadline:
@@ -947,13 +950,14 @@ def serve():
     "kwargs":{...}}, ...]}`. A batch is run by an intermediate child (`_run_batch_primed`) that
     execs the module once and forks one grandchild per item from that primed state, so only the
     first item in the batch pays a module exec. The intermediate child enforces each item's
-    normal per-item timeout itself, and enforces the whole-batch limit ITSELF as a SOFT deadline —
-    once passed, it stops starting new items and reports the rest `deadline_skipped`, never
-    losing a result that already completed. That whole-batch limit defaults to
-    `timeout * len(batch)`. The serve parent only supervises the intermediate child with a HARD
-    kill, set above the soft deadline (soft deadline plus one more per-item timeout), so it fires
-    only if the intermediate child itself wedges — the soft path inside it is what normally
-    enforces the limit, and only a wedge ever loses a whole batch's results. A request may
+    normal per-item timeout itself, and enforces the whole-batch limit ITSELF as a SOFT deadline,
+    computed before the module is even exec'd — once passed, it stops starting new items and
+    reports the rest `deadline_skipped`, never losing a result that already completed. That
+    whole-batch limit defaults to `timeout * len(batch)`. The serve parent only supervises the
+    intermediate child with a HARD kill, set above the soft deadline with slack for one more
+    in-flight item plus response assembly (`soft + timeout + 2` seconds), so it fires only if the
+    intermediate child itself wedges — the soft path inside it is what normally enforces the
+    limit, and only a wedge ever loses a whole batch's results. A request may
     override both limits: `timeout` (per item) and `batch_timeout` (the soft whole-batch
     deadline); either falls back to its default when absent, unparseable, or non-positive. The
     whole batch gets ONE newline-delimited response: `{"results": [<normal response>, ...]}`,
@@ -979,7 +983,11 @@ def serve():
             base = {k: v for k, v in req.items() if k != "batch"}
             timeout = _parse_timeout(req.get("timeout"), default_timeout)
             soft_batch_timeout = _parse_timeout(req.get("batch_timeout"), timeout * max(len(batch), 1))
-            hard_batch_timeout = soft_batch_timeout + timeout
+            # Slack beyond one more per-item timeout: an item that starts a moment before the
+            # soft deadline may run the full `timeout` before the soft path even notices, and the
+            # child still has to assemble and write the JSON response after that. Without this
+            # margin the hard kill can fire on a batch that was about to return successfully.
+            hard_batch_timeout = soft_batch_timeout + timeout + 2
             batch_result = _fork_bytes(
                 lambda: _run_batch_primed(base, batch, timeout, soft_batch_timeout),
                 hard_batch_timeout,
