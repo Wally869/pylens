@@ -37,5 +37,6 @@ pub(super) fn finish(facts: FunctionFacts, param_defs: Vec<ParamInfo>) -> Effect
         .filter_map(|b| facts.imports.get(b).map(|m| ImportUse { binding: b.clone(), module: m.clone() }))
         .collect();
     sig.may_use_star = facts.may_use_star;
+    sig.param_relations = facts.param_relations;
     sig
 }

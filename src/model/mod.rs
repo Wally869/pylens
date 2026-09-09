@@ -235,6 +235,40 @@ pub enum ParamKind {
     VarKeyword,
 }
 
+/// Which side of a [`ParamRelation`] one operand sits on: the parameter itself, or one element
+/// of it (`p[i]`, or the loop variable of `for p_i in p:`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParamRef {
+    pub param: String,
+    pub element: bool,
+}
+
+/// The kind of expression that put two [`ParamRef`]s together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationKind {
+    /// `<`, `<=`, `>`, `>=`.
+    Order,
+    /// `==`, `!=`.
+    Eq,
+    /// `+`, `-`, `*`, `/`, `//`, `%`, `**`.
+    Arith,
+}
+
+/// A generation-only fact: two parameters (or one parameter's element and another parameter) meet
+/// as the two operands of one comparison or arithmetic expression somewhere in the body. A
+/// bounded heuristic, not a solver — over the two parameters' meeting alone it says nothing about
+/// their VALUES, only that the sampler should stop picking each one independently: pairing a `str`
+/// `arr` with an `int` `target` when the body only ever does `arr[mid] < target` wastes most of
+/// the generation budget on a guaranteed `TypeError`. Like `guard_samples`/`hints`/
+/// `default_literal`, this never narrows a shape, a may-set, or purity — a wrong relation only
+/// wastes a generation slot. See `analyze::collect::relations`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParamRelation {
+    pub left: ParamRef,
+    pub right: ParamRef,
+    pub kind: RelationKind,
+}
+
 /// A parameter and its inferred shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParamInfo {
@@ -291,6 +325,12 @@ pub struct EffectSignature {
     pub owner: Option<String>,
     /// Parameters with usage-inferred shapes (drives input generation).
     pub params: Vec<ParamInfo>,
+    /// Cross-parameter relations found in the body (two parameters, or a parameter's element and
+    /// another parameter, meeting as the operands of one comparison/arithmetic expression) — see
+    /// [`ParamRelation`]. A generation-only hint, not part of the JSON contract: never folded
+    /// into `params`, the may-set, or `purity`.
+    #[serde(skip)]
+    pub param_relations: Vec<ParamRelation>,
     /// From annotation — UNTRUSTED. Kept only for declared-vs-inferred mismatch detection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub declared_return: Option<String>,
@@ -401,6 +441,7 @@ impl EffectSignature {
             kind,
             owner: None,
             params: Vec::new(),
+            param_relations: Vec::new(),
             declared_return: None,
             is_generator: false,
             returns: Vec::new(),

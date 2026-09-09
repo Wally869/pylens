@@ -1476,3 +1476,82 @@ fn join_with_a_literal_list_of_string_literals_is_proven_safe() {
         f.raises.implicit
     );
 }
+
+fn has_relation(s: &EffectSignature, left: (&str, bool), right: (&str, bool), kind: RelationKind) -> bool {
+    s.param_relations.iter().any(|r| {
+        r.left == ParamRef { param: left.0.into(), element: left.1 }
+            && r.right == ParamRef { param: right.0.into(), element: right.1 }
+            && r.kind == kind
+    })
+}
+
+#[test]
+fn find_closest_element_relates_arr_element_to_target() {
+    let s = analyze(
+        "def find_closest_element(arr, target):\n\
+         \x20   left, right = 0, len(arr) - 1\n\
+         \x20   best = None\n\
+         \x20   while left <= right:\n\
+         \x20       mid = (left + right) // 2\n\
+         \x20       if arr[mid] == target:\n\
+         \x20           return arr[mid]\n\
+         \x20       if best is None or abs(arr[mid] - target) < abs(best - target):\n\
+         \x20           best = arr[mid]\n\
+         \x20       if arr[mid] < target:\n\
+         \x20           left = mid + 1\n\
+         \x20       else:\n\
+         \x20           right = mid - 1\n\
+         \x20   return best\n",
+    );
+    let f = sig(&s, "find_closest_element");
+    assert!(has_relation(f, ("arr", true), ("target", false), RelationKind::Eq));
+    assert!(has_relation(f, ("arr", true), ("target", false), RelationKind::Order));
+    assert!(has_relation(f, ("arr", true), ("target", false), RelationKind::Arith));
+    assert!(
+        !f.param_relations.iter().any(|r| r.left.param == r.right.param),
+        "no relation should relate a parameter to itself: {:?}",
+        f.param_relations
+    );
+}
+
+#[test]
+fn for_loop_over_bare_param_relates_element_to_other_param() {
+    let s = analyze("def f(xs, t):\n    for x in xs:\n        if x > t: return x\n    return None\n");
+    let f = sig(&s, "f");
+    assert!(has_relation(f, ("xs", true), ("t", false), RelationKind::Order));
+}
+
+#[test]
+fn comprehension_over_local_index_records_no_relation() {
+    let s = analyze("def g(a, b, n):\n    return [(a + i, b) for i in range(n)]\n");
+    let f = sig(&s, "g");
+    assert!(
+        f.param_relations.is_empty(),
+        "a local loop index should not relate to a parameter: {:?}",
+        f.param_relations
+    );
+}
+
+#[test]
+fn slice_comparison_records_no_relation() {
+    let s = analyze("def h(a, b):\n    return a[1:] == b\n");
+    let f = sig(&s, "h");
+    assert!(f.param_relations.is_empty(), "a slice is not an element: {:?}", f.param_relations);
+}
+
+#[test]
+fn param_relations_are_not_serialized() {
+    let s = analyze(
+        "def find_closest_element(arr, target):\n\
+         \x20   if arr[0] == target:\n\
+         \x20       return arr[0]\n\
+         \x20   return None\n",
+    );
+    let f = sig(&s, "find_closest_element");
+    assert!(!f.param_relations.is_empty());
+    let value = serde_json::to_value(f).expect("serialize");
+    assert!(
+        value.as_object().unwrap().get("param_relations").is_none(),
+        "param_relations must not appear in the JSON output: {value}"
+    );
+}

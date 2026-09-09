@@ -338,6 +338,9 @@ pub(in crate::analyze) struct FunctionFacts<'a> {
     /// `ParamInfo::hints` in `finish`. Unlike `guard_samples`, this isn't accumulated
     /// incrementally during the walk.
     pub(in crate::analyze) hints: HashMap<String, Vec<String>>,
+    /// Cross-parameter relations found in the body, computed once up front — see
+    /// `collect::relations`. Moved into `EffectSignature::param_relations` in `finish`.
+    pub(in crate::analyze) param_relations: Vec<ParamRelation>,
     /// Names bound to a nested `def`/`class` statement anywhere in this function's body (any
     /// depth, not crossing into a further-nested def/class's own body) — computed once up front
     /// by `passes::effects::setup::local_def_names`. Consulted by `builtin_shadowed` so a local
@@ -386,6 +389,7 @@ impl<'a> FunctionFacts<'a> {
             import_call_sites: Vec::new(),
             guard_samples: HashMap::new(),
             hints: HashMap::new(),
+            param_relations: Vec::new(),
             local_defs: HashSet::new(),
             sig,
         }

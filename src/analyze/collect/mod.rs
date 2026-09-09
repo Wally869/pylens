@@ -8,5 +8,6 @@ pub(super) mod exceptions;
 pub(super) mod guards;
 pub(super) mod hints;
 pub(super) mod mutations;
+pub(super) mod relations;
 pub(super) mod returns;
 pub(super) mod shapes;
