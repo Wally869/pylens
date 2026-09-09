@@ -69,10 +69,19 @@ pub enum Rank {
 ///
 /// Sampling order: (1) the all-base vector, every parameter at its typical value; (2) one
 /// parameter at a time, round-robined by candidate index so no single parameter can consume the
-/// whole budget before the others get a turn; (3) once every parameter's candidates are
-/// exhausted, combination vectors spread evenly across the full cartesian product, so pairings
-/// across positional AND keyword-only arguments — not only matched positions — get exercised.
-/// Duplicate vectors (same positional values and same keyword pairs) are never emitted twice.
+/// whole budget before the others get a turn; (3) for every relation that pairs a scalar
+/// parameter against a related container parameter's element by `Order` or `Eq`
+/// (`sig.param_relations`, see [`relations::relative_vectors`]), vectors that place the scalar
+/// below the container's minimum, above its maximum, equal to a middle element, and strictly
+/// between its widest-spaced adjacent elements — the positions a "binary search"/"find closest"
+/// style body branches on, which independent round-robin sampling of the scalar and the container
+/// essentially never lands on together; (4) once every parameter's candidates are exhausted,
+/// combination vectors spread evenly across the full cartesian product, so pairings across
+/// positional AND keyword-only arguments — not only matched positions — get exercised. Duplicate
+/// vectors (same positional values and same keyword pairs) are never emitted twice. Phase (3)
+/// reserves at most a quarter of `max_vectors` for itself (`min` of its own count and that
+/// quarter), taken out of phase (2)'s share so the total budget is unaffected; a function with no
+/// qualifying relation skips phase (3) and generates exactly as it did before this phase existed.
 ///
 /// `domain`, when given, restricts every produced value to [`ValueDomain::allows`] — see
 /// `pylens record --value-domain`. `None` means unrestricted generation (the default, and
@@ -125,10 +134,14 @@ pub fn gen_inputs(sig: &EffectSignature, max_vectors: usize, domain: Option<&Val
     relations::repair(&sig.param_relations, &names, &per, &mut base_values, None, domain);
     let mut out: Vec<GenInput> = vec![to_input(&base_values)];
 
+    let relative = relations::relative_vectors(&sig.param_relations, &names, &per, &base_values, domain);
+    let reserved = relative.len().min(max / 4);
+    let round_robin_limit = max.saturating_sub(reserved);
+
     let max_len = per.iter().map(Vec::len).max().unwrap_or(1);
     'round_robin: for i in 1..max_len {
         for (j, c) in per.iter().enumerate() {
-            if out.len() >= max {
+            if out.len() >= round_robin_limit {
                 break 'round_robin;
             }
             let Some(cand) = c.get(i) else { continue };
@@ -139,6 +152,16 @@ pub fn gen_inputs(sig: &EffectSignature, max_vectors: usize, domain: Option<&Val
             if !out.contains(&candidate_input) {
                 out.push(candidate_input);
             }
+        }
+    }
+
+    for values in &relative {
+        if out.len() >= max {
+            break;
+        }
+        let candidate_input = to_input(values);
+        if !out.contains(&candidate_input) {
+            out.push(candidate_input);
         }
     }
 

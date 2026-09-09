@@ -1,11 +1,14 @@
 //! Relation-driven vector shaping: nudges a generated input vector toward coherence with
 //! `sig.param_relations` (see `analyze::collect::relations`) — pairing a `str` container with an
 //! `int` scalar when the body compares them wastes a slot on a guaranteed `TypeError`. [`repair`]
-//! fixes up a kind mismatch on an already-built vector.
+//! fixes up a kind mismatch on an already-built vector; [`relative_vectors`] goes further and
+//! seeds new vectors that place a related scalar below, above, at, and strictly between the
+//! elements of its related container, so branches like binary search's below-range/above-range/
+//! exact-match/interpolated-match outcomes get a candidate that can actually reach them.
 
 use serde_json::Value;
 
-use crate::model::{ParamRef, ParamRelation, Shape};
+use crate::model::{ParamRef, ParamRelation, RelationKind, Shape};
 
 use super::{Candidate, ValueDomain, seeds};
 
@@ -142,3 +145,222 @@ pub(super) fn repair(
     }
 }
 
+/// New vectors that place a scalar related by [`RelationKind::Order`] or [`RelationKind::Eq`] to
+/// a container's *element* at four positions relative to that container: below its minimum, above
+/// its maximum, equal to a middle element, and strictly between the two adjacent elements with the
+/// widest gap. `Arith`-only relations don't qualify — arithmetic doesn't imply a comparison
+/// boundary the way `Order`/`Eq` do.
+///
+/// For each qualifying relation (one processed per distinct container/scalar pair, even if
+/// several relations name it — `Eq` and `Order` on the same two parameters would otherwise repeat
+/// identical work), every candidate of the container parameter (from `per[container]`) that is an
+/// all-number (no bools) or all-string array of at least two elements, or a string of at least two
+/// distinct characters, contributes up to four scalar values built off its sorted, deduplicated
+/// elements — widest-range candidate first (see [`range_of`]), so a Union-shaped container's more
+/// interesting, wide-spread candidates aren't crowded out of a small reserved budget by low-signal
+/// ones from an unrelated member. Each produced vector holds every other parameter at
+/// `base_values`, sets the container slot to that candidate and the scalar slot to the built
+/// value, then runs through [`repair`] (anchored on the container) so a third related parameter
+/// stays coherent. A scalar that fails `domain` is skipped; a vector is only emitted when a scalar
+/// was actually built.
+pub(super) fn relative_vectors(
+    relations: &[ParamRelation],
+    names: &[&str],
+    per: &[Vec<Candidate>],
+    base_values: &[Value],
+    domain: Option<&ValueDomain>,
+) -> Vec<Vec<Value>> {
+    let mut out: Vec<Vec<Value>> = Vec::new();
+    let mut seen_pairs: Vec<(usize, usize)> = Vec::new();
+    for rel in relations {
+        if !matches!(rel.kind, RelationKind::Order | RelationKind::Eq) {
+            continue;
+        }
+        let Some((container_idx, scalar_idx)) = container_scalar_pair(rel, names) else {
+            continue;
+        };
+        if seen_pairs.contains(&(container_idx, scalar_idx)) {
+            continue;
+        }
+        seen_pairs.push((container_idx, scalar_idx));
+
+        // Widest-range candidates go first: a container instance whose elements span a narrow
+        // range (e.g. `[1, 2, 1]`) barely separates "below min" from "above max" from "between",
+        // whereas the outlier/wide-spread candidates give the four positions the most room to
+        // land in genuinely different branches — the values most worth the reserved budget when
+        // a Union-shaped container mixes in many low-signal candidates ahead of them.
+        let mut ranked: Vec<(f64, &Candidate, Elements)> = per[container_idx]
+            .iter()
+            .filter_map(|cand| orderable_elements(&cand.value).map(|e| (range_of(&e), cand, e)))
+            .collect();
+        ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+
+        for (_, cand, elements) in ranked {
+            for scalar in scalar_positions(&elements) {
+                if !domain_allows(&scalar, domain) {
+                    continue;
+                }
+                let mut values = base_values.to_vec();
+                values[container_idx] = cand.value.clone();
+                values[scalar_idx] = scalar;
+                repair(relations, names, per, &mut values, Some(container_idx), domain);
+                if !out.contains(&values) {
+                    out.push(values);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The value span the four [`scalar_positions`] have to work with — `max - min` of the
+/// deduplicated elements, in the same units [`num_scalar_positions`]/[`str_scalar_positions`]
+/// build from ([`str_char_gap`]'s codepoint distance for strings).
+fn range_of(elements: &Elements) -> f64 {
+    match elements {
+        Elements::Nums(d, _) => d.last().unwrap().as_f64().unwrap() - d.first().unwrap().as_f64().unwrap(),
+        Elements::Strs(d) => str_char_gap(d.first().unwrap(), d.last().unwrap()) as f64,
+    }
+}
+
+/// Resolves `rel` to `(container_index, scalar_index)` when exactly one side names a container
+/// element and the other a bare scalar, both present in `names`. `None` otherwise (both sides
+/// scalar, both sides elements, or a name outside `names`).
+fn container_scalar_pair(rel: &ParamRelation, names: &[&str]) -> Option<(usize, usize)> {
+    let li = names.iter().position(|n| *n == rel.left.param)?;
+    let ri = names.iter().position(|n| *n == rel.right.param)?;
+    if li == ri {
+        return None;
+    }
+    match (rel.left.element, rel.right.element) {
+        (true, false) => Some((li, ri)),
+        (false, true) => Some((ri, li)),
+        _ => None,
+    }
+}
+
+/// A sorted, deduplicated element kind for `value`: `Nums` for an array of at least two numbers
+/// (no bools), `Strs` for an array of at least two strings, or the one-character-string breakdown
+/// of a `Value::String` of at least two distinct characters. `None` for anything else.
+enum Elements {
+    Nums(Vec<serde_json::Number>, bool),
+    Strs(Vec<String>),
+}
+
+fn orderable_elements(value: &Value) -> Option<Elements> {
+    match value {
+        Value::Array(items) if items.len() >= 2 => {
+            if items.iter().all(|v| matches!(v, Value::Number(_))) {
+                let is_int = items.iter().all(|v| v.as_i64().is_some() || v.as_u64().is_some());
+                let mut nums: Vec<serde_json::Number> =
+                    items.iter().filter_map(|v| v.as_number().cloned()).collect();
+                nums.sort_by(|a, b| a.as_f64().partial_cmp(&b.as_f64()).unwrap());
+                nums.dedup_by(|a, b| a.as_f64() == b.as_f64());
+                (nums.len() >= 2).then_some(Elements::Nums(nums, is_int))
+            } else if items.iter().all(|v| matches!(v, Value::String(_))) {
+                let mut strs: Vec<String> =
+                    items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+                strs.sort();
+                strs.dedup();
+                (strs.len() >= 2).then_some(Elements::Strs(strs))
+            } else {
+                None
+            }
+        }
+        Value::String(s) => {
+            let mut chars: Vec<String> = s.chars().map(String::from).collect();
+            chars.sort();
+            chars.dedup();
+            (chars.len() >= 2).then_some(Elements::Strs(chars))
+        }
+        _ => None,
+    }
+}
+
+/// The below-min, above-max, middle-element, and widest-gap-midpoint scalar values for `elements`
+/// (see [`relative_vectors`]'s doc for the exact rule per position). Fewer than four when a
+/// position has no qualifying value (e.g. an empty string can't produce a below-min string).
+fn scalar_positions(elements: &Elements) -> Vec<Value> {
+    match elements {
+        Elements::Nums(nums, is_int) => num_scalar_positions(nums, *is_int),
+        Elements::Strs(strs) => str_scalar_positions(strs),
+    }
+}
+
+fn num_scalar_positions(d: &[serde_json::Number], is_int: bool) -> Vec<Value> {
+    let mut out = Vec::new();
+    let to_value = |f: f64| -> Value {
+        if is_int { Value::from(f as i64) } else { serde_json::json!(f) }
+    };
+    let min = d.first().unwrap().as_f64().unwrap();
+    let max = d.last().unwrap().as_f64().unwrap();
+    out.push(to_value(min - 1.0));
+    out.push(to_value(max + 1.0));
+    out.push(Value::Number(d[d.len() / 2].clone()));
+    let mut best_gap = 0.0;
+    let mut mid: Option<f64> = None;
+    for w in d.windows(2) {
+        let a = w[0].as_f64().unwrap();
+        let b = w[1].as_f64().unwrap();
+        let gap = b - a;
+        if gap > best_gap {
+            best_gap = gap;
+            mid = Some(a + gap / 2.0);
+        }
+    }
+    if let Some(m) = mid {
+        if is_int {
+            if best_gap >= 2.0 {
+                out.push(to_value(m));
+            }
+        } else {
+            out.push(to_value(m));
+        }
+    }
+    out
+}
+
+fn str_scalar_positions(d: &[String]) -> Vec<Value> {
+    let mut out = Vec::new();
+    let min = &d[0];
+    let max = d.last().unwrap();
+    if !min.is_empty() {
+        out.push(Value::String(String::new()));
+    }
+    out.push(Value::String(format!("{max}z")));
+    out.push(Value::String(d[d.len() / 2].clone()));
+    // "Widest gap" between two strings has no canonical metric, so the first differing
+    // character's codepoint distance stands in for it — a coarse, but order-respecting, proxy.
+    let mut best_gap: i64 = -1;
+    let mut between: Option<String> = None;
+    for w in d.windows(2) {
+        let a = &w[0];
+        let b = &w[1];
+        let candidate = format!("{a}a");
+        if candidate.as_str() <= a.as_str() || candidate.as_str() >= b.as_str() {
+            continue;
+        }
+        let gap = str_char_gap(a, b);
+        if gap > best_gap {
+            best_gap = gap;
+            between = Some(candidate);
+        }
+    }
+    if let Some(b) = between {
+        out.push(Value::String(b));
+    }
+    out
+}
+
+fn str_char_gap(a: &str, b: &str) -> i64 {
+    let mut ac = a.chars();
+    let mut bc = b.chars();
+    loop {
+        match (ac.next(), bc.next()) {
+            (Some(x), Some(y)) if x == y => continue,
+            (Some(x), Some(y)) => return (y as i64) - (x as i64),
+            (None, Some(y)) => return y as i64,
+            _ => return 0,
+        }
+    }
+}

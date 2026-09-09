@@ -601,6 +601,111 @@ def find_closest_element(arr, target):
     }
 }
 
+const FIND_CLOSEST_ELEMENT_SRC: &str = "\
+def find_closest_element(arr, target):
+    left = 0
+    right = len(arr) - 1
+    while left <= right:
+        mid = (left + right) // 2
+        if arr[mid] == target:
+            return arr[mid]
+        elif arr[mid] < target:
+            left = mid + 1
+        else:
+            right = mid - 1
+    if left >= len(arr):
+        return arr[-1]
+    if right < 0:
+        return arr[0]
+    if abs(arr[left] - target) < abs(arr[right] - target):
+        return arr[left]
+    else:
+        return arr[right]
+";
+
+/// The `Int` outlier property seed is `[1, 2, 3, 4, 1000]` (`seeds::seq_property_candidates`,
+/// `outlier_example`) — min 1, max 1000, middle element (index 2 of the sorted-dedup 5-element
+/// list) 3, and the widest adjacent gap 4..1000 (gap 996) giving integer midpoint 502.
+#[test]
+fn relative_vectors_place_target_around_the_outlier_array() {
+    let sigs = analyze_source(FIND_CLOSEST_ELEMENT_SRC).expect("parse");
+    let f = sig(&sigs, "find_closest_element");
+    assert!(!f.param_relations.is_empty(), "expected arr/target relations to be inferred");
+    let vectors = gen_inputs(&f, 24, None);
+    assert!(!vectors.is_empty());
+
+    let arr = json!([1, 2, 3, 4, 1000]);
+    let targets_with_arr: std::collections::HashSet<i64> = vectors
+        .iter()
+        .filter(|v| v.positional.first() == Some(&arr))
+        .filter_map(|v| v.positional.get(1).and_then(Value::as_i64))
+        .collect();
+
+    for expected in [0, 1001, 3, 502] {
+        assert!(
+            targets_with_arr.contains(&expected),
+            "expected target {expected} paired with arr {arr:?} among generated vectors: {vectors:?}"
+        );
+    }
+}
+
+#[test]
+fn relative_vectors_stay_in_domain() {
+    let sigs = analyze_source(FIND_CLOSEST_ELEMENT_SRC).expect("parse");
+    let f = sig(&sigs, "find_closest_element");
+    let domain = ValueDomain::parse(
+        r#"{"scalars": ["int"], "list_elements": ["int"], "max_list_len": 8}"#,
+    )
+    .expect("parse");
+    let vectors = gen_inputs(&f, 24, Some(&domain));
+    assert!(!vectors.is_empty());
+    for v in &vectors {
+        for value in &v.positional {
+            assert!(domain.allows(value), "value {value:?} escaped the domain: {v:?}");
+        }
+    }
+}
+
+#[test]
+fn relative_vectors_cover_a_string_container() {
+    let sigs = analyze_source(
+        "def g(s, ch):\n    return s.index(ch) if ch < s[0] else -1\n",
+    )
+    .expect("parse");
+    let f = sig(&sigs, "g");
+    assert!(!f.param_relations.is_empty(), "expected s/ch relations to be inferred");
+    let vectors = gen_inputs(&f, 24, None);
+    assert!(!vectors.is_empty());
+
+    let sorted_dedup_chars = |s: &str| -> Vec<char> {
+        let mut chars: Vec<char> = s.chars().collect();
+        chars.sort_unstable();
+        chars.dedup();
+        chars
+    };
+
+    let saw_empty_ch = vectors.iter().any(|v| {
+        let (Some(s), Some(ch)) = (v.positional.first().and_then(Value::as_str), v.positional.get(1).and_then(Value::as_str)) else {
+            return false;
+        };
+        sorted_dedup_chars(s).len() >= 2 && ch.is_empty()
+    });
+    assert!(saw_empty_ch, "expected a vector with a string s and ch == \"\": {vectors:?}");
+
+    let saw_above_max_ch = vectors.iter().any(|v| {
+        let (Some(s), Some(ch)) = (v.positional.first().and_then(Value::as_str), v.positional.get(1).and_then(Value::as_str)) else {
+            return false;
+        };
+        let chars = sorted_dedup_chars(s);
+        let Some(max_char) = chars.last() else { return false };
+        chars.len() >= 2 && ch == format!("{max_char}z")
+    });
+    assert!(
+        saw_above_max_ch,
+        "expected a vector with ch == s's max char followed by 'z': {vectors:?}"
+    );
+}
+
 #[test]
 fn keyword_only_params_go_in_kwargs_not_positional() {
     let sigs = analyze_source("def f(a, *, b):\n    return a\n").expect("parse");
