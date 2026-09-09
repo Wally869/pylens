@@ -8,7 +8,7 @@ use pylens::record::{
     CaseSource, DepStatus, RecordFlags, ReplayMap, parse_project_replay, parse_replay, record_file,
     record_with_signatures,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use pylens::{analyze_source, imports_of};
 use serde_json::{Value, json};
 
@@ -900,6 +900,167 @@ fn time_budget_never_drops_replay_cases() {
     assert_eq!(replay_case.input, vec![json!(7)]);
     assert_eq!(replay_case.outcome, "returned");
     assert_eq!(replay_case.ret, Some(json!(7)));
+}
+
+/// A body that never returns: the regression fixture for the ~51.7s-per-process overrun (see
+/// the module doc for the bug's history) — the deadline must be hard against it, not merely
+/// "no new work starts".
+const INFINITE_LOOP_SRC: &str = "def spin(x):\n    while True:\n        pass\n";
+
+#[test]
+fn hard_time_budget_bounds_an_infinite_loop() {
+    if !ready("hard_time_budget_bounds_an_infinite_loop") {
+        return;
+    }
+    let start = Instant::now();
+    let rec = record_file(
+        INFINITE_LOOP_SRC,
+        20,
+        &ReplayMap::new(),
+        RecordFlags { time_budget: Some(Duration::from_secs(5)), ..RecordFlags::default() },
+    )
+    .expect("record");
+    let elapsed = start.elapsed();
+    let f = rec.functions.iter().find(|r| r.signature.name == "spin").expect("spin record");
+
+    // The ceiling is loose on purpose: this guards against a return to the old ~60s per-batch
+    // overrun (an order of magnitude away), not against timing imprecision. A tight assertion
+    // here would be flaky under WSL cold start for no safety benefit.
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "a 5s time budget must not let an infinite loop run anywhere near the old ~60s ceiling, took {elapsed:?}"
+    );
+    assert_eq!(f.time_budget_hit, Some(true), "the budget must be reported as tripped");
+}
+
+/// Sleeps a full second per call — long enough that a handful of calls land in the same
+/// dispatched batch (`BATCH_SIZE` in `record/mod.rs`) while a tight-but-not-floor budget runs
+/// out mid-batch, so the worker's own soft batch deadline skips the trailing items rather than
+/// the budget ever refusing a whole chunk outright.
+const SLEEP_ONE_SEC_SRC: &str = "\
+import time
+
+def slow_one(x: int) -> int:
+    time.sleep(1.0)
+    return x
+";
+
+#[test]
+fn deadline_skipped_items_never_become_cases() {
+    if !ready("deadline_skipped_items_never_become_cases") {
+        return;
+    }
+    // 6 inputs land in one dispatched batch; a 3s budget lets roughly 3 of them start (their
+    // own 1s sleep) before the worker's soft batch deadline fires and skips the rest mid-batch
+    // — the in-batch `deadline_skipped` path, not merely a refused lease before dispatch.
+    let rec = record_file(
+        SLEEP_ONE_SEC_SRC,
+        6,
+        &ReplayMap::new(),
+        RecordFlags { time_budget: Some(Duration::from_secs(3)), ..RecordFlags::default() },
+    )
+    .expect("record");
+    let f = rec.functions.iter().find(|r| r.signature.name == "slow_one").expect("slow_one record");
+
+    assert_eq!(f.time_budget_hit, Some(true), "the budget must have tripped mid-batch");
+    assert!(
+        f.cases.len() < 6,
+        "some items must have been skipped rather than executed, got {} cases",
+        f.cases.len()
+    );
+    for c in &f.cases {
+        if let Some(err) = &c.error {
+            assert_ne!(
+                err.kind, "deadline_skipped",
+                "a skipped item must never surface as a case: {err:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn no_shrink_suppresses_minimization_only() {
+    if !ready("no_shrink_suppresses_minimization_only") {
+        return;
+    }
+    // Same fixture as `raised_case_carries_a_smaller_minimized_input`: `xs[10]` reliably raises
+    // IndexError and reliably shrinks under a 16-input budget.
+    let src = "def f(xs):\n    for _ in xs:\n        pass\n    return xs[10]\n";
+    let default_rec = record_file(src, 16, &ReplayMap::new(), RecordFlags::default()).expect("record");
+    let no_shrink_rec = record_file(
+        src,
+        16,
+        &ReplayMap::new(),
+        RecordFlags { no_shrink: true, ..RecordFlags::default() },
+    )
+    .expect("record");
+
+    let default_f = default_rec.functions.iter().find(|r| r.signature.name == "f").expect("f record");
+    let no_shrink_f = no_shrink_rec.functions.iter().find(|r| r.signature.name == "f").expect("f record");
+
+    assert!(
+        default_f.cases.iter().any(|c| c.minimized.is_some()),
+        "the default run should minimize at least one raised case"
+    );
+    assert!(
+        no_shrink_f.cases.iter().all(|c| c.minimized.is_none()),
+        "--no-shrink must suppress every minimized input"
+    );
+
+    assert_eq!(
+        default_f.cases.len(),
+        no_shrink_f.cases.len(),
+        "--no-shrink must not change which or how many cases are generated"
+    );
+    for (a, b) in default_f.cases.iter().zip(&no_shrink_f.cases) {
+        assert_eq!(a.input, b.input, "generation is deterministic; inputs must match run-to-run");
+        assert_eq!(a.outcome, b.outcome);
+        assert_eq!(a.raises, b.raises);
+    }
+}
+
+/// Sleeps 0.4s per call: 8 calls make generation take ~3.2s, leaving ~1.8s of the 5s budget for
+/// the single `--stability-runs 2` re-run round — whose own 8-call, ~3.2s workload runs past
+/// that leftover, so the worker's soft batch deadline fires mid-round and marks the trailing
+/// items `deadline_skipped`.
+const STABILITY_SLEEP_SRC: &str = "\
+import time
+
+def slow_stable(x: int) -> int:
+    time.sleep(0.4)
+    return x
+";
+
+#[test]
+fn budget_skipped_stability_rerun_is_kept_not_dropped() {
+    if !ready("budget_skipped_stability_rerun_is_kept_not_dropped") {
+        return;
+    }
+    let rec = record_file(
+        STABILITY_SLEEP_SRC,
+        8,
+        &ReplayMap::new(),
+        RecordFlags {
+            base_inputs: Some(8),
+            stability_runs: Some(2),
+            time_budget: Some(Duration::from_secs_f64(5.0)),
+            ..RecordFlags::default()
+        },
+    )
+    .expect("record");
+    let f = rec.functions.iter().find(|r| r.signature.name == "slow_stable").expect("slow_stable record");
+
+    let dropped = f.dropped_cases.as_ref().expect("stability_runs was set");
+    assert_eq!(
+        dropped.unstable, 0,
+        "a deterministic sleep+return case must never be marked unstable by a skipped re-run"
+    );
+    assert_eq!(
+        f.cases.len(),
+        8,
+        "every case recorded before the budget ran out must survive, skipped-and-unverified or verified alike"
+    );
+    assert_eq!(f.time_budget_hit, Some(true), "the budget must have run out during the re-runs");
 }
 
 #[test]
