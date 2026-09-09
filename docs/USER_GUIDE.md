@@ -91,7 +91,7 @@ For a field-by-field reference, refer to [SCHEMA.md](SCHEMA.md).
 
 ```sh
 pylens record <file.py> [--inputs N] [--replay <cases.json>] [--value-domain <profile.json>]
-              [--cover-branches] [--stability-runs N] [--time-budget <s>]
+              [--cover-branches] [--stability-runs N] [--time-budget <s>] [--no-shrink]
               [--format json|summary|pyi|html]
 ```
 
@@ -119,7 +119,13 @@ The optional flags:
   each uncovered branch outcome until the outcomes are covered or the budget ends.
 - `--stability-runs N` runs each case N times and drops the cases whose runs disagree. The
   report then carries the `dropped_cases` count.
-- `--time-budget <seconds>` puts a soft wall-time cap on the generated work per function.
+- `--time-budget <seconds>` sets a hard deadline for one function: generated batches, shrinking,
+  the `--cover-branches` loop, and `--stability-runs` re-runs all stop drawing new work once it
+  passes. It does not cover `--replay` cases, which always run in full. The value must be greater
+  than 1 second (the minimum lease floor); pylens rejects a smaller one.
+- `--no-shrink` skips input minimization for cases that raised. `minimized` is then absent from
+  every case. Shrinking runs by default, and now runs under `--time-budget` like everything else,
+  so leaving it on no longer risks an unbounded tail.
 
 pylens makes the inputs from the inferred shapes, then adds better candidates and tries them
 first:
@@ -142,6 +148,53 @@ exception (`minimized`).
 
 If the sandbox stops the code (out of memory, recursion, or timeout), pylens reports `error`. It
 does not report that the function raised.
+
+### How long one function can run
+
+`record` runs these phases for one function, always in this order:
+
+1. **Per-module probes.** Once per file, before any function runs: one load probe for each
+   distinct imported module, and — unless the first function's own initial batch already proves
+   the module loads — one whole-module load probe.
+2. **The method constructor probe.** For a method, the first method of each class probes its
+   constructor once; the result is cached for the rest of the class.
+3. **The initial generated batches.** Generated inputs are dispatched in chunks of 6
+   (`BATCH_SIZE`, `src/record/mod.rs`), one sandboxed batch call per chunk.
+4. **Shrinking.** Each case that raised is shrunk right away: one sandbox call per candidate, up
+   to 32 calls per case (`SHRINK_BUDGET`, `src/shrink.rs`). `--no-shrink` skips this phase.
+5. **`--replay` cases.** Run once, after the initial batches, as a single batch call.
+6. **The `--cover-branches` loop**, if requested: one sandbox call per targeted candidate, until
+   every observable outcome is covered, a round adds nothing new, or the case count reaches
+   `--inputs`.
+7. **`--stability-runs` re-run rounds**, if requested: one batch call per round, covering every
+   case still alive, for up to `N - 1` further rounds.
+
+**Per-batch limits.** Phases 2, 3, 4, 6, and 7 each ask `--time-budget`'s deadline for a limit
+before they start a new piece of work: a per-call limit (`min(PYLENS_CALL_TIMEOUT, time left
+before the deadline)`) and a whole-batch limit (the time left before the deadline). Without
+`--time-budget`, every call instead uses the plain default: a per-call limit of
+`PYLENS_CALL_TIMEOUT` (an environment variable, 10 seconds if unset — the same fallback
+`worker.py` uses on its side) and no whole-batch limit at all, so the worker derives its own,
+`PYLENS_CALL_TIMEOUT` times the number of items in the batch.
+
+**Where the deadline applies.** Once a phase's request for a limit is refused, that phase (and
+every later phase for that function) stops starting new work; everything already recorded stays.
+The per-module probes (phase 1) sit outside every function's deadline by design — they run once
+per module, before any function's deadline exists. `--replay` cases (phase 5) always run at full,
+un-leased limits: external evidence must never disappear because a deadline had already passed.
+(If `--stability-runs` is also set, a replayed case's re-run rounds share the same per-round limit
+request as every other still-alive case, so a refusal late in the deadline can leave a replayed
+case's stability check unfinished too — only a replayed case's own first execution is
+deadline-proof.)
+
+**The worst case.** For one function with `--time-budget B` set, expect at most `B` plus one more
+per-call limit: an item can start a moment before its batch's deadline and still run to its own
+per-call limit (at most `PYLENS_CALL_TIMEOUT`, 10 seconds by default) before it is killed. For a
+whole file, multiply that per-function worst case by the number of functions in the file — the
+deadline restarts fresh for every function, so `--time-budget` bounds one function, never the
+file. Without `--time-budget`, there is no deadline at all: wall time scales with however many
+sandbox calls the function needs (generated batches, up to 32 shrink calls per raised case, the
+cover loop, stability rounds), each up to `PYLENS_CALL_TIMEOUT`, with nothing to stop the total.
 
 ## validate
 

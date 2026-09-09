@@ -202,14 +202,16 @@ The signature fields, and also:
   `coverage`, `branches`, and `branch_coverage` are computed from the surviving `cases` only.
   Omitted entirely when `--stability-runs` wasn't passed, so plain `record` output is unchanged.
 - `time_budget_hit` — `true`, present only when `record --time-budget <seconds>` was passed and
-  that function's deadline had already passed by the time recording finished. `record
-  --time-budget` is a soft per-function wall cap covering generated-case execution, the
-  `--cover-branches` loop, and `--stability-runs` re-runs of *generated* cases: once the deadline
-  passes, no new generated work starts for that function, but everything already recorded is
-  kept, and still-uncovered branch outcomes are marked with the existing `"budget"` reason (see
-  `branches` above). Replayed cases (`--replay`) always execute in full regardless of the
-  deadline — external evidence must not silently vanish. Omitted (not `false`) whenever
-  `--time-budget` wasn't passed or wasn't hit, so plain `record` output is unchanged.
+  that function's deadline stopped some piece of work from starting — a refused lease request, a
+  batch item the worker reports as `deadline_skipped` (see below), or a re-run round that couldn't
+  begin. `record --time-budget` is a hard per-function deadline covering generated-case execution
+  (including shrinking, unless `--no-shrink`), the `--cover-branches` loop, and
+  `--stability-runs` re-runs: once the deadline passes, no new generated work starts for that
+  function, but everything already recorded is kept, and still-uncovered branch outcomes are
+  marked with the existing `"budget"` reason (see `branches` above). Replayed cases (`--replay`)
+  always execute in full regardless of the deadline — external evidence must not silently vanish.
+  Omitted (not `false`) whenever `--time-budget` wasn't passed or wasn't hit, so plain `record`
+  output is unchanged.
 - `io_observability` — one entry per `io` may-set token: `{ "kind": <str>, "observable": <bool>
   }`. `observable: true` for `"stdout"`/`"stderr"` (captured and checked against the may-set by
   `validate`'s `check_io` — see below); `observable: false` for `"filesystem"` (the jail's
@@ -242,12 +244,18 @@ The signature fields, and also:
 | `return_aliases_arg` | the index of the argument that **is** the return value (identity), if one exists |
 | `stdout` / `stderr` | the captured output; omitted if empty |
 | `error` | a structured `HarnessError` (the `error` outcome only) |
-| `minimized` | `{ "input", "kwargs"? }` — a smaller input that raises the same exception type; `raised` cases only, and present only if the shrink operation succeeded |
+| `minimized` | `{ "input", "kwargs"? }` — a smaller input that raises the same exception type; `raised` cases only, present only if the shrink operation succeeded, and always absent when `record --no-shrink` was passed |
 
 `raised` always means that the function itself raised. This is part of its behavior. If the
 sandbox stops the code (out of memory, recursion limit, or timeout), the outcome is `error` with
 `error.stage: "resource"`. It is never `raised`. A `HarnessError` is
 `{ "stage", "kind", "message", "module"? }`.
+
+`error.kind: "deadline_skipped"` (`error.stage: "resource"`) is different from every other
+resource kind: it means a `--time-budget` deadline passed before a batch item got its turn, so
+that item never ran at all. It produces no case — there is nothing to observe. This is distinct
+from `error.kind: "timeout"`, which is a real, kept case: that item started, ran, and was killed
+on its own wall limit, and it still carries whatever `lines` it reached, which coverage uses.
 
 ## Validate additions
 
