@@ -182,10 +182,9 @@ every later phase for that function) stops starting new work; everything already
 The per-module probes (phase 1) sit outside every function's deadline by design — they run once
 per module, before any function's deadline exists. `--replay` cases (phase 5) always run at full,
 un-leased limits: external evidence must never disappear because a deadline had already passed.
-(If `--stability-runs` is also set, a replayed case's re-run rounds share the same per-round limit
-request as every other still-alive case, so a refusal late in the deadline can leave a replayed
-case's stability check unfinished too — only a replayed case's own first execution is
-deadline-proof.)
+That guarantee holds in every phase a replayed case touches, including its `--stability-runs`
+re-run rounds (phase 7): each round dispatches the replayed cases still alive on their own batch,
+at the same un-leased limits, never sharing a lease with the generated cases in that round.
 
 **The worst case.** For one function with `--time-budget B` set, expect at most `B` plus one more
 per-call limit: an item can start a moment before its batch's deadline and still run to its own

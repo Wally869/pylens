@@ -5,7 +5,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::exec::{CallInput, Sandbox};
+use crate::exec::{CallInput, CallResult, Limits, Sandbox};
 use crate::generate::GenInput;
 use crate::model::EffectSignature;
 
@@ -41,10 +41,15 @@ pub struct DroppedCases {
 /// the re-run checks, not discarding what's already there. A replayed case's re-runs always
 /// execute in full, regardless of the deadline: external evidence must not silently vanish.
 ///
-/// Each round's batch leases wall limits from `budget` before it runs; when a lease is refused,
-/// every case still alive is kept as-is, unverified, and re-running stops. A re-run that comes
-/// back `deadline_skipped` never disagreed with anything — it is kept as-is, unverified, not
-/// counted as unstable.
+/// Each round splits the cases still alive into a replayed batch and a generated batch before it
+/// dispatches either. The replayed batch always runs at `Limits::default()` and never leases from
+/// `budget` — it runs every round, in full, until `runs` is reached, exactly as it would with no
+/// `--time-budget` at all. The generated batch leases wall limits from `budget`; when a lease is
+/// refused, that round's still-alive generated cases are kept as-is, unverified, and drop out of
+/// re-running for good — the replayed batch is unaffected and keeps re-running in later rounds. A
+/// re-run that comes back `deadline_skipped` (expected only for a generated case, since a replayed
+/// one no longer leases a shortened batch limit) never disagreed with anything — it is kept as-is,
+/// unverified, not counted as unstable.
 pub(super) fn stabilize_cases(
     sandbox: &dyn Sandbox,
     src: &str,
@@ -77,63 +82,128 @@ pub(super) fn stabilize_cases(
         if alive.is_empty() {
             break;
         }
-        let Some(limits) = budget.lease() else { break };
-        let kwargs_owned: Vec<Vec<(String, Value)>> = alive
-            .iter()
-            .map(|c| c.kwargs.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .collect();
-        let call_inputs: Vec<CallInput> = alive
-            .iter()
-            .zip(&kwargs_owned)
-            .map(|(c, kw)| (c.input.as_slice(), kw.as_slice()))
-            .collect();
-        let ctor_args_for_batch = alive[0].ctor_args.clone();
-        // A stability re-run's traces are discarded (see the doc comment above) — fine-grained
-        // hits would be too, so `fine_targets` stays empty and the worker never pays
-        // opcode-tracing overhead here.
-        let results = match &ctor_args_for_batch {
-            Some(ctor_args) => {
-                let class = sig
-                    .owner
-                    .as_deref()
-                    .ok_or_else(|| format!("method {:?} has no owning class", sig.name))?;
-                sandbox.call_batch(
-                    src,
-                    &sig.name,
-                    &call_inputs,
-                    Some((class, ctor_args.as_slice())),
-                    &[],
-                    limits,
-                )?
-            }
-            None => sandbox.call_batch(src, &sig.name, &call_inputs, None, &[], limits)?,
+
+        // Splitting must not reorder `kept`/the surviving list relative to what a single
+        // undivided batch would have produced: `is_replay` records each case's position in
+        // `this_round`'s original order, and the two partitions below (`Vec::partition`
+        // preserves relative order within each output) are walked back in lockstep with it,
+        // so the reassembly below reproduces the pre-split interleaving exactly.
+        let this_round = std::mem::take(&mut alive);
+        let is_replay: Vec<bool> = this_round.iter().map(|c| c.source == CaseSource::Replay).collect();
+        let (replay_batch, generated_batch): (Vec<Case>, Vec<Case>) =
+            this_round.into_iter().partition(|c| c.source == CaseSource::Replay);
+
+        // Replayed cases never lease from `budget`: external evidence must not silently vanish
+        // regardless of the deadline, in a stability re-run exactly as in the initial recording.
+        let replay_results = dispatch_batch(sandbox, src, sig, &replay_batch, Limits::default())?;
+
+        // Generated cases lease as before; a refused lease removes them from further re-running
+        // (they are kept, unverified) without touching the replayed batch above.
+        let generated_lease = if generated_batch.is_empty() { None } else { budget.lease() };
+        let generated_results = match generated_lease {
+            Some(limits) => Some(dispatch_batch(sandbox, src, sig, &generated_batch, limits)?),
+            None => None,
         };
 
-        let mut next_alive = Vec::with_capacity(alive.len());
-        for ((case, kwargs), result) in alive.into_iter().zip(kwargs_owned).zip(&results) {
-            if result.is_deadline_skipped() {
-                // Never re-enters `alive` for a later round: a `deadline_skipped` re-run is not
-                // "this round's attempt failed, try again next round" — the case must leave the
-                // round loop entirely and be kept exactly as it stands, unverified, the same as
-                // the up-front `budget.expired()` path above. Anything else risks ending with
-                // fewer than `runs` executions while being treated as fully verified, or being
-                // dropped as unstable on the strength of an incomplete comparison.
-                budget.mark_hit();
-                kept.push(case);
-                continue;
-            }
-            let gen_input = GenInput { positional: case.input.clone(), kwargs };
-            let rerun = build_case(sig, &gen_input, case.ctor_args.clone(), result, case.source);
-            if cases_agree(&case, &rerun) {
-                next_alive.push(case);
+        let mut next_alive = Vec::with_capacity(replay_batch.len() + generated_batch.len());
+        let mut replay_iter = replay_batch.into_iter().zip(replay_results);
+        let mut generated_iter = generated_batch.into_iter();
+        let mut generated_results_iter = generated_results.map(IntoIterator::into_iter);
+        for replayed in is_replay {
+            if replayed {
+                let (case, result) = replay_iter.next().expect("is_replay tracked this case as replayed");
+                process_rerun(sig, case, &result, &mut next_alive, &mut kept, &mut dropped, budget);
             } else {
-                dropped.unstable += 1;
+                let case = generated_iter.next().expect("is_replay tracked this case as generated");
+                match generated_results_iter.as_mut().and_then(Iterator::next) {
+                    Some(result) => {
+                        process_rerun(sig, case, &result, &mut next_alive, &mut kept, &mut dropped, budget);
+                    }
+                    None => kept.push(case),
+                }
             }
         }
         alive = next_alive;
     }
     kept.extend(alive);
     Ok((kept, dropped))
+}
+
+/// Dispatches one stability-round batch (either the replayed or the generated cases still
+/// alive) at `limits`. A stability re-run's traces are discarded (see [`stabilize_cases`]'s doc
+/// comment) — fine-grained hits would be too, so `fine_targets` stays empty and the worker never
+/// pays opcode-tracing overhead here.
+fn dispatch_batch(
+    sandbox: &dyn Sandbox,
+    src: &str,
+    sig: &EffectSignature,
+    batch: &[Case],
+    limits: Limits,
+) -> Result<Vec<CallResult>, String> {
+    if batch.is_empty() {
+        return Ok(Vec::new());
+    }
+    let kwargs_owned: Vec<Vec<(String, Value)>> = batch
+        .iter()
+        .map(|c| c.kwargs.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .collect();
+    let call_inputs: Vec<CallInput> = batch
+        .iter()
+        .zip(&kwargs_owned)
+        .map(|(c, kw)| (c.input.as_slice(), kw.as_slice()))
+        .collect();
+    match &batch[0].ctor_args {
+        Some(ctor_args) => {
+            let class = sig
+                .owner
+                .as_deref()
+                .ok_or_else(|| format!("method {:?} has no owning class", sig.name))?;
+            sandbox.call_batch(
+                src,
+                &sig.name,
+                &call_inputs,
+                Some((class, ctor_args.as_slice())),
+                &[],
+                limits,
+            )
+        }
+        None => sandbox.call_batch(src, &sig.name, &call_inputs, None, &[], limits),
+    }
+}
+
+/// Applies one case's re-run `result`: a `deadline_skipped` result (never expected for a
+/// replayed case now that it always runs at `Limits::default()`, but handled the same way if it
+/// somehow occurs) marks the budget hit and keeps the case as-is, unverified; otherwise the
+/// re-run is compared against the original and the case either survives into `next_alive` or is
+/// counted as unstable and dropped.
+fn process_rerun(
+    sig: &EffectSignature,
+    case: Case,
+    result: &CallResult,
+    next_alive: &mut Vec<Case>,
+    kept: &mut Vec<Case>,
+    dropped: &mut DroppedCases,
+    budget: &Budget,
+) {
+    if result.is_deadline_skipped() {
+        // Never re-enters `alive` for a later round: a `deadline_skipped` re-run is not "this
+        // round's attempt failed, try again next round" — the case must leave the round loop
+        // entirely and be kept exactly as it stands, unverified, the same as the up-front
+        // `budget.expired()` path above. Anything else risks ending with fewer than `runs`
+        // executions while being treated as fully verified, or being dropped as unstable on the
+        // strength of an incomplete comparison.
+        budget.mark_hit();
+        kept.push(case);
+        return;
+    }
+    let kwargs = case.kwargs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let gen_input = GenInput { positional: case.input.clone(), kwargs };
+    let rerun = build_case(sig, &gen_input, case.ctor_args.clone(), result, case.source);
+    if cases_agree(&case, &rerun) {
+        next_alive.push(case);
+    } else {
+        dropped.unstable += 1;
+    }
 }
 
 /// Whether two runs of the same case agree on every field that counts as an observation:

@@ -73,8 +73,8 @@
 //!                                                                       default; not available
 //!                                                                       on `validate`.
 //!                                                                       `--time-budget <seconds>`
-//!                                                                       is a soft per-function
-//!                                                                       wall cap covering
+//!                                                                       is a hard per-function
+//!                                                                       deadline covering
 //!                                                                       generated-case execution,
 //!                                                                       the `--cover-branches`
 //!                                                                       loop, and

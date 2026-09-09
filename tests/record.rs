@@ -1068,6 +1068,65 @@ fn budget_skipped_stability_rerun_is_kept_not_dropped() {
     assert_eq!(f.time_budget_hit, Some(true), "the budget must have run out during the re-runs");
 }
 
+/// Calibrated so the *round-start* lease is refused, not a mid-batch soft skip: one generated
+/// case (0.4s) plus a 3-tuple replay batch (1.2s) make the initial recording ~1.6s; a 1.8s budget
+/// leaves ~0.2s remaining when the stability round begins — under `MIN_TIME_BUDGET` (1s), so
+/// `budget.lease()` refuses. Before this fix, that single refused lease covered the whole round
+/// (replay included) and broke out of it before dispatching anything, so the replayed cases'
+/// second run never happened; the case would still show up in `cases` (unchanged from its first,
+/// deterministic execution) either way, so only wall-clock elapsed time tells the two behaviors
+/// apart. The fixed code dispatches the replayed batch un-leased regardless, adding ~1.2s more —
+/// so a total elapsed comfortably above the old ~1.6s-and-done floor, but below the new ~2.8s
+/// floor, discriminates a regression here. Numbers assume a quiet, already-warm sandbox, per the
+/// same caveat as `budget_skipped_stability_rerun_is_kept_not_dropped` above.
+#[test]
+fn replay_stability_rerun_survives_a_refused_generated_lease() {
+    if !ready("replay_stability_rerun_survives_a_refused_generated_lease") {
+        return;
+    }
+    let mut replay = ReplayMap::new();
+    replay.insert(
+        "slow_stable".to_string(),
+        vec![vec![json!(1)], vec![json!(2)], vec![json!(3)]],
+    );
+
+    let start = Instant::now();
+    let rec = record_file(
+        STABILITY_SLEEP_SRC,
+        1,
+        &replay,
+        RecordFlags {
+            stability_runs: Some(2),
+            time_budget: Some(Duration::from_secs_f64(1.8)),
+            ..RecordFlags::default()
+        },
+    )
+    .expect("record");
+    let elapsed = start.elapsed();
+    let f = rec.functions.iter().find(|r| r.signature.name == "slow_stable").expect("slow_stable record");
+
+    assert_eq!(f.time_budget_hit, Some(true), "the tight budget must trip against the generated case");
+    let dropped = f.dropped_cases.as_ref().expect("stability_runs was set");
+    assert_eq!(
+        dropped.unstable, 0,
+        "slow_stable is deterministic; a stability re-run must never disagree with the original"
+    );
+    for (input, expected) in [(1, 1), (2, 2), (3, 3)] {
+        let replay_case = f
+            .cases
+            .iter()
+            .find(|c| c.source == CaseSource::Replay && c.input == vec![json!(input)])
+            .unwrap_or_else(|| panic!("replay case for input {input} must survive"));
+        assert_eq!(replay_case.outcome, "returned");
+        assert_eq!(replay_case.ret, Some(json!(expected)));
+    }
+    assert!(
+        elapsed > Duration::from_secs_f64(2.2),
+        "the replayed batch's stability re-run must still execute in full past the tripped \
+         deadline, took only {elapsed:?}"
+    );
+}
+
 #[test]
 fn base_inputs_absent_matches_max_inputs_bit_for_bit() {
     if !ready("base_inputs_absent_matches_max_inputs_bit_for_bit") {
