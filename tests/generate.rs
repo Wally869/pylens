@@ -468,6 +468,140 @@ fn gen_inputs_domain_filter_covers_guard_and_hint_candidates_too() {
 }
 
 #[test]
+fn related_string_and_number_params_stay_kind_paired() {
+    let src = "\
+def find_closest_element(arr, target):
+    left = 0
+    right = len(arr) - 1
+    while left <= right:
+        mid = (left + right) // 2
+        if arr[mid] == target:
+            return arr[mid]
+        elif arr[mid] < target:
+            left = mid + 1
+        else:
+            right = mid - 1
+    if left >= len(arr):
+        return arr[-1]
+    if right < 0:
+        return arr[0]
+    if abs(arr[left] - target) < abs(arr[right] - target):
+        return arr[left]
+    else:
+        return arr[right]
+";
+    let sigs = analyze_source(src).expect("parse");
+    let f = sig(&sigs, "find_closest_element");
+    assert!(!f.param_relations.is_empty(), "expected arr/target relations to be inferred");
+    let vectors = gen_inputs(&f, 24, None);
+    assert!(!vectors.is_empty());
+
+    let mut saw_string_pair = false;
+    let mut saw_array_number_pair = false;
+    for v in &vectors {
+        let (Some(arr), Some(target)) = (v.positional.first(), v.positional.get(1)) else {
+            continue;
+        };
+        if arr.is_string() {
+            assert!(
+                target.is_string(),
+                "a string `arr` must be paired with a string `target`: {v:?}"
+            );
+            saw_string_pair = true;
+        }
+        if let Some(items) = arr.as_array()
+            && !items.is_empty()
+            && items[0].is_number()
+        {
+            assert!(
+                target.is_number(),
+                "a numeric-array `arr` must be paired with a numeric `target`: {v:?}"
+            );
+            saw_array_number_pair = true;
+        }
+    }
+    assert!(saw_string_pair, "expected a string/string pairing among generated vectors: {vectors:?}");
+    assert!(
+        saw_array_number_pair,
+        "expected an array-of-numbers/number pairing among generated vectors: {vectors:?}"
+    );
+}
+
+#[test]
+fn unrelated_params_generate_identically_to_no_relations() {
+    let sigs = analyze_source("def f(a, b):\n    return len(a) + b\n").expect("parse");
+    let f = sig(&sigs, "f");
+    assert!(
+        f.param_relations.is_empty(),
+        "a and b never meet as operands, so no relation should be inferred: {:?}",
+        f.param_relations
+    );
+    let mut cleared = f.clone();
+    cleared.param_relations.clear();
+    assert_eq!(gen_inputs(&f, 24, None), gen_inputs(&cleared, 24, None));
+}
+
+#[test]
+fn related_scalars_always_share_kind_or_have_a_none_side() {
+    let sigs = analyze_source("def g(x, y):\n    return x < y\n").expect("parse");
+    let f = sig(&sigs, "g");
+    let vectors = gen_inputs(&f, 24, None);
+    assert!(!vectors.is_empty());
+    for v in &vectors {
+        let (Some(x), Some(y)) = (v.positional.first(), v.positional.get(1)) else {
+            continue;
+        };
+        let x_is_scalar_kind = x.is_number() || x.is_string();
+        let y_is_scalar_kind = y.is_number() || y.is_string();
+        if x_is_scalar_kind && y_is_scalar_kind {
+            assert_eq!(
+                x.is_number(),
+                y.is_number(),
+                "related scalars x and y must share the same kind: {v:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn value_domain_still_holds_under_relation_repair() {
+    let src = "\
+def find_closest_element(arr, target):
+    left = 0
+    right = len(arr) - 1
+    while left <= right:
+        mid = (left + right) // 2
+        if arr[mid] == target:
+            return arr[mid]
+        elif arr[mid] < target:
+            left = mid + 1
+        else:
+            right = mid - 1
+    if left >= len(arr):
+        return arr[-1]
+    if right < 0:
+        return arr[0]
+    if abs(arr[left] - target) < abs(arr[right] - target):
+        return arr[left]
+    else:
+        return arr[right]
+";
+    let sigs = analyze_source(src).expect("parse");
+    let f = sig(&sigs, "find_closest_element");
+    let domain = ValueDomain::parse(
+        r#"{"scalars": ["int"], "list_elements": ["int"], "max_list_len": 6}"#,
+    )
+    .expect("parse");
+    let vectors = gen_inputs(&f, 24, Some(&domain));
+    assert!(!vectors.is_empty());
+    for v in &vectors {
+        for value in &v.positional {
+            assert!(domain.allows(value), "value {value:?} escaped the domain: {v:?}");
+        }
+    }
+}
+
+#[test]
 fn keyword_only_params_go_in_kwargs_not_positional() {
     let sigs = analyze_source("def f(a, *, b):\n    return a\n").expect("parse");
     let f = sig(&sigs, "f");

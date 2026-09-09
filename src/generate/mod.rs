@@ -14,7 +14,7 @@
 
 use serde_json::{Value, Map, json};
 
-use crate::model::{EffectSignature, ParamInfo, ParamKind, Shape};
+use crate::model::{EffectSignature, ParamInfo, ParamKind, ParamRef, ParamRelation, Shape};
 
 mod domain;
 pub mod predicate;
@@ -76,6 +76,16 @@ pub enum Rank {
 /// `domain`, when given, restricts every produced value to [`ValueDomain::allows`] — see
 /// `pylens record --value-domain`. `None` means unrestricted generation (the default, and
 /// always the case for `pylens validate`, which must not weaken the soundness harness).
+///
+/// Every vector built above also passes through [`repair`], which nudges it toward
+/// `sig.param_relations` coherence: when two parameters (or one parameter's element and another
+/// parameter) meet as operands of a comparison or arithmetic expression in the body, pairing
+/// e.g. a string with an int wastes a slot on a guaranteed `TypeError` before the real body is
+/// ever reached. One side of the mismatch is kept (the parameter this step just varied, or the
+/// left side for the base/combination vectors) and the other side is swapped for the first of
+/// its own candidates with a matching value kind, or a synthesized one when none qualifies. A
+/// relation is never treated as a hard constraint — repair can leave a vector unfixed — so a
+/// wrong or unresolvable relation only wastes a slot, exactly like a wrong guard sample.
 pub fn gen_inputs(sig: &EffectSignature, max_vectors: usize, domain: Option<&ValueDomain>) -> Vec<GenInput> {
     let max = max_vectors.max(1);
     let positional = positional_params(sig);
@@ -83,6 +93,7 @@ pub fn gen_inputs(sig: &EffectSignature, max_vectors: usize, domain: Option<&Val
     if positional.is_empty() && kwonly.is_empty() {
         return vec![GenInput::default()];
     }
+    let names: Vec<&str> = positional.iter().chain(kwonly.iter()).map(|p| p.name.as_str()).collect();
     let per: Vec<Vec<Candidate>> = positional
         .iter()
         .chain(kwonly.iter())
@@ -109,7 +120,8 @@ pub fn gen_inputs(sig: &EffectSignature, max_vectors: usize, domain: Option<&Val
         }
     };
 
-    let base_values: Vec<Value> = per.iter().map(|c| c[0].value.clone()).collect();
+    let mut base_values: Vec<Value> = per.iter().map(|c| c[0].value.clone()).collect();
+    repair(&sig.param_relations, &names, &per, &mut base_values, None, domain);
     let mut out: Vec<GenInput> = vec![to_input(&base_values)];
 
     let max_len = per.iter().map(Vec::len).max().unwrap_or(1);
@@ -121,6 +133,7 @@ pub fn gen_inputs(sig: &EffectSignature, max_vectors: usize, domain: Option<&Val
             let Some(cand) = c.get(i) else { continue };
             let mut values = base_values.clone();
             values[j] = cand.value.clone();
+            repair(&sig.param_relations, &names, &per, &mut values, Some(j), domain);
             let candidate_input = to_input(&values);
             if !out.contains(&candidate_input) {
                 out.push(candidate_input);
@@ -149,6 +162,7 @@ pub fn gen_inputs(sig: &EffectSignature, max_vectors: usize, domain: Option<&Val
                 values.push(c[sel].value.clone());
             }
             values.reverse();
+            repair(&sig.param_relations, &names, &per, &mut values, None, domain);
             let candidate_input = to_input(&values);
             if !out.contains(&candidate_input) {
                 out.push(candidate_input);
@@ -157,6 +171,139 @@ pub fn gen_inputs(sig: &EffectSignature, max_vectors: usize, domain: Option<&Val
     }
 
     out
+}
+
+/// The coarse value kind [`repair`] pairs on. Ints, floats and bools all collapse to `Number` —
+/// Python compares and adds them freely, so distinguishing them would only reject pairings that
+/// actually work at runtime. `Tagged` is a `{"__t__": ...}` object (the tuple/set/dict encoding
+/// `seeds.rs` and `python/worker.py` share); a plain string-keyed object is `Object`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairKind {
+    Null,
+    Number,
+    Str,
+    Array,
+    Object,
+    Tagged,
+}
+
+fn kind_of(value: &Value) -> PairKind {
+    match value {
+        Value::Null => PairKind::Null,
+        Value::Bool(_) | Value::Number(_) => PairKind::Number,
+        Value::String(_) => PairKind::Str,
+        Value::Array(_) => PairKind::Array,
+        Value::Object(map) => {
+            if tag_of(map).is_some() { PairKind::Tagged } else { PairKind::Object }
+        }
+    }
+}
+
+/// The kind `value`'s elements carry, for the `element: true` side of a [`ParamRef`] — `None`
+/// when `value` has no discernible element kind (an empty array, or a non-container value).
+fn element_kind_of(value: &Value) -> Option<PairKind> {
+    match value {
+        Value::String(_) => Some(PairKind::Str),
+        Value::Array(items) => items.first().map(kind_of),
+        _ => None,
+    }
+}
+
+/// The kind `reference` contributes given the value bound to its parameter — `None` means "no
+/// opinion", compatible with any kind.
+fn ref_kind(reference: &ParamRef, value: &Value) -> Option<PairKind> {
+    if reference.element { element_kind_of(value) } else { Some(kind_of(value)) }
+}
+
+fn domain_allows(value: &Value, domain: Option<&ValueDomain>) -> bool {
+    match domain {
+        Some(d) => d.allows(value),
+        None => true,
+    }
+}
+
+/// The first of `candidates` whose value contributes `needed_kind` for `reference`, or a value
+/// synthesized from the seed corpus when none qualifies — see [`repair`]. `None` when neither a
+/// matching candidate nor a synthesizable one exists (e.g. `needed_kind` is `Null`/`Object`/
+/// `Tagged`, which have no dedicated seed shape), or when a synthesized value fails `domain`.
+fn pick_value(reference: &ParamRef, needed_kind: PairKind, candidates: &[Candidate], domain: Option<&ValueDomain>) -> Option<Value> {
+    if !reference.element {
+        if let Some(c) = candidates.iter().find(|c| kind_of(&c.value) == needed_kind) {
+            return Some(c.value.clone());
+        }
+        let shape = match needed_kind {
+            PairKind::Number => Shape::Int,
+            PairKind::Str => Shape::Str,
+            PairKind::Array => Shape::Seq(Box::new(Shape::Int)),
+            _ => return None,
+        };
+        let value = seeds::candidates(&shape).into_iter().next()?.value;
+        return domain_allows(&value, domain).then_some(value);
+    }
+    if let Some(c) = candidates.iter().find(|c| element_kind_of(&c.value) == Some(needed_kind)) {
+        return Some(c.value.clone());
+    }
+    let elem_shape = match needed_kind {
+        PairKind::Number => Shape::Int,
+        PairKind::Str => Shape::Str,
+        _ => return None,
+    };
+    let value = seeds::candidates(&Shape::Seq(Box::new(elem_shape)))
+        .into_iter()
+        .map(|c| c.value)
+        .find(|v| matches!(v, Value::Array(items) if !items.is_empty()))?;
+    domain_allows(&value, domain).then_some(value)
+}
+
+/// Nudges `values` toward coherence with `relations`: for every relation whose two parameters are
+/// both present in `names` and whose contributed kinds ([`ref_kind`]) disagree, one side is kept
+/// (the parameter at `anchor`, when the relation names it; otherwise the left side) and the other
+/// is replaced by [`pick_value`]. Two passes over `relations` so a chain `a ~ b ~ c` can settle;
+/// a relation naming a parameter absent from `names` (`*args`/`**kwargs`, or untracked) is
+/// ignored. Leaves `values` as-is wherever no candidate and no synthesized value qualifies — a
+/// wasted slot, never a hard failure (see [`gen_inputs`]'s doc).
+fn repair(
+    relations: &[ParamRelation],
+    names: &[&str],
+    per: &[Vec<Candidate>],
+    values: &mut [Value],
+    anchor: Option<usize>,
+    domain: Option<&ValueDomain>,
+) {
+    for _ in 0..2 {
+        let mut changed = false;
+        for rel in relations {
+            let (Some(li), Some(ri)) = (
+                names.iter().position(|n| *n == rel.left.param),
+                names.iter().position(|n| *n == rel.right.param),
+            ) else {
+                continue;
+            };
+            if li == ri {
+                continue;
+            }
+            let (Some(lk), Some(rk)) = (ref_kind(&rel.left, &values[li]), ref_kind(&rel.right, &values[ri])) else {
+                continue;
+            };
+            if lk == rk {
+                continue;
+            }
+            let (target, target_ref, needed_kind) = if anchor == Some(ri) {
+                (li, &rel.left, rk)
+            } else {
+                (ri, &rel.right, lk)
+            };
+            if let Some(new_value) = pick_value(target_ref, needed_kind, &per[target], domain)
+                && values[target] != new_value
+            {
+                values[target] = new_value;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 }
 
 /// Candidate values for a parameter, ranked, including the None/default-path injection for
