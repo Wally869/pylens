@@ -81,7 +81,7 @@ pub enum Rank {
 /// vectors (same positional values and same keyword pairs) are never emitted twice. Phase (3)
 /// reserves at most a quarter of `max_vectors` for itself (`min` of its own count and that
 /// quarter), taken out of phase (2)'s share so the total budget is unaffected; a function with no
-/// qualifying relation skips phase (3) and generates exactly as it did before this phase existed.
+/// qualifying relation skips phase (3).
 ///
 /// `domain`, when given, restricts every produced value to [`ValueDomain::allows`] — see
 /// `pylens record --value-domain`. `None` means unrestricted generation (the default, and

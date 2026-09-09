@@ -146,16 +146,17 @@ pub(super) fn repair(
 }
 
 /// New vectors that place a scalar related by [`RelationKind::Order`] or [`RelationKind::Eq`] to
-/// a container's *element* at four positions relative to that container: below its minimum, above
+/// a container's *element* at a few positions relative to that container: below its minimum, above
 /// its maximum, equal to a middle element, and strictly between the two adjacent elements with the
-/// widest gap. `Arith`-only relations don't qualify — arithmetic doesn't imply a comparison
+/// widest gap (numbers get two such values: the midpoint and one just past it, so a closest-
+/// neighbour comparison sees both its tie side and its other side). `Arith`-only relations don't qualify — arithmetic doesn't imply a comparison
 /// boundary the way `Order`/`Eq` do.
 ///
 /// For each qualifying relation (one processed per distinct container/scalar pair, even if
 /// several relations name it — `Eq` and `Order` on the same two parameters would otherwise repeat
 /// identical work), every candidate of the container parameter (from `per[container]`) that is an
 /// all-number (no bools) or all-string array of at least two elements, or a string of at least two
-/// distinct characters, contributes up to four scalar values built off its sorted, deduplicated
+/// distinct characters, contributes up to five scalar values built off its sorted, deduplicated
 /// elements — widest-range candidate first (see [`range_of`]), so a Union-shaped container's more
 /// interesting, wide-spread candidates aren't crowded out of a small reserved budget by low-signal
 /// ones from an unrelated member. Each produced vector holds every other parameter at
@@ -277,9 +278,9 @@ fn orderable_elements(value: &Value) -> Option<Elements> {
     }
 }
 
-/// The below-min, above-max, middle-element, and widest-gap-midpoint scalar values for `elements`
-/// (see [`relative_vectors`]'s doc for the exact rule per position). Fewer than four when a
-/// position has no qualifying value (e.g. an empty string can't produce a below-min string).
+/// The below-min, above-max, middle-element, and widest-gap between scalar values for `elements`
+/// (see [`relative_vectors`]'s doc for the exact rule per position). Fewer when a position has
+/// no qualifying value (e.g. an empty string can't produce a below-min string).
 fn scalar_positions(elements: &Elements) -> Vec<Value> {
     match elements {
         Elements::Nums(nums, is_int) => num_scalar_positions(nums, *is_int),
@@ -297,24 +298,32 @@ fn num_scalar_positions(d: &[serde_json::Number], is_int: bool) -> Vec<Value> {
     out.push(to_value(min - 1.0));
     out.push(to_value(max + 1.0));
     out.push(Value::Number(d[d.len() / 2].clone()));
+    // Two between values for the widest gap: the exact midpoint, equidistant from both
+    // neighbours, and one just past it toward the upper element. A "which neighbour is closer"
+    // comparison takes its tie side on the first and the other side on the second. Ints need a
+    // gap of at least 2 for the midpoint and at least 4 for the off-centre value.
     let mut best_gap = 0.0;
-    let mut mid: Option<f64> = None;
+    let mut widest: Option<f64> = None;
     for w in d.windows(2) {
         let a = w[0].as_f64().unwrap();
         let b = w[1].as_f64().unwrap();
-        let gap = b - a;
-        if gap > best_gap {
-            best_gap = gap;
-            mid = Some(a + gap / 2.0);
+        if b - a > best_gap {
+            best_gap = b - a;
+            widest = Some(a);
         }
     }
-    if let Some(m) = mid {
+    if let Some(a) = widest {
         if is_int {
+            let mid = a + (best_gap / 2.0).floor();
             if best_gap >= 2.0 {
-                out.push(to_value(m));
+                out.push(to_value(mid));
+            }
+            if best_gap >= 4.0 {
+                out.push(to_value(mid + 1.0));
             }
         } else {
-            out.push(to_value(m));
+            out.push(to_value(a + best_gap / 2.0));
+            out.push(to_value(a + best_gap * 0.6));
         }
     }
     out

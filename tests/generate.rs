@@ -625,7 +625,8 @@ def find_closest_element(arr, target):
 
 /// The `Int` outlier property seed is `[1, 2, 3, 4, 1000]` (`seeds::seq_property_candidates`,
 /// `outlier_example`) — min 1, max 1000, middle element (index 2 of the sorted-dedup 5-element
-/// list) 3, and the widest adjacent gap 4..1000 (gap 996) giving integer midpoint 502.
+/// list) 3, and the widest adjacent gap 4..1000 (gap 996) giving the midpoint 502 (equidistant)
+/// and the off-centre 503 (strictly closer to 1000 than to 4).
 #[test]
 fn relative_vectors_place_target_around_the_outlier_array() {
     let sigs = analyze_source(FIND_CLOSEST_ELEMENT_SRC).expect("parse");
@@ -641,7 +642,7 @@ fn relative_vectors_place_target_around_the_outlier_array() {
         .filter_map(|v| v.positional.get(1).and_then(Value::as_i64))
         .collect();
 
-    for expected in [0, 1001, 3, 502] {
+    for expected in [0, 1001, 3, 502, 503] {
         assert!(
             targets_with_arr.contains(&expected),
             "expected target {expected} paired with arr {arr:?} among generated vectors: {vectors:?}"
