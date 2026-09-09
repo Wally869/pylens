@@ -130,8 +130,10 @@ raised as part of its behavior. Caught ahead of the generic `except Exception` i
 and reported through `error` (stage `"resource"`), never through `exception` — so a consumer
 can never mistake "ran out of memory/stack" for a semantic raise. `KeyboardInterrupt` is left
 alone: it's a harness signal (never something the function under test does on purpose), so it
-still falls outside every `except` below and crashes the (forked) child, surfacing as
-`no_output` — the error side, never `exception`. `SystemExit` is different: `sys.exit()` is
+still falls outside every `except` below and crashes the (forked) child, surfacing as a
+harness-side error — `no_output`, or the signal-specific classification (`resource`/`cpu_limit`,
+`resource`/`killed`, or `harness`/`crash`) if the OS terminated the child by signal — the error
+side, never `exception`. `SystemExit` is different: `sys.exit()` is
 genuine function behavior (e.g. a CLI entry point), so `run_request` catches it explicitly,
 below, and reports it through `exception` like any other raise, even though it's a
 `BaseException` the generic `except Exception` wouldn't otherwise see."""
@@ -712,7 +714,7 @@ def oneshot():
 
 def _fork_bytes(produce, timeout):
     """Fork a child that runs `produce()` — a zero-arg callable returning the bytes to write to
-    the pipe — and hand those bytes back to the caller, or None on timeout.
+    the pipe — and hand back `(bytes, wait_status)`, or None on timeout.
 
     The generic fork + deadline + pipe machinery underneath every isolation boundary in this
     file: a single request's child (`produce` calls `run_request` once), a batch item's
@@ -720,7 +722,9 @@ def _fork_bytes(produce, timeout):
     batch's own intermediate child (`produce` runs the whole batch and returns the assembled
     `{"results": [...]}` bytes). Bounds the child independently of the jail's wall time_limit,
     which can't bound individual calls in a long-lived --serve process. A timed-out child is
-    killed; its (grand)children, if any, die with it.
+    killed; its (grand)children, if any, die with it. `wait_status` is the raw `os.waitpid`
+    status, which callers with empty or truncated output use to tell an rlimit signal kill
+    (SIGXCPU/SIGKILL) apart from a normal exit that just wrote nothing.
     """
     r, w = os.pipe()
     pid = os.fork()
@@ -760,12 +764,12 @@ def _fork_bytes(produce, timeout):
         except ProcessLookupError:
             pass
     os.close(r)
-    os.waitpid(pid, 0)
-    return None if timed_out else b"".join(chunks)
+    _, status = os.waitpid(pid, 0)
+    return None if timed_out else (b"".join(chunks), status)
 
 
 def _handle_in_child(req, timeout):
-    """Fork a child to run one prepared request dict; return its response bytes, or None on
+    """Fork a child to run one prepared request dict; return `(bytes, wait_status)`, or None on
     timeout. Takes an already-parsed request dict (not a raw line) so both a single request and
     (via `run_request`'s `ns` argument) a primed batch item can share this machinery."""
     return _fork_bytes(lambda: json.dumps(run_request(req), allow_nan=False).encode(), timeout)
@@ -779,29 +783,55 @@ def _timeout_response(timeout):
     return resp
 
 
-def _no_output_response():
-    # The child produced nothing at all — most likely SIGKILLed by an rlimit (CPU/mem) or
-    # crashed outright. Either way this is a harness-side failure, never a semantic result, so
-    # it stays on the `error` channel (never `exception`).
+def _signal_error(status):
+    """Classify a child's `os.waitpid` status as a signal-kill error, or None if it exited
+    normally (in which case the caller falls back to its own no-output/truncated-output
+    classification). SIGXCPU is the nsjail CPU rlimit firing; SIGKILL is the OOM killer or an
+    explicit kill (e.g. our own timeout path). Both are a sandbox resource limit, not the
+    function's behavior. Any other signal (SIGSEGV, SIGABRT, ...) is a harness-side crash."""
+    if status is None or not os.WIFSIGNALED(status):
+        return None
+    sig = os.WTERMSIG(status)
+    name = signal.Signals(sig).name
+    if sig == signal.SIGXCPU:
+        return make_error("resource", "cpu_limit", f"child killed by {name}")
+    if sig == signal.SIGKILL:
+        return make_error("resource", "killed", f"child killed by {name}")
+    return make_error("harness", "crash", f"child died with {name}")
+
+
+def _no_output_response(status=None):
+    # The child produced nothing at all. `status` (from `os.waitpid`) tells a signal kill —
+    # SIGXCPU/SIGKILL from an rlimit, or any other signal — apart from a child that simply
+    # exited without writing; the former gets the specific resource/crash classification, the
+    # latter the generic harness one. Either way this stays on the `error` channel, never
+    # `exception`.
     resp = base_response()
-    resp["error"] = make_error("harness", "no_output", "child produced no output")
+    err = _signal_error(status)
+    resp["error"] = err if err is not None else make_error("harness", "no_output", "child produced no output")
     return resp
 
 
-def _collect_result(out, timeout):
-    """Turn a `_fork_bytes` outcome (bytes, empty bytes, or None on timeout) into a parsed
+def _collect_result(result, timeout):
+    """Turn a `_fork_bytes` outcome (`(bytes, wait_status)`, or None on timeout) into a parsed
     response dict, for one child's output."""
-    if out is None:
+    if result is None:
         return _timeout_response(timeout)
+    out, status = result
     if not out:
-        return _no_output_response()
+        return _no_output_response(status)
     try:
         return json.loads(out)
     except ValueError:
-        # A child killed mid-write (rlimit SIGKILL) leaves truncated JSON. That must fail this
-        # one item on the error channel, never crash the whole serve loop.
+        # Truncated JSON: a signal-killed child (rlimit SIGKILL, or a crash) gets that specific
+        # classification; a normally-exited child that still wrote a partial line keeps the
+        # generic harness classification. Either way this must fail this one item on the error
+        # channel, never crash the whole serve loop.
+        err = _signal_error(status)
+        if err is None:
+            err = make_error("harness", "partial_output", "child output was truncated")
         resp = base_response()
-        resp["error"] = make_error("harness", "partial_output", "child output was truncated")
+        resp["error"] = err
         return resp
 
 
@@ -813,11 +843,12 @@ def _run_one(req, timeout):
 def _run_one_bytes(req, timeout):
     """Run one prepared request dict in a forked child; return the raw response bytes, so a
     single unbatched request's output never pays a parse/re-serialize round trip."""
-    out = _handle_in_child(req, timeout)
-    if out is None:
+    result = _handle_in_child(req, timeout)
+    if result is None:
         return json.dumps(_timeout_response(timeout), allow_nan=False).encode()
+    out, status = result
     if not out:
-        return json.dumps(_no_output_response(), allow_nan=False).encode()
+        return json.dumps(_no_output_response(status), allow_nan=False).encode()
     return out
 
 
@@ -899,15 +930,15 @@ def serve():
         if batch is not None:
             base = {k: v for k, v in req.items() if k != "batch"}
             whole_timeout = timeout * max(len(batch), 1)
-            raw_out = _fork_bytes(lambda: _run_batch_primed(base, batch, timeout), whole_timeout)
-            if raw_out is None:
+            batch_result = _fork_bytes(lambda: _run_batch_primed(base, batch, timeout), whole_timeout)
+            if batch_result is None:
                 results = [_timeout_response(timeout) for _ in batch]
                 out = json.dumps({"results": results}, allow_nan=False).encode()
-            elif not raw_out:
-                results = [_no_output_response() for _ in batch]
+            elif not batch_result[0]:
+                results = [_no_output_response(batch_result[1]) for _ in batch]
                 out = json.dumps({"results": results}, allow_nan=False).encode()
             else:
-                out = raw_out
+                out = batch_result[0]
         else:
             out = _run_one_bytes(req, timeout)
         sys.stdout.buffer.write(out + b"\n")

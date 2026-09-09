@@ -155,6 +155,37 @@ fn recursion_error_is_reported_as_resource_kill_not_raised() {
 }
 
 #[test]
+fn signal_killed_child_is_reported_as_resource_error() {
+    if !ready("signal_killed_child_is_reported_as_resource_error") {
+        return;
+    }
+    // The jail's own 10 s CPU rlimit races the harness's 10 s wall timeout, so a plain busy loop
+    // is not a reliable SIGXCPU. The function lowers its own CPU rlimit (a process may always
+    // lower one) to a 1 s soft / 3 s hard pair: the soft limit sends SIGXCPU, whose default
+    // action terminates the child well before either 10 s bound.
+    let src = "def burn(n):\n    import resource\n    resource.setrlimit(resource.RLIMIT_CPU, (1, 3))\n    total = 0\n    i = 0\n    while i < n:\n        total = (total + i) % 1000000007\n        i += 1\n    return total\n";
+    let mut replay = ReplayMap::new();
+    replay.insert("burn".to_string(), vec![vec![json!(100_000_000_000i64)]]);
+    let rec = record_file(src, 0, &replay, RecordFlags::default()).expect("record");
+    let f = rec
+        .functions
+        .iter()
+        .find(|r| r.signature.name == "burn")
+        .expect("burn record");
+    let replayed: Vec<_> = f.cases.iter().filter(|c| c.source == CaseSource::Replay).collect();
+    assert_eq!(replayed.len(), 1, "expected exactly the replayed case");
+    let c = replayed[0];
+    assert_eq!(c.outcome, "error", "expected an error outcome, got {:?}", c.outcome);
+    let err = c.error.as_ref().expect("structured error for a signal-killed child");
+    assert!(
+        err.is_resource(),
+        "expected stage == \"resource\", got {:?}",
+        err.stage
+    );
+    assert_eq!(err.kind, "cpu_limit", "expected a SIGXCPU classification, got {:?}", err.kind);
+}
+
+#[test]
 fn semantic_raise_is_unaffected_by_resource_kill_handling() {
     if !ready("semantic_raise_is_unaffected_by_resource_kill_handling") {
         return;
