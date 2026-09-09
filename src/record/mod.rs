@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::exec::{CallInput, CallResult, HarnessError, NsjailPool, Sandbox};
+use crate::exec::{CallInput, CallResult, HarnessError, Limits, NsjailPool, Sandbox};
 use crate::generate::{GenInput, ValueDomain, gen_inputs};
 use crate::model::branch::fine_targets;
 use crate::model::{DefKind, EffectSignature, Import};
@@ -235,7 +235,7 @@ pub fn record_with_signatures(
         // Ground truth for "can anything in this file run": exec the real source once. This
         // respects guards (e.g. `try: import numpy except ImportError: ...`) that per-import
         // probing can't see, and yields the exact blocking module via the structured error.
-        let load = sandbox.probe_load(src, None, None)?;
+        let load = sandbox.probe_load(src, None, None, Limits::default())?;
         if load.ok { None } else { load.error }
     };
 
@@ -381,7 +381,7 @@ fn probe_dependencies(
 /// Try `import <module>` in the jail. Returns `None` if it resolves, else the structured error.
 fn probe_import(sandbox: &dyn Sandbox, module: &str) -> Result<Option<HarnessError>, String> {
     let src = format!("import {module}\n");
-    let r = sandbox.probe_load(&src, None, None)?;
+    let r = sandbox.probe_load(&src, None, None, Limits::default())?;
     if r.ok {
         Ok(None)
     } else {
@@ -428,7 +428,7 @@ fn function_cases(
             .iter()
             .map(|input| (input.positional.as_slice(), input.kwargs.as_slice()))
             .collect();
-        let results = sandbox.call_batch(src, &sig.name, &call_inputs, None, None, &fine)?;
+        let results = sandbox.call_batch(src, &sig.name, &call_inputs, None, &fine, Limits::default())?;
         if probe_module_load && first_chunk
             && let Some(err) = uniform_setup_failure(&results)
         {
@@ -439,7 +439,7 @@ fn function_cases(
             let mut case = build_case(sig, input, None, result, CaseSource::Generated);
             if case.outcome == "raised" {
                 case.minimized = minimize_raised(&case, input, opts.domain, |pos, kw| {
-                    sandbox.call(src, &sig.name, pos, kw, &fine)
+                    sandbox.call(src, &sig.name, pos, kw, &fine, Limits::default())
                 })?;
             }
             cases.push(case);
@@ -450,7 +450,7 @@ fn function_cases(
             .iter()
             .map(|tuple| (tuple.as_slice(), EMPTY_KWARGS))
             .collect();
-        let results = sandbox.call_batch(src, &sig.name, &call_inputs, None, None, &fine)?;
+        let results = sandbox.call_batch(src, &sig.name, &call_inputs, None, &fine, Limits::default())?;
         for (tuple, result) in replay_inputs.iter().zip(&results) {
             let input = GenInput {
                 positional: tuple.clone(),
@@ -522,7 +522,7 @@ fn method_record(
     let ctor_args = constructor_args(all, class, opts.domain);
 
     if !ctor_cache.contains_key(class) {
-        let probe = sandbox.probe_load(src, Some(class), Some(&ctor_args))?;
+        let probe = sandbox.probe_load(src, Some(class), Some(&ctor_args), Limits::default())?;
         let err = if probe.ok { None } else { probe.error };
         ctor_cache.insert(class.to_string(), err);
     }
@@ -548,13 +548,26 @@ fn method_record(
             .iter()
             .map(|input| (input.positional.as_slice(), input.kwargs.as_slice()))
             .collect();
-        let results =
-            sandbox.call_batch(src, &sig.name, &call_inputs, Some(class), Some(&ctor_args), &fine)?;
+        let results = sandbox.call_batch(
+            src,
+            &sig.name,
+            &call_inputs,
+            Some((class, ctor_args.as_slice())),
+            &fine,
+            Limits::default(),
+        )?;
         for (input, result) in chunk.iter().zip(&results) {
             let mut case = build_case(sig, input, Some(ctor_args.clone()), result, CaseSource::Generated);
             if case.outcome == "raised" {
                 case.minimized = minimize_raised(&case, input, opts.domain, |pos, kw| {
-                    sandbox.call_method(src, class, &ctor_args, &sig.name, (pos, kw), &fine)
+                    sandbox.call_method(
+                        src,
+                        (class, &ctor_args),
+                        &sig.name,
+                        (pos, kw),
+                        &fine,
+                        Limits::default(),
+                    )
                 })?;
             }
             cases.push(case);
@@ -565,8 +578,14 @@ fn method_record(
             .iter()
             .map(|tuple| (tuple.as_slice(), EMPTY_KWARGS))
             .collect();
-        let results =
-            sandbox.call_batch(src, &sig.name, &call_inputs, Some(class), Some(&ctor_args), &fine)?;
+        let results = sandbox.call_batch(
+            src,
+            &sig.name,
+            &call_inputs,
+            Some((class, ctor_args.as_slice())),
+            &fine,
+            Limits::default(),
+        )?;
         for (tuple, result) in replay_inputs.iter().zip(&results) {
             let input = GenInput {
                 positional: tuple.clone(),

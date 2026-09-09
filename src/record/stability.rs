@@ -5,7 +5,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::exec::{CallInput, Sandbox};
+use crate::exec::{CallInput, Limits, Sandbox};
 use crate::generate::GenInput;
 use crate::model::EffectSignature;
 
@@ -91,9 +91,16 @@ pub(super) fn stabilize_cases(
                     .owner
                     .as_deref()
                     .ok_or_else(|| format!("method {:?} has no owning class", sig.name))?;
-                sandbox.call_batch(src, &sig.name, &call_inputs, Some(class), Some(ctor_args), &[])?
+                sandbox.call_batch(
+                    src,
+                    &sig.name,
+                    &call_inputs,
+                    Some((class, ctor_args.as_slice())),
+                    &[],
+                    Limits::default(),
+                )?
             }
-            None => sandbox.call_batch(src, &sig.name, &call_inputs, None, None, &[])?,
+            None => sandbox.call_batch(src, &sig.name, &call_inputs, None, &[], Limits::default())?,
         };
 
         let mut next_alive = Vec::with_capacity(alive.len());

@@ -22,11 +22,40 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::model::branch::{FineHit, FineTarget};
+
+/// The default per-call wall limit (`PYLENS_CALL_TIMEOUT`, seconds, default `10`) — kept in sync
+/// with `worker.py`'s own `_default_call_timeout` fallback so the two never drift.
+pub fn default_call_timeout() -> Duration {
+    let secs = std::env::var("PYLENS_CALL_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(10.0);
+    Duration::from_secs_f64(secs)
+}
+
+/// The wall limits one sandbox request runs under: `per_call` bounds each individual call
+/// (each batch item gets its own), `batch` bounds a whole batched request end to end.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    pub per_call: Duration,
+    pub batch: Option<Duration>,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            per_call: default_call_timeout(),
+            batch: None,
+        }
+    }
+}
 
 #[derive(Serialize)]
 struct Request<'a> {
@@ -51,6 +80,8 @@ struct Request<'a> {
     /// nothing extra.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     fine_targets: &'a [FineTarget],
+    /// Per-call wall limit, seconds — see [`Limits::per_call`].
+    timeout: f64,
 }
 
 /// One item of a batched request: positional and keyword-only arguments for a single call
@@ -77,6 +108,12 @@ struct BatchRequest<'a> {
     /// Shared across the whole batch — see [`Request::fine_targets`].
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     fine_targets: &'a [FineTarget],
+    /// Per-item wall limit, seconds — see [`Limits::per_call`].
+    timeout: f64,
+    /// Whole-batch wall limit, seconds — see [`Limits::batch`]. Absent means let the worker
+    /// derive its own default (`timeout * len(batch)`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_timeout: Option<f64>,
     batch: Vec<BatchItem<'a>>,
 }
 
@@ -101,10 +138,18 @@ pub struct Exc {
 ///
 /// `stage == "resource"` is a **resource kill**: the sandbox ran the function out of memory
 /// (`kind = "MemoryError"`), recursion depth (`kind = "RecursionError"`), wall time
-/// (`kind = "timeout"`), the jail's CPU rlimit (`kind = "cpu_limit"`, SIGXCPU), or was otherwise
-/// signal-killed (`kind = "killed"`, SIGKILL — e.g. the OOM killer). This is strictly distinct
-/// from a semantic Python raise — see [`HarnessError::is_resource`] and `Case::outcome` in
-/// `record.rs`.
+/// (`kind = "timeout"`), the jail's CPU rlimit (`kind = "cpu_limit"`, SIGXCPU), was otherwise
+/// signal-killed (`kind = "killed"`, SIGKILL — e.g. the OOM killer), or never started at all
+/// because a batch's soft whole-batch deadline passed before its turn (`kind =
+/// "deadline_skipped"` — unlike every other resource kind, this one means the item was never
+/// run, not that it started and was stopped). This is strictly distinct from a semantic Python
+/// raise — see [`HarnessError::is_resource`] and `Case::outcome` in `record.rs`.
+///
+/// A `kind = "timeout"` result is a real, kept observation — the item started, ran, and was
+/// killed on its wall limit; it still carries whatever `lines` it reached before the kill, which
+/// coverage uses. Only `kind = "deadline_skipped"` means nothing executed, so a consumer building
+/// a case from these results keeps every `timeout` (and every other resource kind) but drops
+/// `deadline_skipped` outright — there is no observation to record.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct HarnessError {
     pub stage: String,
@@ -177,6 +222,10 @@ pub struct CallResult {
 /// [`Sandbox::call_batch`].
 pub type CallInput<'a> = (&'a [Value], &'a [(String, Value)]);
 
+/// `(class, ctor_args)` for a method call's receiver — bundled the way [`CallInput`] bundles
+/// `(args, kwargs)`, to keep argument counts under clippy's `too_many_arguments` threshold.
+pub type Receiver<'a> = (&'a str, &'a [Value]);
+
 /// A jailed Python execution → observed effects. Implementors provide [`Sandbox::transport`]
 /// (send one encoded request, get the result); `call` / `call_method` are built on top.
 pub trait Sandbox {
@@ -186,6 +235,7 @@ pub trait Sandbox {
     /// Execute free function `fn_name(*args, **kwargs)`. `fine_targets`: same-line branch points
     /// to resolve via opcode-level tracing — see [`Request::fine_targets`]. Pass `&[]` when the
     /// function has none (the common case; the worker then never enables opcode tracing).
+    /// `limits`: the wall limits this call runs under — see [`Limits`].
     fn call(
         &self,
         source: &str,
@@ -193,25 +243,27 @@ pub trait Sandbox {
         args: &[Value],
         kwargs: &[(String, Value)],
         fine_targets: &[FineTarget],
+        limits: Limits,
     ) -> Result<CallResult, String> {
-        let body = encode_request(source, Some(fn_name), args, kwargs, None, None, fine_targets)?;
+        let body = encode_request(source, Some(fn_name), args, kwargs, None, fine_targets, limits)?;
         self.transport(&body)
     }
 
     /// Execute `class(*ctor_args).method(*args, **kwargs)`, capturing receiver pre/post state.
-    /// `input` bundles `(args, kwargs)` — see [`CallInput`] — to keep the argument count under
-    /// clippy's `too_many_arguments` threshold.
+    /// `receiver` bundles `(class, ctor_args)` — see [`Receiver`] — and `input` bundles
+    /// `(args, kwargs)` — see [`CallInput`] — to keep the argument count under clippy's
+    /// `too_many_arguments` threshold.
     fn call_method(
         &self,
         source: &str,
-        class: &str,
-        ctor_args: &[Value],
+        receiver: Receiver,
         method: &str,
         input: CallInput,
         fine_targets: &[FineTarget],
+        limits: Limits,
     ) -> Result<CallResult, String> {
         let (args, kwargs) = input;
-        let body = encode_request(source, Some(method), args, kwargs, Some(class), Some(ctor_args), fine_targets)?;
+        let body = encode_request(source, Some(method), args, kwargs, Some(receiver), fine_targets, limits)?;
         self.transport(&body)
     }
 
@@ -224,38 +276,40 @@ pub trait Sandbox {
         source: &str,
         class: Option<&str>,
         ctor_args: Option<&[Value]>,
+        limits: Limits,
     ) -> Result<CallResult, String> {
-        let body = encode_request(source, None, &[], &[], class, ctor_args, &[])?;
+        let body = encode_request(source, None, &[], &[], class.zip(ctor_args), &[], limits)?;
         self.transport(&body)
     }
 
     /// Execute every `(args, kwargs)` pair in `inputs` against the same `fn_name` (and, if
-    /// `class` is given, the same receiver built from `ctor_args`), returning one [`CallResult`]
-    /// per input in order. The default implementation just loops over [`Sandbox::call`] /
-    /// [`Sandbox::call_method`] — one round trip per input, as before — so [`Nsjail`] and any
-    /// test double keep working unchanged. [`NsjailPool`] overrides this with a single batched
-    /// round trip, amortizing the per-request IPC cost across the whole batch.
+    /// `receiver` is given, the same receiver built from `(class, ctor_args)` — see
+    /// [`Receiver`]), returning one [`CallResult`] per input in order. The default implementation
+    /// just loops over [`Sandbox::call`] / [`Sandbox::call_method`] — one round trip per input, as
+    /// before — so [`Nsjail`] and any test double keep working unchanged. [`NsjailPool`]
+    /// overrides this with a single batched round trip, amortizing the per-request IPC cost
+    /// across the whole batch.
     fn call_batch(
         &self,
         source: &str,
         fn_name: &str,
         inputs: &[CallInput],
-        class: Option<&str>,
-        ctor_args: Option<&[Value]>,
+        receiver: Option<Receiver>,
         fine_targets: &[FineTarget],
+        limits: Limits,
     ) -> Result<Vec<CallResult>, String> {
         inputs
             .iter()
-            .map(|&(args, kwargs)| match class {
-                Some(c) => self.call_method(
+            .map(|&(args, kwargs)| match receiver {
+                Some((class, ctor_args)) => self.call_method(
                     source,
-                    c,
-                    ctor_args.unwrap_or(&[]),
+                    (class, ctor_args),
                     fn_name,
                     (args, kwargs),
                     fine_targets,
+                    limits,
                 ),
-                None => self.call(source, fn_name, args, kwargs, fine_targets),
+                None => self.call(source, fn_name, args, kwargs, fine_targets, limits),
             })
             .collect()
     }
@@ -266,10 +320,14 @@ fn encode_request(
     fn_name: Option<&str>,
     args: &[Value],
     kwargs: &[(String, Value)],
-    class: Option<&str>,
-    ctor_args: Option<&[Value]>,
+    receiver: Option<Receiver>,
     fine_targets: &[FineTarget],
+    limits: Limits,
 ) -> Result<Vec<u8>, String> {
+    let (class, ctor_args) = match receiver {
+        Some((class, ctor_args)) => (Some(class), Some(ctor_args)),
+        None => (None, None),
+    };
     let req = Request {
         source,
         fn_name,
@@ -278,6 +336,7 @@ fn encode_request(
         class,
         ctor_args,
         fine_targets,
+        timeout: limits.per_call.as_secs_f64(),
     };
     serde_json::to_vec(&req).map_err(|e| e.to_string())
 }
@@ -298,6 +357,7 @@ fn encode_batch_request(
     class: Option<&str>,
     ctor_args: Option<&[Value]>,
     fine_targets: &[FineTarget],
+    limits: Limits,
 ) -> Result<Vec<u8>, String> {
     let req = BatchRequest {
         source,
@@ -305,6 +365,8 @@ fn encode_batch_request(
         class,
         ctor_args,
         fine_targets,
+        timeout: limits.per_call.as_secs_f64(),
+        batch_timeout: limits.batch.map(|d| d.as_secs_f64()),
         batch: inputs
             .iter()
             .map(|(args, kwargs)| BatchItem {
@@ -595,14 +657,18 @@ impl Sandbox for NsjailPool {
         source: &str,
         fn_name: &str,
         inputs: &[CallInput],
-        class: Option<&str>,
-        ctor_args: Option<&[Value]>,
+        receiver: Option<Receiver>,
         fine_targets: &[FineTarget],
+        limits: Limits,
     ) -> Result<Vec<CallResult>, String> {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
-        let body = encode_batch_request(source, fn_name, inputs, class, ctor_args, fine_targets)?;
+        let (class, ctor_args) = match receiver {
+            Some((class, ctor_args)) => (Some(class), Some(ctor_args)),
+            None => (None, None),
+        };
+        let body = encode_batch_request(source, fn_name, inputs, class, ctor_args, fine_targets, limits)?;
         let expected_len = inputs.len();
         self.with_worker(|w| w.exchange_batch(&body, expected_len))
     }
@@ -626,7 +692,7 @@ mod tests {
         let args_b = [json!(3)];
         let kwargs_b = [("flag".to_string(), json!(true))];
         let inputs: [CallInput; 2] = [(&args_a, &[]), (&args_b, &kwargs_b)];
-        let body = encode_batch_request("SRC", "f", &inputs, None, None, &[]).unwrap();
+        let body = encode_batch_request("SRC", "f", &inputs, None, None, &[], Limits::default()).unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(value["source"], json!("SRC"));
@@ -646,7 +712,7 @@ mod tests {
         let args = [json!(1)];
         let ctor_args = [json!("x")];
         let inputs: [CallInput; 1] = [(&args, &[])];
-        let body = encode_batch_request("SRC", "m", &inputs, Some("Widget"), Some(&ctor_args), &[]).unwrap();
+        let body = encode_batch_request("SRC", "m", &inputs, Some("Widget"), Some(&ctor_args), &[], Limits::default()).unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(value["class"], json!("Widget"));

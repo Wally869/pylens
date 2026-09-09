@@ -709,6 +709,10 @@ def oneshot():
         resp["error"] = make_error("bad_request", type(e).__name__, str(e))
         sys.stdout.write(json.dumps(resp, allow_nan=False))
         return
+    if isinstance(req, dict) and "timeout" in req:
+        timeout = _parse_timeout(req.get("timeout"), _default_call_timeout())
+        sys.stdout.write(json.dumps(_run_one(req, timeout), allow_nan=False))
+        return
     sys.stdout.write(json.dumps(run_request(req), allow_nan=False))
 
 
@@ -775,9 +779,28 @@ def _handle_in_child(req, timeout):
     return _fork_bytes(lambda: json.dumps(run_request(req), allow_nan=False).encode(), timeout)
 
 
+def _default_call_timeout():
+    return float(os.environ.get("PYLENS_CALL_TIMEOUT", "10"))
+
+
+def _parse_timeout(value, default):
+    """Parse a wire timeout field (seconds, float) into a positive float, falling back to
+    `default` for anything missing, unparseable, or non-positive rather than crashing the
+    serve loop over one malformed request."""
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
 def _timeout_response(timeout):
     # Wall-time exceeded: as much a resource kill as MemoryError/RecursionError, so it gets the
-    # same `stage="resource"` category (kind distinguishes the specific cause).
+    # same `stage="resource"` category (kind distinguishes the specific cause). The item DID
+    # start and run, so this is a real, kept observation — it still carries whatever `lines` it
+    # reached before the kill. Unlike `deadline_skipped` (below), a consumer must never drop it.
     resp = base_response()
     resp["error"] = make_error("resource", "timeout", f"request exceeded {timeout}s")
     return resp
@@ -852,15 +875,30 @@ def _run_one_bytes(req, timeout):
     return out
 
 
-def _run_batch_primed(base_req, batch, timeout):
+def _deadline_skipped_response():
+    # The batch's soft deadline passed before this item got a chance to start — distinct from
+    # every other resource kind (timeout, cpu_limit, killed, MemoryError, RecursionError), all of
+    # which mean the item started and was then stopped. This one means it never ran at all.
+    resp = base_response()
+    resp["error"] = make_error("resource", "deadline_skipped", "batch deadline reached before this item started")
+    return resp
+
+
+def _run_batch_primed(base_req, batch, timeout, batch_timeout):
     """Run inside the batch's intermediate child (already forked from the serve parent). Execs
     the module ONCE, then forks one grandchild per batch item from that primed state, so each
     item skips its own module re-exec — the cost that dominates for a module with real size.
 
     Each grandchild still gets its own fork (so its mutations to the shared `ns` die with it —
     fork's copy-on-write means siblings never see each other's writes) and its own per-item
-    timeout, so a hanging item is killed without sinking the rest of the batch. Returns the
-    assembled `{"results": [...]}` bytes; a module-load failure here is reported as the same
+    timeout, so a hanging item is killed without sinking the rest of the batch. `batch_timeout` is
+    a SOFT whole-batch deadline computed from the moment this function starts: before starting
+    each item, if the deadline has passed, that item (and every item after it) is never started —
+    it gets a `deadline_skipped` response instead, never a fresh attempt. This is the mechanism
+    that actually enforces the whole-batch limit; the serve parent's own hard kill (see `serve`)
+    is only a backstop against this function itself wedging, so completed items are never thrown
+    away by that backstop firing. Returns the assembled `{"results": [...]}` bytes, always one
+    entry per batch item, in order; a module-load failure here is reported as the same
     `stage="setup"` error, once per item, that a per-case exec would have produced.
     """
     timing = bool(base_req.get("timing"))
@@ -877,8 +915,12 @@ def _run_batch_primed(base_req, batch, timeout):
         return json.dumps({"results": results}, allow_nan=False).encode()
 
     module_exec_us = (time.perf_counter_ns() - t0) // 1000
+    deadline = time.monotonic() + batch_timeout
     results = []
     for item in batch:
+        if time.monotonic() >= deadline:
+            results.append(_deadline_skipped_response())
+            continue
         item_req = dict(base_req)
         item_req["args"] = item.get("args", [])
         item_req["kwargs"] = item.get("kwargs", {})
@@ -905,14 +947,20 @@ def serve():
     "kwargs":{...}}, ...]}`. A batch is run by an intermediate child (`_run_batch_primed`) that
     execs the module once and forks one grandchild per item from that primed state, so only the
     first item in the batch pays a module exec. The intermediate child enforces each item's
-    normal per-item timeout itself; the serve parent supervises the intermediate child with a
-    whole-batch deadline of `timeout * len(batch)` as a backstop against the intermediate child
-    itself wedging — a timed-out item still only kills its own grandchild, never a sibling. The
-    whole batch gets ONE newline-delimited response: `{"results": [<normal response>, ...]}`.
-    Unbatched requests (validate, probes, one-shot mode) are untouched: one fork, exec in the
-    child, byte-identical output to before.
+    normal per-item timeout itself, and enforces the whole-batch limit ITSELF as a SOFT deadline —
+    once passed, it stops starting new items and reports the rest `deadline_skipped`, never
+    losing a result that already completed. That whole-batch limit defaults to
+    `timeout * len(batch)`. The serve parent only supervises the intermediate child with a HARD
+    kill, set above the soft deadline (soft deadline plus one more per-item timeout), so it fires
+    only if the intermediate child itself wedges — the soft path inside it is what normally
+    enforces the limit, and only a wedge ever loses a whole batch's results. A request may
+    override both limits: `timeout` (per item) and `batch_timeout` (the soft whole-batch
+    deadline); either falls back to its default when absent, unparseable, or non-positive. The
+    whole batch gets ONE newline-delimited response: `{"results": [<normal response>, ...]}`,
+    always one entry per batch item. Unbatched requests (validate, probes, one-shot mode) are
+    untouched: one fork, exec in the child, byte-identical output to before.
     """
-    timeout = float(os.environ.get("PYLENS_CALL_TIMEOUT", "10"))
+    default_timeout = _default_call_timeout()
     for raw in sys.stdin.buffer:
         line = raw.strip()
         if not line:
@@ -929,8 +977,13 @@ def serve():
         batch = req.get("batch") if isinstance(req, dict) else None
         if batch is not None:
             base = {k: v for k, v in req.items() if k != "batch"}
-            whole_timeout = timeout * max(len(batch), 1)
-            batch_result = _fork_bytes(lambda: _run_batch_primed(base, batch, timeout), whole_timeout)
+            timeout = _parse_timeout(req.get("timeout"), default_timeout)
+            soft_batch_timeout = _parse_timeout(req.get("batch_timeout"), timeout * max(len(batch), 1))
+            hard_batch_timeout = soft_batch_timeout + timeout
+            batch_result = _fork_bytes(
+                lambda: _run_batch_primed(base, batch, timeout, soft_batch_timeout),
+                hard_batch_timeout,
+            )
             if batch_result is None:
                 results = [_timeout_response(timeout) for _ in batch]
                 out = json.dumps({"results": results}, allow_nan=False).encode()
@@ -940,6 +993,7 @@ def serve():
             else:
                 out = batch_result[0]
         else:
+            timeout = _parse_timeout(req.get("timeout") if isinstance(req, dict) else None, default_timeout)
             out = _run_one_bytes(req, timeout)
         sys.stdout.buffer.write(out + b"\n")
         sys.stdout.buffer.flush()

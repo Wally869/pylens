@@ -3,7 +3,7 @@
 //! Like the flow tests, this is jailed and **skips** when the sandbox isn't provisioned
 //! (`scripts/provision-sandbox.sh`) rather than falling back to an unsandboxed run.
 
-use pylens::exec::{CallInput, NsjailPool, Sandbox, probe};
+use pylens::exec::{CallInput, Limits, NsjailPool, Sandbox, probe};
 use serde_json::json;
 
 #[test]
@@ -17,7 +17,14 @@ fn pool_executes_and_isolates_across_calls() {
 
     // A mutation + return-aliasing call.
     let r = pool
-        .call("def f(xs):\n    xs.append(1)\n    return xs", "f", &[json!([0])], &[], &[])
+        .call(
+            "def f(xs):\n    xs.append(1)\n    return xs",
+            "f",
+            &[json!([0])],
+            &[],
+            &[],
+            Limits::default(),
+        )
         .expect("call f");
     assert!(r.ok, "f should run: {:?}", r.error);
     assert_eq!(r.ret, json!([0, 1]));
@@ -32,10 +39,18 @@ fn pool_executes_and_isolates_across_calls() {
             &[json!([1, 2, 3])],
             &[],
             &[],
+            Limits::default(),
         )
         .expect("call p");
     let clean = pool
-        .call("def q(x):\n    return len(x)", "q", &[json!([1, 2, 3])], &[], &[])
+        .call(
+            "def q(x):\n    return len(x)",
+            "q",
+            &[json!([1, 2, 3])],
+            &[],
+            &[],
+            Limits::default(),
+        )
         .expect("call q");
     assert!(clean.ok);
     assert_eq!(clean.ret, json!(3), "builtins patch leaked across pool calls");
@@ -55,12 +70,14 @@ fn call_batch_matches_the_same_calls_made_one_at_a_time() {
     let call_inputs: Vec<CallInput> =
         inputs.iter().map(|v| (std::slice::from_ref(v), &[][..])).collect();
     let batched = pool
-        .call_batch(src, "f", &call_inputs, None, None, &[])
+        .call_batch(src, "f", &call_inputs, None, &[], Limits::default())
         .expect("call_batch f");
     assert_eq!(batched.len(), inputs.len());
 
     for (v, batched_result) in inputs.iter().zip(&batched) {
-        let single = pool.call(src, "f", std::slice::from_ref(v), &[], &[]).expect("call f");
+        let single = pool
+            .call(src, "f", std::slice::from_ref(v), &[], &[], Limits::default())
+            .expect("call f");
         assert_eq!(batched_result.ok, single.ok);
         assert_eq!(batched_result.ret, single.ret);
         assert_eq!(
@@ -92,7 +109,7 @@ fn call_batch_isolates_sibling_grandchildren_from_a_module_level_mutation() {
     let call_inputs: Vec<CallInput> =
         inputs.iter().map(|v| (std::slice::from_ref(v), &[][..])).collect();
     let batched = pool
-        .call_batch(src, "f", &call_inputs, None, None, &[])
+        .call_batch(src, "f", &call_inputs, None, &[], Limits::default())
         .expect("call_batch f");
     assert_eq!(batched.len(), inputs.len());
 

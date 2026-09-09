@@ -14,7 +14,7 @@ use ruff_source_file::LineIndex;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::exec::{CallResult, Sandbox};
+use crate::exec::{CallResult, Limits, Sandbox};
 use crate::generate::predicate::{self, BoolOpGroup, LinePredicates, Predicate};
 use crate::generate::{GenInput, ValueDomain, gen_inputs, positional_params};
 use crate::model::branch::{OutcomeEvidence, fine_targets};
@@ -414,9 +414,9 @@ pub(super) fn run_loop(
     let fine = fine_targets(&sig.branch_points);
     let call = |pos: &[Value], kw: &[(String, Value)]| -> Result<CallResult, String> {
         match &target {
-            CallTarget::Function => sandbox.call(src, &sig.name, pos, kw, &fine),
+            CallTarget::Function => sandbox.call(src, &sig.name, pos, kw, &fine, Limits::default()),
             CallTarget::Method { class, ctor_args } => {
-                sandbox.call_method(src, class, ctor_args, &sig.name, (pos, kw), &fine)
+                sandbox.call_method(src, (class, ctor_args), &sig.name, (pos, kw), &fine, Limits::default())
             }
         }
     };

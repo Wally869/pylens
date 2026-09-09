@@ -3,7 +3,7 @@
 //! `tests/record.rs`). The static enumeration itself is pure and lives in
 //! `tests/branches_static.rs`.
 
-use pylens::exec::{Sandbox, probe};
+use pylens::exec::{Limits, Sandbox, probe};
 use pylens::model::branch::BranchKind;
 use pylens::record::{BranchReport, FunctionRecord, RecordFlags, ReplayMap, record_file};
 use serde_json::json;
@@ -62,7 +62,9 @@ fn else_less_if_false_path_is_covered_via_its_arc() {
     // trace the (2, 4) transition — straight from the test line to the fall-through line,
     // skipping the body's line 3 entirely.
     let sandbox = pylens::exec::Nsjail::new();
-    let result = sandbox.call(src, "f", &[json!(-1)], &[], &[]).expect("call");
+    let result = sandbox
+        .call(src, "f", &[json!(-1)], &[], &[], Limits::default())
+        .expect("call");
     assert!(
         result.arcs.contains(&(2, 4)),
         "expected the false-path arc (2, 4): {:?}",
