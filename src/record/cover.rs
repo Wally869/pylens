@@ -450,7 +450,7 @@ pub(super) fn run_loop(
                 let mut case = build_case(sig, &gi, ctor_args_for_case.clone(), &result, CaseSource::Generated);
                 if case.outcome == "raised" {
                     case.minimized =
-                        minimize_raised(&case, &gi, opts.domain, opts.budget, |pos, kw, limits| call(pos, kw, limits))?;
+                        minimize_raised(&case, &gi, opts.domain, opts.budget, opts.no_shrink, |pos, kw, limits| call(pos, kw, limits))?;
                 }
                 cases.push(case);
                 executed_this_round = true;

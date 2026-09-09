@@ -136,7 +136,7 @@ fn main() {
                  pylens record <file.py|dir> [--inputs <N>] [--base-inputs <N>] \
                  [--replay <cases.json>] \
                  [--value-domain <profile.json>] [--cover-branches] [--stability-runs <N>] \
-                 [--time-budget <seconds>] [--format json|summary|pyi|html]\n  \
+                 [--time-budget <seconds>] [--no-shrink] [--format json|summary|pyi|html]\n  \
                  pylens validate <file.py|dir> [--inputs <N>] [--format json|summary|html]"
             );
             std::process::exit(2);
@@ -255,6 +255,7 @@ fn cmd_record(args: &[String]) {
         ValueDomain::parse(&text).unwrap_or_else(|e| fail(&format!("record error: {e}")))
     });
     let cover_branches = args.iter().any(|a| a == "--cover-branches");
+    let no_shrink = args.iter().any(|a| a == "--no-shrink");
     let stability_runs: Option<usize> = flag(args, "--stability-runs").map(|s| {
         let n: usize = s
             .parse()
@@ -300,6 +301,7 @@ fn cmd_record(args: &[String]) {
                 base_inputs,
                 stability_runs,
                 time_budget,
+                no_shrink,
             },
             replay.as_ref(),
         ) {
@@ -331,6 +333,7 @@ fn cmd_record(args: &[String]) {
             base_inputs,
             stability_runs,
             time_budget,
+            no_shrink,
         },
     );
     match record_result {

@@ -72,6 +72,9 @@ pub struct RecordFlags<'a> {
     /// budget — external evidence must not silently vanish. `None` (the default) leaves
     /// `record`'s behavior and timing unchanged.
     pub time_budget: Option<std::time::Duration>,
+    /// `--no-shrink`: skip [`minimize_raised`] entirely, leaving `Case::minimized` as `None` for
+    /// every raised case. `false` (the default) leaves `record`'s output unchanged.
+    pub no_shrink: bool,
 }
 
 /// Generation settings threaded through the recording of one function or method: the
@@ -91,6 +94,8 @@ pub(super) struct GenOptions<'a> {
     /// Leases wall limits for each piece of generated work from the function's `--time-budget`
     /// deadline (if any) — see [`Budget::lease`] and [`RecordFlags::time_budget`].
     pub(super) budget: &'a Budget,
+    /// `--no-shrink` — see [`RecordFlags::no_shrink`].
+    pub(super) no_shrink: bool,
 }
 
 /// External input tuples supplied via `--replay`: function name → list of positional-argument
@@ -203,7 +208,7 @@ pub fn record_with_signatures(
     replay: &ReplayMap,
     flags: RecordFlags,
 ) -> Result<ModuleRecord, String> {
-    let RecordFlags { domain, cover_branches, base_inputs, stability_runs, time_budget } = flags;
+    let RecordFlags { domain, cover_branches, base_inputs, stability_runs, time_budget, no_shrink } = flags;
     if let Some(runs) = stability_runs {
         assert!(runs >= 2, "stability_runs must be >= 2 (checked by the CLI)");
     }
@@ -254,7 +259,7 @@ pub fn record_with_signatures(
         }
         let replay_inputs: &[Vec<Value>] = replay.get(&sig.name).map(Vec::as_slice).unwrap_or(&[]);
         let budget = Budget::new(time_budget);
-        let opts = GenOptions { max_inputs, base_inputs, domain, cover_branches, budget: &budget };
+        let opts = GenOptions { max_inputs, base_inputs, domain, cover_branches, budget: &budget, no_shrink };
         let (uncallable, mut cases, cover_ctx) = match sig.kind {
             DefKind::Function => {
                 let probe_module_load = fold_probe_idx == Some(i);
@@ -435,7 +440,7 @@ fn function_cases(
             }
             let mut case = build_case(sig, input, None, result, CaseSource::Generated);
             if case.outcome == "raised" {
-                case.minimized = minimize_raised(&case, input, opts.domain, opts.budget, |pos, kw, limits| {
+                case.minimized = minimize_raised(&case, input, opts.domain, opts.budget, opts.no_shrink, |pos, kw, limits| {
                     sandbox.call(src, &sig.name, pos, kw, &fine, limits)
                 })?;
             }
@@ -483,14 +488,19 @@ fn uniform_setup_failure(results: &[CallResult]) -> Option<HarnessError> {
 
 /// Shrink a `raised` case's input, re-executing via `call` (the same call shape — free function
 /// or method — the case itself ran on), leasing wall limits for each candidate call from
-/// `budget`. Returns `None` when nothing shrank.
+/// `budget`. Returns `None` when nothing shrank, or immediately when `no_shrink` (`--no-shrink`)
+/// is set, without leasing any budget or calling the sandbox.
 pub(super) fn minimize_raised(
     case: &Case,
     input: &GenInput,
     domain: Option<&ValueDomain>,
     budget: &Budget,
+    no_shrink: bool,
     call: impl FnMut(&[Value], &[(String, Value)], Limits) -> Result<CallResult, String>,
 ) -> Result<Option<MinimizedInput>, String> {
+    if no_shrink {
+        return Ok(None);
+    }
     let exc = case
         .raises
         .as_deref()
@@ -566,7 +576,7 @@ fn method_record(
             }
             let mut case = build_case(sig, input, Some(ctor_args.clone()), result, CaseSource::Generated);
             if case.outcome == "raised" {
-                case.minimized = minimize_raised(&case, input, opts.domain, opts.budget, |pos, kw, limits| {
+                case.minimized = minimize_raised(&case, input, opts.domain, opts.budget, opts.no_shrink, |pos, kw, limits| {
                     sandbox.call_method(
                         src,
                         (class, &ctor_args),
