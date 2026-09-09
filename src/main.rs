@@ -271,7 +271,15 @@ fn cmd_record(args: &[String]) {
         if secs <= 0.0 {
             fail("--time-budget needs a positive number of seconds");
         }
-        std::time::Duration::from_secs_f64(secs)
+        let duration = std::time::Duration::from_secs_f64(secs);
+        if duration <= pylens::record::MIN_TIME_BUDGET {
+            fail(&format!(
+                "--time-budget must be greater than {}s (the minimum lease floor) — at or under \
+                 it, every lease is refused and nothing ever runs",
+                pylens::record::MIN_TIME_BUDGET.as_secs_f64()
+            ));
+        }
+        duration
     });
 
     if std::path::Path::new(&path).is_dir() {

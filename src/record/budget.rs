@@ -8,8 +8,11 @@ use std::time::{Duration, Instant};
 use crate::exec::{Limits, default_call_timeout};
 
 /// Once less than this remains before the deadline, nothing more may start — avoids leasing a
-/// sliver of time too small for even a trivial call to complete.
-pub(super) const FLOOR: Duration = Duration::from_secs(1);
+/// sliver of time too small for even a trivial call to complete. Also the floor `--time-budget`
+/// itself must clear (see `crate::record::MIN_TIME_BUDGET`, re-exported from here): a budget at
+/// or under this floor would refuse every lease immediately and record nothing, so the CLI
+/// rejects it up front instead of silently producing an empty result.
+pub const MIN_TIME_BUDGET: Duration = Duration::from_secs(1);
 
 /// A function's `--time-budget` deadline, and whether it has ever stopped work from starting.
 pub(crate) struct Budget {
@@ -34,7 +37,7 @@ impl Budget {
             return Some(Limits::default());
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining <= FLOOR {
+        if remaining <= MIN_TIME_BUDGET {
             self.hit.set(true);
             return None;
         }

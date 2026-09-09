@@ -20,6 +20,7 @@ mod cover;
 mod stability;
 
 pub(crate) use budget::Budget;
+pub use budget::MIN_TIME_BUDGET;
 pub use case::{
     Case, CaseSource, Coverage, DepStatus, Dependency, FunctionRecord, IoObservability,
     MinimizedInput, ModuleRecord, ObservedMutation, OutputTypeCoverage, Uncallable, UnobservedReturns,

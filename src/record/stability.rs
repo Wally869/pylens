@@ -112,8 +112,14 @@ pub(super) fn stabilize_cases(
         let mut next_alive = Vec::with_capacity(alive.len());
         for ((case, kwargs), result) in alive.into_iter().zip(kwargs_owned).zip(&results) {
             if result.is_deadline_skipped() {
+                // Never re-enters `alive` for a later round: a `deadline_skipped` re-run is not
+                // "this round's attempt failed, try again next round" — the case must leave the
+                // round loop entirely and be kept exactly as it stands, unverified, the same as
+                // the up-front `budget.expired()` path above. Anything else risks ending with
+                // fewer than `runs` executions while being treated as fully verified, or being
+                // dropped as unstable on the strength of an incomplete comparison.
                 budget.mark_hit();
-                next_alive.push(case);
+                kept.push(case);
                 continue;
             }
             let gen_input = GenInput { positional: case.input.clone(), kwargs };
