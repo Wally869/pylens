@@ -412,17 +412,17 @@ pub(super) fn run_loop(
         CallTarget::Method { ctor_args, .. } => Some(ctor_args.to_vec()),
     };
     let fine = fine_targets(&sig.branch_points);
-    let call = |pos: &[Value], kw: &[(String, Value)]| -> Result<CallResult, String> {
+    let call = |pos: &[Value], kw: &[(String, Value)], limits: Limits| -> Result<CallResult, String> {
         match &target {
-            CallTarget::Function => sandbox.call(src, &sig.name, pos, kw, &fine, Limits::default()),
+            CallTarget::Function => sandbox.call(src, &sig.name, pos, kw, &fine, limits),
             CallTarget::Method { class, ctor_args } => {
-                sandbox.call_method(src, (class, ctor_args), &sig.name, (pos, kw), &fine, Limits::default())
+                sandbox.call_method(src, (class, ctor_args), &sig.name, (pos, kw), &fine, limits)
             }
         }
     };
 
     loop {
-        if cases.len() >= opts.max_inputs || super::deadline_passed(opts.deadline) {
+        if cases.len() >= opts.max_inputs || opts.budget.expired() {
             break;
         }
         let uncovered = uncovered_outcomes(sig, cases);
@@ -437,14 +437,20 @@ pub(super) fn run_loop(
             }
             let Some(want) = want_for_outcome(*kind, outcome_name, &predicates, *line) else { continue };
             for overrides in candidate_values(sig, &predicates, *line, want, opts.domain) {
-                if cases.len() >= opts.max_inputs || super::deadline_passed(opts.deadline) {
+                if cases.len() >= opts.max_inputs {
                     break 'outer;
                 }
+                let Some(limits) = opts.budget.lease() else { break 'outer };
                 let Some(gi) = build_targeted_input(sig, &template, &overrides) else { continue };
-                let result = call(&gi.positional, &gi.kwargs)?;
+                let result = call(&gi.positional, &gi.kwargs, limits)?;
+                if result.is_deadline_skipped() {
+                    opts.budget.mark_hit();
+                    continue;
+                }
                 let mut case = build_case(sig, &gi, ctor_args_for_case.clone(), &result, CaseSource::Generated);
                 if case.outcome == "raised" {
-                    case.minimized = minimize_raised(&case, &gi, opts.domain, |pos, kw| call(pos, kw))?;
+                    case.minimized =
+                        minimize_raised(&case, &gi, opts.domain, opts.budget, |pos, kw, limits| call(pos, kw, limits))?;
                 }
                 cases.push(case);
                 executed_this_round = true;

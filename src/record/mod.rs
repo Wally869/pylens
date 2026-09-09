@@ -14,10 +14,12 @@ use crate::model::{DefKind, EffectSignature, Import};
 use crate::shrink::shrink_case;
 use crate::{analyze_source, imports_of};
 
+mod budget;
 mod case;
 mod cover;
 mod stability;
 
+pub(crate) use budget::Budget;
 pub use case::{
     Case, CaseSource, Coverage, DepStatus, Dependency, FunctionRecord, IoObservability,
     MinimizedInput, ModuleRecord, ObservedMutation, OutputTypeCoverage, Uncallable, UnobservedReturns,
@@ -85,9 +87,9 @@ pub(super) struct GenOptions<'a> {
     pub(super) base_inputs: usize,
     pub(super) domain: Option<&'a ValueDomain>,
     pub(super) cover_branches: bool,
-    /// Once `std::time::Instant::now() >= deadline`, generation loops stop starting new
-    /// generated work — see [`RecordFlags::time_budget`].
-    pub(super) deadline: Option<std::time::Instant>,
+    /// Leases wall limits for each piece of generated work from the function's `--time-budget`
+    /// deadline (if any) — see [`Budget::lease`] and [`RecordFlags::time_budget`].
+    pub(super) budget: &'a Budget,
 }
 
 /// External input tuples supplied via `--replay`: function name → list of positional-argument
@@ -250,8 +252,8 @@ pub fn record_with_signatures(
             continue;
         }
         let replay_inputs: &[Vec<Value>] = replay.get(&sig.name).map(Vec::as_slice).unwrap_or(&[]);
-        let deadline = time_budget.map(|d| std::time::Instant::now() + d);
-        let opts = GenOptions { max_inputs, base_inputs, domain, cover_branches, deadline };
+        let budget = Budget::new(time_budget);
+        let opts = GenOptions { max_inputs, base_inputs, domain, cover_branches, budget: &budget };
         let (uncallable, mut cases, cover_ctx) = match sig.kind {
             DefKind::Function => {
                 let probe_module_load = fold_probe_idx == Some(i);
@@ -271,7 +273,7 @@ pub fn record_with_signatures(
         let dropped_cases = match stability_runs {
             Some(runs) if uncallable.is_none() => {
                 let (kept, dropped) =
-                    stability::stabilize_cases(sandbox, src, sig, std::mem::take(&mut cases), runs, deadline)?;
+                    stability::stabilize_cases(sandbox, src, sig, std::mem::take(&mut cases), runs, &budget)?;
                 cases = kept;
                 Some(dropped)
             }
@@ -299,7 +301,6 @@ pub fn record_with_signatures(
                 None => (None, None),
             }
         };
-        let time_budget_hit = deadline.is_some_and(|dl| std::time::Instant::now() >= dl);
         functions.push(FunctionRecord {
             io_observability: io_observability(&sig.io),
             signature: sig.clone(),
@@ -311,7 +312,7 @@ pub fn record_with_signatures(
             dropped_cases,
             output_type_coverage,
             unobserved_returns,
-            time_budget_hit: time_budget_hit.then_some(true),
+            time_budget_hit: budget.was_hit().then_some(true),
         });
     }
     Ok(ModuleRecord {
@@ -394,13 +395,6 @@ fn probe_import(sandbox: &dyn Sandbox, module: &str) -> Result<Option<HarnessErr
     }
 }
 
-/// Whether `opts.deadline` (the `--time-budget` cap) has already passed — generation loops stop
-/// starting new *generated* work once this is true, but replayed cases (see [`ReplayMap`]) never
-/// check it: external evidence must not silently vanish.
-pub(super) fn deadline_passed(deadline: Option<std::time::Instant>) -> bool {
-    deadline.is_some_and(|dl| std::time::Instant::now() >= dl)
-}
-
 /// Generate and run the initial batch for a free function, then the `--cover-branches` loop.
 /// `probe_module_load`, when set, checks the *first* dispatched batch for a uniform `stage ==
 /// "setup"` failure across every item — the signature the module-load probe itself would produce
@@ -421,14 +415,12 @@ fn function_cases(
     let inputs = gen_inputs(sig, opts.base_inputs, opts.domain);
     let mut first_chunk = true;
     for chunk in inputs.chunks(BATCH_SIZE) {
-        if deadline_passed(opts.deadline) {
-            break;
-        }
+        let Some(limits) = opts.budget.lease() else { break };
         let call_inputs: Vec<CallInput> = chunk
             .iter()
             .map(|input| (input.positional.as_slice(), input.kwargs.as_slice()))
             .collect();
-        let results = sandbox.call_batch(src, &sig.name, &call_inputs, None, &fine, Limits::default())?;
+        let results = sandbox.call_batch(src, &sig.name, &call_inputs, None, &fine, limits)?;
         if probe_module_load && first_chunk
             && let Some(err) = uniform_setup_failure(&results)
         {
@@ -436,10 +428,14 @@ fn function_cases(
         }
         first_chunk = false;
         for (input, result) in chunk.iter().zip(&results) {
+            if result.is_deadline_skipped() {
+                opts.budget.mark_hit();
+                continue;
+            }
             let mut case = build_case(sig, input, None, result, CaseSource::Generated);
             if case.outcome == "raised" {
-                case.minimized = minimize_raised(&case, input, opts.domain, |pos, kw| {
-                    sandbox.call(src, &sig.name, pos, kw, &fine, Limits::default())
+                case.minimized = minimize_raised(&case, input, opts.domain, opts.budget, |pos, kw, limits| {
+                    sandbox.call(src, &sig.name, pos, kw, &fine, limits)
                 })?;
             }
             cases.push(case);
@@ -485,18 +481,20 @@ fn uniform_setup_failure(results: &[CallResult]) -> Option<HarnessError> {
 }
 
 /// Shrink a `raised` case's input, re-executing via `call` (the same call shape — free function
-/// or method — the case itself ran on). Returns `None` when nothing shrank.
+/// or method — the case itself ran on), leasing wall limits for each candidate call from
+/// `budget`. Returns `None` when nothing shrank.
 pub(super) fn minimize_raised(
     case: &Case,
     input: &GenInput,
     domain: Option<&ValueDomain>,
-    call: impl FnMut(&[Value], &[(String, Value)]) -> Result<CallResult, String>,
+    budget: &Budget,
+    call: impl FnMut(&[Value], &[(String, Value)], Limits) -> Result<CallResult, String>,
 ) -> Result<Option<MinimizedInput>, String> {
     let exc = case
         .raises
         .as_deref()
         .expect("a raised case always carries an exception type");
-    let shrunk = shrink_case(exc, &input.positional, &input.kwargs, domain, call)?;
+    let shrunk = shrink_case(exc, &input.positional, &input.kwargs, domain, budget, call)?;
     Ok(shrunk.map(|(pos, kw)| MinimizedInput {
         input: pos,
         kwargs: kw.into_iter().collect(),
@@ -522,7 +520,13 @@ fn method_record(
     let ctor_args = constructor_args(all, class, opts.domain);
 
     if !ctor_cache.contains_key(class) {
-        let probe = sandbox.probe_load(src, Some((class, ctor_args.as_slice())), Limits::default())?;
+        // A budget refusal must never be cached as a verdict about `class` — the next method of
+        // the same class must get its own chance to probe once the situation may have changed
+        // (it won't, within one run, but caching a non-verdict here would be a lie either way).
+        let Some(limits) = opts.budget.lease() else {
+            return Ok((None, Vec::new(), cover::CoverContext::not_run()));
+        };
+        let probe = sandbox.probe_load(src, Some((class, ctor_args.as_slice())), limits)?;
         let err = if probe.ok { None } else { probe.error };
         ctor_cache.insert(class.to_string(), err);
     }
@@ -541,9 +545,7 @@ fn method_record(
     let mut cases = Vec::new();
     let inputs = gen_inputs(sig, opts.base_inputs, opts.domain);
     for chunk in inputs.chunks(BATCH_SIZE) {
-        if deadline_passed(opts.deadline) {
-            break;
-        }
+        let Some(limits) = opts.budget.lease() else { break };
         let call_inputs: Vec<CallInput> = chunk
             .iter()
             .map(|input| (input.positional.as_slice(), input.kwargs.as_slice()))
@@ -554,19 +556,23 @@ fn method_record(
             &call_inputs,
             Some((class, ctor_args.as_slice())),
             &fine,
-            Limits::default(),
+            limits,
         )?;
         for (input, result) in chunk.iter().zip(&results) {
+            if result.is_deadline_skipped() {
+                opts.budget.mark_hit();
+                continue;
+            }
             let mut case = build_case(sig, input, Some(ctor_args.clone()), result, CaseSource::Generated);
             if case.outcome == "raised" {
-                case.minimized = minimize_raised(&case, input, opts.domain, |pos, kw| {
+                case.minimized = minimize_raised(&case, input, opts.domain, opts.budget, |pos, kw, limits| {
                     sandbox.call_method(
                         src,
                         (class, &ctor_args),
                         &sig.name,
                         (pos, kw),
                         &fine,
-                        Limits::default(),
+                        limits,
                     )
                 })?;
             }

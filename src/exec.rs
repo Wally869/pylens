@@ -165,6 +165,14 @@ impl HarnessError {
     pub fn is_resource(&self) -> bool {
         self.stage == "resource"
     }
+
+    /// Whether this is specifically a `deadline_skipped` resource kind — the item never started
+    /// because a batch's soft whole-batch deadline passed before its turn, so there is no
+    /// observation to record (unlike every other resource kind, which is a real, kept
+    /// observation — see the type doc).
+    pub fn is_deadline_skipped(&self) -> bool {
+        self.is_resource() && self.kind == "deadline_skipped"
+    }
 }
 
 /// The observed effects of one execution.
@@ -216,6 +224,15 @@ pub struct CallResult {
     /// `record::branch_report_for`.
     #[serde(default)]
     pub fine_hits: Vec<FineHit>,
+}
+
+impl CallResult {
+    /// Whether this result is a [`HarnessError::is_deadline_skipped`] — the batch item never ran,
+    /// so a consumer must drop it and build no case from it rather than treat it as an
+    /// observation.
+    pub fn is_deadline_skipped(&self) -> bool {
+        self.error.as_ref().is_some_and(HarnessError::is_deadline_skipped)
+    }
 }
 
 /// One `(positional args, keyword-only args)` pair for a batched call — see

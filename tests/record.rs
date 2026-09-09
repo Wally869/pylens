@@ -835,11 +835,14 @@ fn tight_time_budget_trips_and_keeps_already_recorded_cases() {
     if !ready("tight_time_budget_trips_and_keeps_already_recorded_cases") {
         return;
     }
+    // The budget must clear `budget::FLOOR` (1s) or nothing would ever be leased at all — see
+    // `Budget::lease`. Still far under the ~2s a full run of 20 inputs at 0.1s/call would take,
+    // so the deadline reliably trips after the first leased batch.
     let rec = record_file(
         SLOW_SRC,
         20,
         &ReplayMap::new(),
-        RecordFlags { time_budget: Some(Duration::from_secs_f64(0.05)), ..RecordFlags::default() },
+        RecordFlags { time_budget: Some(Duration::from_secs_f64(1.3)), ..RecordFlags::default() },
     )
     .expect("record");
     let f = rec.functions.iter().find(|r| r.signature.name == "slow").expect("slow record");

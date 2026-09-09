@@ -5,11 +5,11 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::exec::{CallInput, Limits, Sandbox};
+use crate::exec::{CallInput, Sandbox};
 use crate::generate::GenInput;
 use crate::model::EffectSignature;
 
-use super::{Case, CaseSource, build_case, deadline_passed};
+use super::{Budget, Case, CaseSource, build_case};
 
 /// The closed count of cases `--stability-runs` dropped from a function's `cases` — see
 /// [`stabilize_cases`]. Present on [`super::FunctionRecord`] exactly when `--stability-runs` was
@@ -34,19 +34,24 @@ pub struct DroppedCases {
 /// original, whose arcs already contributed to coverage/branch accounting; re-run traces are
 /// diagnostics, not observations, and value-level agreement is what stability checks.
 ///
-/// `deadline` (the `--time-budget` cap, if any) applies only to `CaseSource::Generated` cases: a
+/// `budget` (the `--time-budget` cap, if any) applies only to `CaseSource::Generated` cases: a
 /// generated case whose stability re-runs haven't started yet when the deadline has already
-/// passed is kept as-is, unverified, rather than dropped — the case itself was already recorded
-/// before the deadline tripped, and "stop starting new generated work" means the re-run checks,
-/// not discarding what's already there. A replayed case's re-runs always execute in full,
-/// regardless of the deadline: external evidence must not silently vanish.
+/// passed (`budget.expired()`) is kept as-is, unverified, rather than dropped — the case itself
+/// was already recorded before the deadline tripped, and "stop starting new generated work" means
+/// the re-run checks, not discarding what's already there. A replayed case's re-runs always
+/// execute in full, regardless of the deadline: external evidence must not silently vanish.
+///
+/// Each round's batch leases wall limits from `budget` before it runs; when a lease is refused,
+/// every case still alive is kept as-is, unverified, and re-running stops. A re-run that comes
+/// back `deadline_skipped` never disagreed with anything — it is kept as-is, unverified, not
+/// counted as unstable.
 pub(super) fn stabilize_cases(
     sandbox: &dyn Sandbox,
     src: &str,
     sig: &EffectSignature,
     cases: Vec<Case>,
     runs: usize,
-    deadline: Option<std::time::Instant>,
+    budget: &Budget,
 ) -> Result<(Vec<Case>, DroppedCases), String> {
     let mut kept = Vec::with_capacity(cases.len());
     let mut dropped = DroppedCases::default();
@@ -61,7 +66,7 @@ pub(super) fn stabilize_cases(
             dropped.resource += 1;
             continue;
         }
-        if case.source == CaseSource::Generated && deadline_passed(deadline) {
+        if case.source == CaseSource::Generated && budget.expired() {
             kept.push(case);
             continue;
         }
@@ -72,6 +77,7 @@ pub(super) fn stabilize_cases(
         if alive.is_empty() {
             break;
         }
+        let Some(limits) = budget.lease() else { break };
         let kwargs_owned: Vec<Vec<(String, Value)>> = alive
             .iter()
             .map(|c| c.kwargs.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -97,14 +103,19 @@ pub(super) fn stabilize_cases(
                     &call_inputs,
                     Some((class, ctor_args.as_slice())),
                     &[],
-                    Limits::default(),
+                    limits,
                 )?
             }
-            None => sandbox.call_batch(src, &sig.name, &call_inputs, None, &[], Limits::default())?,
+            None => sandbox.call_batch(src, &sig.name, &call_inputs, None, &[], limits)?,
         };
 
         let mut next_alive = Vec::with_capacity(alive.len());
         for ((case, kwargs), result) in alive.into_iter().zip(kwargs_owned).zip(&results) {
+            if result.is_deadline_skipped() {
+                budget.mark_hit();
+                next_alive.push(case);
+                continue;
+            }
             let gen_input = GenInput { positional: case.input.clone(), kwargs };
             let rerun = build_case(sig, &gen_input, case.ctor_args.clone(), result, case.source);
             if cases_agree(&case, &rerun) {
